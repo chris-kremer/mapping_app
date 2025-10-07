@@ -419,6 +419,12 @@ class RoutePolyline: MKPolyline {
     var averageSpeed: Double?
 }
 
+// District polygon overlay with metadata for styling
+class DistrictPolygon: MKPolygon {
+    var districtName: String = ""
+    var colorIndex: Int = 0
+}
+
 private extension RoutePolyline {
     /// Convenience factory because `MKPolyline(coordinates:count:)`
     /// is a *convenience* initializer that isn’t inherited by subclasses.
@@ -486,6 +492,12 @@ struct ContentView: View {
     @State private var trackingTimer: Timer?
     @State private var showControls = false
     @State private var showStats = false
+    @State private var showAchievementsPage = false
+    @StateObject private var achievementsManager = AchievementsManager()
+    
+    // District overlay state
+    @State private var selectedDistrictOverlay: (name: String, lat: Double, lon: Double)? = nil
+    @State private var showAllBerlinDistricts = false
 
     // Stats banner state
     @AppStorage("lastRunCount") private var lastRunCount = 0
@@ -508,10 +520,12 @@ struct ContentView: View {
         ZStack {
             RouteMapView(routes: viewModel.displayedRoutes,
                          region: region,
-                       highlightedRouteIDs: highlightedRouteIDs,
+                         highlightedRouteIDs: highlightedRouteIDs,
                          showUserLocation: showUserLocation,
                          liveCoordinates: liveCoordinates,
-                       mapType: mapType)
+                         mapType: mapType,
+                         districtOverlay: selectedDistrictOverlay,
+                         showAllBerlinDistricts: showAllBerlinDistricts)
                 .onReceive(locationManager.$currentLocation) { location in
                     // Center map on user's current location when first obtained
                     if let location = location, !hasSetInitialLocation {
@@ -583,25 +597,29 @@ struct ContentView: View {
                             .onTapGesture {
                                 if let latest = viewModel.routes.sorted(by: { $0.date > $1.date }).first {
                                     let calendar = Calendar.current
-                                    
+
                                     // Find all routes from the same day
                                     let routesFromLatestDay = viewModel.routes.filter { route in
                                         calendar.isDate(route.date, inSameDayAs: latest.date)
                                     }
-                                    
+
                                     highlightedRouteIDs = Set(routesFromLatestDay.map { $0.id })
-                                    
+
                                     // Create region that encompasses all routes from that day
                                     let allCoordinates = routesFromLatestDay.flatMap { $0.coordinates }
                                     region = coordinateRegion(for: allCoordinates)
-                                    
+
                                     showLatestDayLabel = true
                                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                                         showLatestDayLabel = false
                                     }
                                 }
                             }
-                            .onLongPressGesture { highlightedRouteIDs.removeAll() }
+                            .onLongPressGesture {
+                                highlightedRouteIDs.removeAll()
+                                selectedDistrictOverlay = nil
+                                showAllBerlinDistricts = false
+                            }
 
                         // Tracking button
                         circleButton(icon: isTracking ? "pause.circle" : "dot.circle",
@@ -661,6 +679,12 @@ struct ContentView: View {
                         circleButton(icon: "chart.bar")
                             .onTapGesture {
                                 showStats = true
+                            }
+
+                        // Achievements button
+                        circleButton(icon: "trophy.fill")
+                            .onTapGesture {
+                                showAchievementsPage = true
                             }
 
                     }
@@ -727,7 +751,26 @@ struct ContentView: View {
                             }
                             
                             var message = "You added \(newRuns) runs for " + String(format: "%.1f", newDistance) + " km"
-                            
+
+                            // Check for new streets in Berlin
+                            var newStreetNames: Set<String> = []
+                            let isBerlinRun = newCountries.contains("Germany") && newRoutes.contains { route in
+                                guard let first = route.coordinates.first else { return false }
+                                return BerlinDistricts.getDistrict(lat: first.latitude, lon: first.longitude) != nil
+                            }
+
+                            if isBerlinRun {
+                                // Get newly covered streets from the latest routes
+                                let newRouteIDs = Set(newRoutes.map { "\($0.date.timeIntervalSince1970)" })
+                                for (routeID, coverageData) in achievementsManager.processedRoutes {
+                                    if newRouteIDs.contains(routeID) {
+                                        // Get unique street names from this route's segments
+                                        let streetNames = Set(coverageData.coveredSegments.map { $0.streetName })
+                                        newStreetNames.formUnion(streetNames)
+                                    }
+                                }
+                            }
+
                             if !newCountries.isEmpty {
                                 let sortedCountries = Array(newCountries).sorted()
                                 if sortedCountries.count == 1 {
@@ -736,8 +779,18 @@ struct ContentView: View {
                                     message += " in \(sortedCountries.joined(separator: ", "))"
                                 }
                             }
-                            
-                            message += " since your last visit. Great job!"
+
+                            // Add new streets info if any
+                            if !newStreetNames.isEmpty {
+                                let streetList = Array(newStreetNames.prefix(5)).sorted()
+                                if streetList.count <= 3 {
+                                    message += "\n\nNew streets covered: \(streetList.joined(separator: ", "))"
+                                } else {
+                                    message += "\n\nNew streets covered: \(streetList.prefix(3).joined(separator: ", ")) and \(newStreetNames.count - 3) more"
+                                }
+                            }
+
+                            message += "\n\nGreat job!"
                             summaryMessage = message
                         }
                         showSummaryAlert = true
@@ -769,6 +822,39 @@ struct ContentView: View {
             StatsView(routes: viewModel.displayedRoutes) { country, city in
                 navigateToLocation(country: country, city: city)
             }
+        }
+        .sheet(isPresented: $showAchievementsPage) {
+            AchievementsView(
+                achievementsManager: achievementsManager,
+                routes: viewModel.routes,
+                onDistrictSelected: { districtName, lat, lon in
+                    selectedDistrictOverlay = (districtName, lat, lon)
+                    showAllBerlinDistricts = false
+                    let districtCenter = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+                    let newRegion = MKCoordinateRegion(
+                        center: districtCenter,
+                        span: MKCoordinateSpan(latitudeDelta: 0.08, longitudeDelta: 0.08)
+                    )
+                    withAnimation(.easeInOut(duration: 1.0)) {
+                        region = newRegion
+                    }
+                },
+                onShowAllDistricts: {
+                    selectedDistrictOverlay = nil
+                    showAllBerlinDistricts = true
+                    let berlinCenter = CLLocationCoordinate2D(latitude: 52.52, longitude: 13.405)
+                    let newRegion = MKCoordinateRegion(
+                        center: berlinCenter,
+                        span: MKCoordinateSpan(latitudeDelta: 0.4, longitudeDelta: 0.4)
+                    )
+                    withAnimation(.easeInOut(duration: 1.0)) {
+                        region = newRegion
+                    }
+                },
+                onLocationSelected: { country, city in
+                    navigateToLocation(country: country, city: city)
+                }
+            )
         }
         .alert(summaryMessage ?? "", isPresented: $showSummaryAlert) {
             Button("OK", role: .cancel) { }
@@ -1027,6 +1113,8 @@ struct RouteMapView: UIViewRepresentable {
     var showUserLocation: Bool
     var liveCoordinates: [CLLocationCoordinate2D]
     var mapType: MKMapType
+    var districtOverlay: (name: String, lat: Double, lon: Double)? = nil
+    var showAllBerlinDistricts: Bool = false
     
     func makeUIView(context: Context) -> MKMapView {
         let mapView = MKMapView()
@@ -1054,6 +1142,54 @@ struct RouteMapView: UIViewRepresentable {
 
         if mapView.mapType != mapType {
             mapView.mapType = mapType
+        }
+
+        // Remove existing district overlays and annotations
+        let existingDistrictOverlays = mapView.overlays.filter { $0 is MKCircle }
+        let existingDistrictAnnotations = mapView.annotations.compactMap { $0 as? MKPointAnnotation }.filter {
+            $0.title?.contains("District") ?? false
+        }
+        if !existingDistrictOverlays.isEmpty { mapView.removeOverlays(existingDistrictOverlays) }
+        if !existingDistrictAnnotations.isEmpty { mapView.removeAnnotations(existingDistrictAnnotations) }
+
+        // Add Berlin district overlays if requested (polygons + label-only annotations)
+        if showAllBerlinDistricts {
+            for district in BerlinDistricts.districts {
+                let center = CLLocationCoordinate2D(latitude: district.lat, longitude: district.lon)
+                let ann = MKPointAnnotation()
+                ann.coordinate = center
+                ann.title = district.name
+                ann.subtitle = "District Label"
+                mapView.addAnnotation(ann)
+                if let boundary = BerlinDistricts.boundaries.first(where: { $0.name == district.name }) {
+                    for polygon in boundary.polygons {
+                        if let outer = polygon.first, outer.count >= 3 {
+                            let mkPolygon = DistrictPolygon(coordinates: outer, count: outer.count)
+                            mkPolygon.districtName = district.name
+                            mkPolygon.colorIndex = BerlinDistricts.districts.firstIndex(where: { $0.name == district.name }) ?? 0
+                            mapView.addOverlay(mkPolygon)
+                        }
+                    }
+                }
+            }
+        } else if let d = districtOverlay {
+            let center = CLLocationCoordinate2D(latitude: d.lat, longitude: d.lon)
+            let ann = MKPointAnnotation()
+            ann.coordinate = center
+            ann.title = d.name
+            ann.subtitle = "District Label"
+            mapView.addAnnotation(ann)
+            // Add district outline as MKPolygon(s)
+            if let boundary = BerlinDistricts.boundaries.first(where: { $0.name == d.name }) {
+                for polygon in boundary.polygons {
+                    if let outer = polygon.first, outer.count >= 3 {
+                        let mkPolygon = DistrictPolygon(coordinates: outer, count: outer.count)
+                        mkPolygon.districtName = d.name
+                        mkPolygon.colorIndex = BerlinDistricts.districts.firstIndex(where: { $0.name == d.name }) ?? 0
+                        mapView.addOverlay(mkPolygon)
+                    }
+                }
+            }
         }
 
         // Remove existing live overlays (those without routeID)
@@ -1125,6 +1261,31 @@ struct RouteMapView: UIViewRepresentable {
         let parent: RouteMapView
         init(_ parent: RouteMapView) { self.parent = parent }
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            if let polygon = overlay as? DistrictPolygon {
+                let renderer = MKPolygonRenderer(polygon: polygon)
+                // Black dotted borders
+                renderer.strokeColor = .black
+                renderer.lineWidth = 2
+                renderer.lineDashPattern = [6, 4]
+                // Pastel fill color based on index
+                let palette: [UIColor] = [
+                    UIColor(red: 0.90, green: 0.49, blue: 0.47, alpha: 0.3),
+                    UIColor(red: 0.99, green: 0.76, blue: 0.38, alpha: 0.3),
+                    UIColor(red: 0.99, green: 0.94, blue: 0.60, alpha: 0.3),
+                    UIColor(red: 0.70, green: 0.87, blue: 0.54, alpha: 0.3),
+                    UIColor(red: 0.54, green: 0.80, blue: 0.94, alpha: 0.3),
+                    UIColor(red: 0.80, green: 0.67, blue: 0.94, alpha: 0.3),
+                    UIColor(red: 0.95, green: 0.66, blue: 0.88, alpha: 0.3),
+                    UIColor(red: 0.95, green: 0.84, blue: 0.70, alpha: 0.3),
+                    UIColor(red: 0.66, green: 0.88, blue: 0.80, alpha: 0.3),
+                    UIColor(red: 0.80, green: 0.88, blue: 0.99, alpha: 0.3),
+                    UIColor(red: 0.88, green: 0.80, blue: 0.99, alpha: 0.3),
+                    UIColor(red: 0.99, green: 0.80, blue: 0.88, alpha: 0.3)
+                ]
+                let idx = max(0, min(polygon.colorIndex % palette.count, palette.count - 1))
+                renderer.fillColor = palette[idx]
+                return renderer
+            }
             guard let polyline = overlay as? RoutePolyline else {
                 return MKOverlayRenderer(overlay: overlay)
             }
@@ -1144,6 +1305,35 @@ struct RouteMapView: UIViewRepresentable {
             }
             renderer.lineWidth = 4
             return renderer
+        }
+        
+        // Custom label-only annotation views for district labels
+        func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
+            guard let point = annotation as? MKPointAnnotation else { return nil }
+            guard point.subtitle == "District Label" else { return nil }
+            let identifier = "DistrictLabelView"
+            let view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier) ?? MKAnnotationView(annotation: annotation, reuseIdentifier: identifier)
+            view.annotation = annotation
+            view.canShowCallout = false
+            view.image = nil
+            // Remove previous subviews
+            view.subviews.forEach { $0.removeFromSuperview() }
+            // Add a label
+            let label = UILabel()
+            label.text = point.title ?? ""
+            label.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+            label.textColor = UIColor.systemBlue
+            label.backgroundColor = UIColor.white.withAlphaComponent(0.6)
+            label.layer.cornerRadius = 4
+            label.layer.masksToBounds = true
+            label.sizeToFit()
+            label.translatesAutoresizingMaskIntoConstraints = false
+            view.addSubview(label)
+            NSLayoutConstraint.activate([
+                label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                label.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+            ])
+            return view
         }
     }
 }
