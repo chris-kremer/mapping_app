@@ -1246,7 +1246,7 @@ struct RouteMapView: UIViewRepresentable {
                 pl.isHighlighted = shouldHighlight
                 if let r = mapView.renderer(for: pl) as? MKPolylineRenderer {
                     r.strokeColor = shouldHighlight ? .orange :
-                        (pl.workoutType == .running ? .systemRed :
+                        (pl.workoutType == .running ? UIColor(red: 0.0, green: 0.5, blue: 1.0, alpha: 1.0) :
                          pl.workoutType == .walking ? .systemBlue : .systemGreen)
                     r.setNeedsDisplay()
                 }
@@ -1296,7 +1296,7 @@ struct RouteMapView: UIViewRepresentable {
             } else {
                 switch polyline.workoutType {
                 case .running:
-                    renderer.strokeColor = .systemRed
+                    renderer.strokeColor = UIColor(red: 0.0, green: 0.5, blue: 1.0, alpha: 1.0) // Bright blue
                 case .walking:
                     renderer.strokeColor = .systemBlue
                 default:

@@ -5,7 +5,7 @@ import MapKit
 
 // MARK: - Achievement Model
 
-enum AchievementTier: String, Codable {
+enum AchievementTier: String, Codable, Comparable {
     case none = "Locked"
     case bronze = "Bronze"
     case silver = "Silver"
@@ -20,6 +20,21 @@ enum AchievementTier: String, Codable {
         case .gold: return Color(red: 1.0, green: 0.84, blue: 0.0)
         case .platinum: return Color(red: 0.4, green: 0.8, blue: 1.0) // Bright cyan/sky blue
         }
+    }
+
+    // Numeric value for comparison
+    var numericValue: Int {
+        switch self {
+        case .none: return 0
+        case .bronze: return 1
+        case .silver: return 2
+        case .gold: return 3
+        case .platinum: return 4
+        }
+    }
+
+    static func < (lhs: AchievementTier, rhs: AchievementTier) -> Bool {
+        return lhs.numericValue < rhs.numericValue
     }
 }
 
@@ -100,6 +115,20 @@ struct StreetSegment: Codable, Hashable {
     let stadtteil: String?  // Optional for backward compatibility
     let startIndex: Int
     let endIndex: Int
+}
+
+struct StreetCoverageCache: Codable {
+    let formatVersion: Int
+    let generatedAt: Date
+    let totalStreetCount: Int
+    let coveredStreetCount: Int
+    let fullyCoveredStreetCount: Int
+    let coveredPoints: Int
+    let totalPoints: Int
+    let overallCoveragePercentage: Double
+    let coverageByStreetID: [String: ConsolidatedStreet.CoverageResult]
+    let districtStats: [DistrictCoverageStats]
+    let stadtteilStats: [StadtteilCoverageStats]
 }
 
 // MARK: - Berlin Streets Helper
@@ -662,27 +691,48 @@ class AchievementsManager: ObservableObject {
     @Published var achievementMessage: String? = nil
     @Published var showAchievementAlert = false
 
+    // NEW: Fast street processing
+    @Published var consolidatedStreets: [ConsolidatedStreet] = []
+    @Published var streetsByDistrict: [String: [ConsolidatedStreet]] = [:]
+    @Published var streetsByStadtteil: [String: [ConsolidatedStreet]] = [:]
+    @Published var currentStadtteil = ""
+    @Published var currentStadtteilProgressInfo: StadtteilProgressInfo?
+    @Published var streetCoverageByID: [String: ConsolidatedStreet.CoverageResult] = [:]
+    @Published var districtCoverageStats: [DistrictCoverageStats] = []
+    @Published var stadtteilCoverageStats: [StadtteilCoverageStats] = []
+    @Published var overallStreetCoverage: Double = 0
+    @Published var totalBerlinStreets: Int = 0
+    @Published var processedBerlinStreets: Int = 0
+    @Published var coveredBerlinStreets: Int = 0
+    @Published var fullyCoveredBerlinStreets: Int = 0
+    @Published var coveredBerlinPoints: Int = 0
+    @Published var totalBerlinPoints: Int = 0
+    @Published var streetCoverageLastUpdated: Date?
+    var fastProcessor: FastStreetProcessor?
+    
     private let storageKey = "unlockedAchievements"
+    private let streetCoverageCacheKey = "berlinStreetCoverageCache"
+    private let streetCoverageFormatVersion = 1
     private var berlinVisitedFingerprint: String = ""
-
+    
     init() {
         loadAchievements()
         loadCachedData()
-
+        
         // Start loading streets in background
         BerlinStreets.loadStreetsInBackground {
             // Streets are now loaded, trigger any pending processing
             print("✅ Streets loaded, ready for processing")
         }
     }
-
+    
     private func loadCachedData() {
         // Version key for street data format - ONLY increment when you need to clear cache
-        let currentVersion = "v14_stadtteil_in_segment"  // Changed: Added stadtteil field to StreetSegment
+        let currentVersion = "v16_radius_20m"  // Changed: increased detection radius from 15m to 20m
         let savedVersion = UserDefaults.standard.string(forKey: "berlinStreetsDataVersion") ?? ""
-
+        
         // print("🔍 Checking cache version: saved='\(savedVersion)' current='\(currentVersion)'")
-
+        
         // If version mismatch, clear ONLY street coverage data (not districts)
         if savedVersion != currentVersion {
             // TEMPORARY: Just update version without clearing cache (detail view fix doesn't need re-parse)
@@ -691,12 +741,13 @@ class AchievementsManager: ObservableObject {
                 UserDefaults.standard.set(currentVersion, forKey: "berlinStreetsDataVersion")
             } else {
                 print("🔄 Street data version changed (\(savedVersion) -> \(currentVersion)), clearing route processing only")
-
+                
                 // Clear ONLY route processing data from UserDefaults
                 // DO NOT delete street geometry files - those don't need to change
                 UserDefaults.standard.removeObject(forKey: "berlinProcessedRoutes")
                 UserDefaults.standard.removeObject(forKey: "berlinCoveredSegments")
-
+                UserDefaults.standard.removeObject(forKey: streetCoverageCacheKey)
+                
                 // Also reset the achievement tier so it recalculates with new formula
                 if savedVersion == "v10_all_districts" {
                     print("   🔄 Resetting berlin_streets achievement tier for recalculation")
@@ -708,7 +759,7 @@ class AchievementsManager: ObservableObject {
                         }
                     }
                 }
-
+                
                 // For v12/v13: Adding stadtteil field and more points requires re-parsing
                 if savedVersion == "v11_overall_percentage" || savedVersion == "v12_add_stadtteil" {
                     print("   🔄 More points + stadtteil - need to re-parse GeoJSON")
@@ -725,69 +776,152 @@ class AchievementsManager: ObservableObject {
                         }
                     }
                 }
-
+                
                 // v13 → v14: Added optional stadtteil field (backward compatible, no cache clear needed)
-
+                
+                // v14 → v15: Changed simplification from every 5th to every 2nd coordinate
+                if savedVersion == "v14_stadtteil_in_segment" {
+                    print("   🔄 Density increased (2x more points) - clearing street geometry cache")
+                    if let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+                        do {
+                            let files = try FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)
+                            let streetCacheFiles = files.filter { $0.lastPathComponent.hasPrefix("berlin_streets_") }
+                            for file in streetCacheFiles {
+                                try? FileManager.default.removeItem(at: file)
+                            }
+                            print("   🗑️ Deleted \(streetCacheFiles.count) street cache files for higher density parsing")
+                        } catch {
+                            print("   ⚠️ Error: \(error)")
+                        }
+                    }
+                }
+                
                 UserDefaults.standard.set(currentVersion, forKey: "berlinStreetsDataVersion")
                 processedRoutes = [:]
                 streetSegmentsCovered = []
                 print("✅ Route processing cache cleared (street files and districts preserved)")
             }
         }
-
+        
         // Load cached Berlin districts
         if let districtsData = UserDefaults.standard.data(forKey: "berlinDistrictsVisited"),
            let districts = try? JSONDecoder().decode([String].self, from: districtsData) {
             berlinDistrictsVisitedCached = Set(districts)
         }
-
+        
         // Load cached Berlin stadtteile
         if let stadtteilData = UserDefaults.standard.data(forKey: "berlinStadtteileVisited"),
            let stadtteile = try? JSONDecoder().decode([String].self, from: stadtteilData) {
             berlinStadtteileVisitedCached = Set(stadtteile)
         }
-
+        
         // Load processed routes
         if let routesData = UserDefaults.standard.data(forKey: "berlinProcessedRoutes"),
            let routes = try? JSONDecoder().decode([String: RouteCoverageData].self, from: routesData) {
             processedRoutes = routes
         }
-
+        
         // Load covered segments
         if let segmentsData = UserDefaults.standard.data(forKey: "berlinCoveredSegments"),
            let segments = try? JSONDecoder().decode(Set<StreetSegment>.self, from: segmentsData) {
             streetSegmentsCovered = segments
         }
 
+        // Load cached street coverage summaries
+        if let coverageData = UserDefaults.standard.data(forKey: streetCoverageCacheKey),
+           let cache = try? JSONDecoder().decode(StreetCoverageCache.self, from: coverageData),
+           cache.formatVersion == streetCoverageFormatVersion {
+            streetCoverageByID = cache.coverageByStreetID
+            districtCoverageStats = cache.districtStats
+            stadtteilCoverageStats = cache.stadtteilStats
+            overallStreetCoverage = cache.overallCoveragePercentage
+            totalBerlinStreets = cache.totalStreetCount
+            processedBerlinStreets = cache.totalStreetCount
+            coveredBerlinStreets = cache.coveredStreetCount
+            fullyCoveredBerlinStreets = cache.fullyCoveredStreetCount
+            coveredBerlinPoints = cache.coveredPoints
+            totalBerlinPoints = cache.totalPoints
+            streetCoverageLastUpdated = cache.generatedAt
+
+            if berlinStadtteileVisitedCached.isEmpty {
+                let visited = cache.stadtteilStats.filter { $0.coveredStreets > 0 }.map { $0.stadtteil }
+                berlinStadtteileVisitedCached = Set(visited)
+            }
+
+            // Initialize fastProcessor if we have cached data but no processor yet
+            if fastProcessor == nil {
+                print("🔧 Initializing fastProcessor from cached data")
+                fastProcessor = FastStreetProcessor()
+
+                // Load streets in background to populate consolidated streets
+                Task {
+                    // Load all Berlin districts
+                    let allDistricts = BerlinDistricts.districts.map { $0.name }
+                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                        BerlinStreets.loadDistrictsInBackground(allDistricts) { loadedStreets in
+                            let allStreets = loadedStreets.values.flatMap { $0 }
+                            let consolidated = StreetConsolidator.consolidate(streets: allStreets)
+                            Task { @MainActor in
+                                self.fastProcessor?.consolidatedStreets = consolidated
+                                print("✅ Populated \(consolidated.count) consolidated streets")
+                            }
+                            continuation.resume()
+                        }
+                    }
+                }
+            }
+        }
+        
         // Load fingerprints
         berlinVisitedFingerprint = UserDefaults.standard.string(forKey: "berlinVisitedFingerprint") ?? ""
     }
-
-    private func saveCachedData() {
+    
+    func saveCachedData() {
         // Save Berlin districts
         if let districtsData = try? JSONEncoder().encode(Array(berlinDistrictsVisitedCached)) {
             UserDefaults.standard.set(districtsData, forKey: "berlinDistrictsVisited")
         }
-
+        
         // Save Berlin stadtteile
         if let stadtteilData = try? JSONEncoder().encode(Array(berlinStadtteileVisitedCached)) {
             UserDefaults.standard.set(stadtteilData, forKey: "berlinStadtteileVisited")
         }
-
+        
         // Save processed routes
         if let routesData = try? JSONEncoder().encode(processedRoutes) {
             UserDefaults.standard.set(routesData, forKey: "berlinProcessedRoutes")
         }
-
+        
         // Save covered segments
         if let segmentsData = try? JSONEncoder().encode(streetSegmentsCovered) {
             UserDefaults.standard.set(segmentsData, forKey: "berlinCoveredSegments")
         }
 
+        if !streetCoverageByID.isEmpty {
+            let cache = StreetCoverageCache(
+                formatVersion: streetCoverageFormatVersion,
+                generatedAt: streetCoverageLastUpdated ?? Date(),
+                totalStreetCount: totalBerlinStreets,
+                coveredStreetCount: coveredBerlinStreets,
+                fullyCoveredStreetCount: fullyCoveredBerlinStreets,
+                coveredPoints: coveredBerlinPoints,
+                totalPoints: totalBerlinPoints,
+                overallCoveragePercentage: overallStreetCoverage,
+                coverageByStreetID: streetCoverageByID,
+                districtStats: districtCoverageStats,
+                stadtteilStats: stadtteilCoverageStats
+            )
+            if let coverageData = try? JSONEncoder().encode(cache) {
+                UserDefaults.standard.set(coverageData, forKey: streetCoverageCacheKey)
+            }
+        } else {
+            UserDefaults.standard.removeObject(forKey: streetCoverageCacheKey)
+        }
+        
         // Save fingerprints
         UserDefaults.standard.set(berlinVisitedFingerprint, forKey: "berlinVisitedFingerprint")
     }
-
+    
     // Define all possible achievements
     private func getAllAchievements() -> [Achievement] {
         return [
@@ -805,7 +939,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Walking Distance
             Achievement(
                 id: "walking_distance",
@@ -820,7 +954,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Countries Visited (at least 1km)
             Achievement(
                 id: "countries_visited",
@@ -835,7 +969,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Countries Explored (at least 100km)
             Achievement(
                 id: "countries_explored",
@@ -850,7 +984,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Countries Mastered (at least 1000km)
             Achievement(
                 id: "countries_mastered",
@@ -865,7 +999,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Cities Visited (at least 1km)
             Achievement(
                 id: "cities_visited",
@@ -880,7 +1014,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Cities Explored (at least 100km)
             Achievement(
                 id: "cities_explored",
@@ -895,7 +1029,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Cities Mastered (at least 1000km)
             Achievement(
                 id: "cities_mastered",
@@ -910,7 +1044,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Daily Distance (all workouts)
             Achievement(
                 id: "daily_distance",
@@ -925,7 +1059,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Daily Running Distance
             Achievement(
                 id: "daily_running",
@@ -940,7 +1074,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Berlin Districts (there are 12 districts in Berlin)
             Achievement(
                 id: "berlin_districts",
@@ -955,7 +1089,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Berlin Stadtteile (neighborhoods - there are 97 neighborhoods in Berlin)
             Achievement(
                 id: "berlin_stadtteile",
@@ -970,7 +1104,7 @@ class AchievementsManager: ObservableObject {
                 ],
                 currentTier: .none
             ),
-
+            
             // Berlin Streets
             Achievement(
                 id: "berlin_streets",
@@ -987,15 +1121,15 @@ class AchievementsManager: ObservableObject {
             ),
         ]
     }
-
+    
     private struct AchievementSaveData: Codable {
         let tier: String
         let date: Date
     }
-
+    
     private func loadAchievements() {
         var allAchievements = getAllAchievements()
-
+        
         // Load tier status from UserDefaults
         if let data = UserDefaults.standard.data(forKey: storageKey),
            let savedData = try? JSONDecoder().decode([String: AchievementSaveData].self, from: data) {
@@ -1007,11 +1141,11 @@ class AchievementsManager: ObservableObject {
                 }
             }
         }
-
+        
         achievements = allAchievements
     }
-
-    func updateAchievementTier(id: String, tier: AchievementTier, currentProgress: Double, nextGoal: Double) {
+    
+    func updateAchievementTier(id: String, tier: AchievementTier, currentProgress: Double, nextGoal: Double, extraContext: String? = nil) {
         guard let index = achievements.firstIndex(where: { $0.id == id }) else {
             return
         }
@@ -1021,9 +1155,9 @@ class AchievementsManager: ObservableObject {
         achievements[index].nextTierGoal = nextGoal
 
         // Special case: Allow downgrade to .none (e.g., when progress is 0)
-        let shouldUpdate = tier.rawValue > achievements[index].currentTier.rawValue ||
-                          achievements[index].currentTier == .none ||
-                          tier == .none
+        let shouldUpdate = tier > achievements[index].currentTier ||
+        achievements[index].currentTier == .none ||
+        tier == .none
 
         // Only update tier if the new tier is higher or resetting to none
         if shouldUpdate {
@@ -1037,7 +1171,7 @@ class AchievementsManager: ObservableObject {
             // Show congratulatory message
             if tier != .none {
                 let achievement = achievements[index]
-                let message: String
+                var message: String
 
                 if oldTier == .none {
                     // First unlock
@@ -1047,13 +1181,18 @@ class AchievementsManager: ObservableObject {
                     message = "🎉 Achievement Upgraded!\n\n\(achievement.title)\n\(oldTier.rawValue) → \(tier.rawValue)"
                 }
 
+                // Add extra context if provided
+                if let extra = extraContext {
+                    message += "\n\n" + extra
+                }
+
                 achievementMessage = message
                 showAchievementAlert = true
                 print("🏆 \(message.replacingOccurrences(of: "\n", with: " "))")
             }
         }
     }
-
+    
     private func saveAchievements() {
         let savedData = achievements
             .filter { $0.currentTier != .none }
@@ -1062,14 +1201,14 @@ class AchievementsManager: ObservableObject {
                     result[achievement.id] = AchievementSaveData(tier: achievement.currentTier.rawValue, date: date)
                 }
             }
-
+        
         if let data = try? JSONEncoder().encode(savedData) {
             UserDefaults.standard.set(data, forKey: storageKey)
         }
     }
-
+    
     // Helper function to determine tier and next goal
-    private func getTierAndNext(for value: Double, tiers: [Double]) -> (AchievementTier, Double) {
+    func getTierAndNext(for value: Double, tiers: [Double]) -> (AchievementTier, Double) {
         if value >= tiers[3] {
             return (.platinum, tiers[3])
         } else if value >= tiers[2] {
@@ -1082,8 +1221,8 @@ class AchievementsManager: ObservableObject {
             return (.none, tiers[0])
         }
     }
-
-    private func getCountTierAndNext(for count: Int, tiers: [Int]) -> (AchievementTier, Double) {
+    
+    func getCountTierAndNext(for count: Int, tiers: [Int]) -> (AchievementTier, Double) {
         if count >= tiers[3] {
             return (.platinum, Double(tiers[3]))
         } else if count >= tiers[2] {
@@ -1096,34 +1235,34 @@ class AchievementsManager: ObservableObject {
             return (.none, Double(tiers[0]))
         }
     }
-
+    
     // Helper functions for checking achievements based on stats
     func checkAndUnlockAchievements(routes: [Route]) {
         // Calculate running and walking distances
         let runningRoutes = routes.filter { $0.workoutType == .running }
         let runningDistance = runningRoutes.reduce(0.0) { $0 + $1.distanceKm }
-
+        
         let walkingRoutes = routes.filter { $0.workoutType == .walking }
         let walkingDistance = walkingRoutes.reduce(0.0) { $0 + $1.distanceKm }
-
+        
         // Check running distance tiers
         let (runningTier, runningNext) = getTierAndNext(for: runningDistance, tiers: [500, 1000, 2500, 10000])
         updateAchievementTier(id: "running_distance", tier: runningTier, currentProgress: runningDistance, nextGoal: runningNext)
-
+        
         // Check walking distance tiers
         let (walkingTier, walkingNext) = getTierAndNext(for: walkingDistance, tiers: [500, 1000, 2500, 10000])
         updateAchievementTier(id: "walking_distance", tier: walkingTier, currentProgress: walkingDistance, nextGoal: walkingNext)
-
+        
         // Calculate country and city stats
         var countryDistances: [String: Double] = [:]
         var cityDistances: [String: Double] = [:]
-
+        
         for route in routes {
             guard let firstCoord = route.coordinates.first else { continue }
             let geocodeResult = LocalGeocoder.geocode(latitude: firstCoord.latitude, longitude: firstCoord.longitude)
             let country = geocodeResult.country
             let city = geocodeResult.city
-
+            
             if !country.isEmpty && country != "Unknown" {
                 countryDistances[country, default: 0] += route.distanceKm
             }
@@ -1132,65 +1271,65 @@ class AchievementsManager: ObservableObject {
                 cityDistances[city, default: 0] += route.distanceKm
             }
         }
-
+        
         // Check countries visited (at least 1km)
         let countriesVisited = countryDistances.filter { $0.value >= 1 }.count
         let (countriesVisitedTier, countriesVisitedNext) = getCountTierAndNext(for: countriesVisited, tiers: [1, 10, 25, 50])
         updateAchievementTier(id: "countries_visited", tier: countriesVisitedTier, currentProgress: Double(countriesVisited), nextGoal: countriesVisitedNext)
-
+        
         // Check countries explored (at least 100km)
         let countriesExplored = countryDistances.filter { $0.value >= 100 }.count
         let (countriesExploredTier, countriesExploredNext) = getCountTierAndNext(for: countriesExplored, tiers: [1, 10, 25, 50])
         updateAchievementTier(id: "countries_explored", tier: countriesExploredTier, currentProgress: Double(countriesExplored), nextGoal: countriesExploredNext)
-
+        
         // Check countries mastered (at least 1000km)
         let countriesMastered = countryDistances.filter { $0.value >= 1000 }.count
         let (countriesMasteredTier, countriesMasteredNext) = getCountTierAndNext(for: countriesMastered, tiers: [1, 10, 25, 50])
         updateAchievementTier(id: "countries_mastered", tier: countriesMasteredTier, currentProgress: Double(countriesMastered), nextGoal: countriesMasteredNext)
-
+        
         // Check cities visited (at least 1km)
         let citiesVisited = cityDistances.filter { $0.value >= 1 }.count
         let (citiesVisitedTier, citiesVisitedNext) = getCountTierAndNext(for: citiesVisited, tiers: [1, 10, 25, 50])
         updateAchievementTier(id: "cities_visited", tier: citiesVisitedTier, currentProgress: Double(citiesVisited), nextGoal: citiesVisitedNext)
-
+        
         // Check cities explored (at least 100km)
         let citiesExplored = cityDistances.filter { $0.value >= 100 }.count
         let (citiesExploredTier, citiesExploredNext) = getCountTierAndNext(for: citiesExplored, tiers: [1, 10, 25, 50])
         updateAchievementTier(id: "cities_explored", tier: citiesExploredTier, currentProgress: Double(citiesExplored), nextGoal: citiesExploredNext)
-
+        
         // Check cities mastered (at least 1000km)
         let citiesMastered = cityDistances.filter { $0.value >= 1000 }.count
         let (citiesMasteredTier, citiesMasteredNext) = getCountTierAndNext(for: citiesMastered, tiers: [1, 10, 25, 50])
         updateAchievementTier(id: "cities_mastered", tier: citiesMasteredTier, currentProgress: Double(citiesMastered), nextGoal: citiesMasteredNext)
-
+        
         // Check daily distance (all workouts)
         var dailyDistances: [String: Double] = [:]
         var dailyRunningDistances: [String: Double] = [:]
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd"
         let today = dateFormatter.string(from: Date())
-
+        
         for route in routes {
             let dateKey = dateFormatter.string(from: route.date)
             dailyDistances[dateKey, default: 0] += route.distanceKm
-
+            
             if route.workoutType == .running {
                 dailyRunningDistances[dateKey, default: 0] += route.distanceKm
             }
         }
-
+        
         // Get max distance ever achieved (for tier)
         let maxDailyDistance = dailyDistances.values.max() ?? 0
         let (dailyTier, dailyNext) = getTierAndNext(for: maxDailyDistance, tiers: [10, 15, 20, 30])
-
+        
         // Get today's distance (for progress message)
         let todayDistance = dailyDistances[today] ?? 0
         updateAchievementTier(id: "daily_distance", tier: dailyTier, currentProgress: todayDistance, nextGoal: dailyNext)
-
+        
         // Check daily running distance
         let maxDailyRunning = dailyRunningDistances.values.max() ?? 0
         let (dailyRunningTier, dailyRunningNext) = getTierAndNext(for: maxDailyRunning, tiers: [10, 15, 20, 30])
-
+        
         // Get today's running distance (for progress message)
         let todayRunning = dailyRunningDistances[today] ?? 0
         updateAchievementTier(id: "daily_running", tier: dailyRunningTier, currentProgress: todayRunning, nextGoal: dailyRunningNext)
@@ -1198,6 +1337,10 @@ class AchievementsManager: ObservableObject {
         // Check Berlin districts visited using actual polygon boundaries (cached)
         let latestDate = routes.map { $0.date.timeIntervalSince1970 }.max() ?? 0
         let fingerprint = "\(routes.count)_\(Int(latestDate))"
+
+        // Track previous districts before updating
+        let previousDistricts = berlinDistrictsVisitedCached
+
         if fingerprint != berlinVisitedFingerprint {
             var visited = Set<String>()
             // Phase 1: quick pass on start/end points for all routes
@@ -1249,391 +1392,203 @@ class AchievementsManager: ObservableObject {
             berlinVisitedFingerprint = fingerprint
             saveCachedData() // Save to persistent storage
         }
-
+        
         let berlinDistrictsCount = berlinDistrictsVisitedCached.count
         let (berlinTier, berlinNext) = getCountTierAndNext(for: berlinDistrictsCount, tiers: [3, 6, 9, 12])
-        updateAchievementTier(id: "berlin_districts", tier: berlinTier, currentProgress: Double(berlinDistrictsCount), nextGoal: berlinNext)
+
+        // Generate contextual message for new districts
+        var districtsContext: String? = nil
+        if fingerprint != berlinVisitedFingerprint { // Only if we just recalculated
+            let newDistricts = berlinDistrictsVisitedCached.subtracting(previousDistricts)
+            if !newDistricts.isEmpty {
+                let sortedNew = newDistricts.sorted()
+                if sortedNew.count == 1 {
+                    districtsContext = "This was your first walk in \(sortedNew[0])!"
+                } else {
+                    districtsContext = "New districts: \(sortedNew.joined(separator: ", "))"
+                }
+
+                // Add progress message
+                let remaining = Int(berlinNext) - berlinDistrictsCount
+                if remaining > 0 {
+                    let tierName: String
+                    if berlinNext == 6 {
+                        tierName = "Silver"
+                    } else if berlinNext == 9 {
+                        tierName = "Gold"
+                    } else if berlinNext == 12 {
+                        tierName = "Platinum"
+                    } else {
+                        tierName = "next tier"
+                    }
+                    districtsContext! += "\nOnly \(remaining) more districts to reach \(tierName)!"
+                }
+            }
+        }
+
+        updateAchievementTier(id: "berlin_districts", tier: berlinTier, currentProgress: Double(berlinDistrictsCount), nextGoal: berlinNext, extraContext: districtsContext)
 
         print("🏙️ Berlin districts visited: \(berlinDistrictsCount) - \(berlinDistrictsVisitedCached)")
+        
+        // Determine visited Stadtteile (prefer fast cache if available)
+        // Track previous stadtteile before updating
+        let previousStadtteile = berlinStadtteileVisitedCached
 
-        // Check Berlin Stadtteile from street segments
-        let visitedStadtteile = Set(streetSegmentsCovered.compactMap { segment -> String? in
-            // Use cached stadtteil if available (new segments), otherwise skip (old segments will be reprocessed eventually)
-            return segment.stadtteil
-        })
+        let visitedStadtteile: Set<String>
+        if !stadtteilCoverageStats.isEmpty {
+            visitedStadtteile = Set(stadtteilCoverageStats.filter { $0.coveredStreets > 0 }.map { $0.stadtteil })
+        } else if !streetSegmentsCovered.isEmpty {
+            visitedStadtteile = Set(streetSegmentsCovered.compactMap { $0.stadtteil })
+        } else {
+            visitedStadtteile = []
+        }
 
         berlinStadtteileVisitedCached = visitedStadtteile
         let stadtteilCount = visitedStadtteile.count
         let (stadtteilTier, stadtteilNext) = getCountTierAndNext(for: stadtteilCount, tiers: [10, 25, 50, 75])
-        updateAchievementTier(id: "berlin_stadtteile", tier: stadtteilTier, currentProgress: Double(stadtteilCount), nextGoal: stadtteilNext)
+
+        // Generate contextual message for new stadtteile
+        var stadtteileContext: String? = nil
+        let newStadtteile = visitedStadtteile.subtracting(previousStadtteile)
+        if !newStadtteile.isEmpty {
+            let sortedNew = newStadtteile.sorted()
+            if sortedNew.count == 1 {
+                stadtteileContext = "This was your first walk in \(sortedNew[0])!"
+            } else if sortedNew.count <= 3 {
+                stadtteileContext = "New neighborhoods: \(sortedNew.joined(separator: ", "))"
+            } else {
+                stadtteileContext = "Explored \(sortedNew.count) new neighborhoods!"
+            }
+
+            // Add progress message
+            let remaining = Int(stadtteilNext) - stadtteilCount
+            if remaining > 0 {
+                let tierName: String
+                if stadtteilNext == 25 {
+                    tierName = "Silver"
+                } else if stadtteilNext == 50 {
+                    tierName = "Gold"
+                } else if stadtteilNext == 75 {
+                    tierName = "Platinum"
+                } else {
+                    tierName = "next tier"
+                }
+                stadtteileContext! += "\nOnly \(remaining) more neighborhoods to reach \(tierName)!"
+            }
+        }
+
+        updateAchievementTier(id: "berlin_stadtteile", tier: stadtteilTier, currentProgress: Double(stadtteilCount), nextGoal: stadtteilNext, extraContext: stadtteileContext)
 
         print("🏘️ Berlin Stadtteile visited: \(stadtteilCount)")
-
+        
         // Reset berlin_streets achievement if no coverage
-        if streetSegmentsCovered.isEmpty {
+        if streetSegmentsCovered.isEmpty && streetCoverageByID.isEmpty {
             updateAchievementTier(id: "berlin_streets", tier: .none, currentProgress: 0.0, nextGoal: 10.0)
         }
-
-        // Check Berlin streets coverage - trigger background processing for new routes only
-        Task.detached(priority: .background) {
-            await self.processNewRoutesForStreets(routes: routes)
-        }
-    }
-
-    // Process only new routes incrementally (runs in background)
-    func processNewRoutesForStreets(routes: [Route]) async {
-        print("🚀 processNewRoutesForStreets called with \(routes.count) total routes")
-
-        // Find routes that haven't been processed yet
+        
+        // Check Berlin streets coverage - only process when new routes exist or cache is empty
         let newRoutes = routes.filter { route in
             let routeID = "\(route.date.timeIntervalSince1970)"
             return processedRoutes[routeID] == nil
         }
 
-        print("📊 Found \(newRoutes.count) new routes to process (already processed: \(processedRoutes.count))")
+        let shouldProcessStreets = !newRoutes.isEmpty || streetCoverageByID.isEmpty
 
-        guard !newRoutes.isEmpty else {
-            // All routes processed, just update achievement
-            print("✅ All routes already processed, updating achievement...")
-            await updateStreetsAchievement()
-            return
+        if shouldProcessStreets {
+            Task.detached(priority: .background) {
+                await self.processStreetsFast(routes: routes)
+            }
+        } else {
+            processingStatus = "Streets up to date ✓"
+            processingProgress = 1.0
+            processedBerlinStreets = totalBerlinStreets
+
+            // Update achievement tier based on current coverage
+            if overallStreetCoverage > 0 {
+                let (streetsTier, streetsNext) = getTierAndNext(for: overallStreetCoverage, tiers: [10, 20, 40, 80])
+                updateAchievementTier(id: "berlin_streets", tier: streetsTier, currentProgress: overallStreetCoverage, nextGoal: streetsNext)
+                print("🛣️ Streets achievement updated: \(String(format: "%.2f", overallStreetCoverage))% coverage, tier: \(streetsTier.rawValue)")
+            }
+
+            // Ensure processed routes cache contains current routes
+            for route in routes {
+                let routeID = "\(route.date.timeIntervalSince1970)"
+                if processedRoutes[routeID] == nil {
+                    processedRoutes[routeID] = RouteCoverageData(routeID: routeID, districts: [], coveredSegments: [])
+                }
+            }
+            saveCachedData()
+        }
+    }
+    
+    // Use FastStreetProcessor to process all streets efficiently
+    func processStreetsFast(routes: [Route]) async {
+        print("🚀 Using FastStreetProcessor for \(routes.count) routes")
+
+        // Initialize fast processor if needed
+        if fastProcessor == nil {
+            await MainActor.run {
+                fastProcessor = FastStreetProcessor()
+            }
         }
 
+        guard let processor = fastProcessor else {
+            print("⚠️ Failed to initialize fast processor")
+            return
+        }
+        
+        // Get all districts to process
+        let allDistricts = BerlinDistricts.districts.map { $0.name }
+
         await MainActor.run {
-            processingStatus = "Processing \(newRoutes.count) new routes..."
+            processingStatus = "Processing all Berlin streets..."
             processingProgress = 0
         }
 
-        print("🔄 Starting to process \(newRoutes.count) new routes...")
-
-        // Process routes in batches for frequent updates
-        let batchSize = 5  // Update achievement every 5 routes
-
-        // Process each new route
-        for (index, route) in newRoutes.enumerated() {
-            let routeID = "\(route.date.timeIntervalSince1970)"
-
-            await MainActor.run {
-                processingStatus = "Route \(index + 1)/\(newRoutes.count): Checking start location..."
-                processingProgress = Double(index) / Double(newRoutes.count)
-            }
-
-            // Step 1: Find which districts this route touches (sample every 10th coordinate)
-            var routeDistricts = Set<String>()
-            let samplingInterval = max(10, route.coordinates.count / 20)
-            let samplePoints = stride(from: 0, to: route.coordinates.count, by: samplingInterval)
-            for i in samplePoints {
-                let coord = route.coordinates[i]
-                if let district = BerlinDistricts.getDistrict(lat: coord.latitude, lon: coord.longitude) {
-                    routeDistricts.insert(district)
-                }
-            }
-
-            guard !routeDistricts.isEmpty else {
-                // Route not in Berlin, skip
-                await MainActor.run {
-                    let data = RouteCoverageData(routeID: routeID, districts: [], coveredSegments: [])
-                    processedRoutes[routeID] = data
-                }
-                continue
-            }
-
-            let districtsArray = Array(routeDistricts)
-
-            await MainActor.run {
-                processingStatus = "Route \(index + 1)/\(newRoutes.count): Loading streets for \(routeDistricts.count) districts..."
-            }
-
-            // Step 2: Lazy load streets for only the districts this route touches
-            let streetsByDistrict = BerlinStreets.getStreets(forDistricts: districtsArray)
-            var streetsByDistrictMap: [String: [BerlinStreets.Street]] = [:]
-            for street in streetsByDistrict {
-                streetsByDistrictMap[street.district, default: []].append(street)
-            }
-
-            // If streets not in memory, load them in background
-            if streetsByDistrict.isEmpty {
-                print("🔄 Loading streets for districts: \(districtsArray)")
-                await withCheckedContinuation { continuation in
-                    BerlinStreets.loadDistrictsInBackground(districtsArray) { loadedStreets in
-                        print("✅ Loaded \(loadedStreets.values.map { $0.count }.reduce(0, +)) streets for \(loadedStreets.count) districts")
-                        for (district, streets) in loadedStreets {
-                            streetsByDistrictMap[district] = streets
-                        }
-                        continuation.resume()
-                    }
-                }
-            } else {
-                print("✅ Using cached streets: \(streetsByDistrict.count) streets")
-            }
-
-            let totalStreetsBeforeFilter = streetsByDistrictMap.values.map { $0.count }.reduce(0, +)
-
-            // Step 2.5: Filter by Stadtteil for even better efficiency
-            let allDistrictStreets = Array(streetsByDistrictMap.values.flatMap { $0 })
-            let routeStadtteile = BerlinStreets.getStadtteileFromCoordinates(route.coordinates)
-
-            let filteredStreets: [BerlinStreets.Street]
-            if !routeStadtteile.isEmpty {
-                filteredStreets = BerlinStreets.filterStreets(allDistrictStreets, byStadtteile: routeStadtteile)
-                if index < 3 {
-                    print("🎯 Route \(index + 1): Filtered from \(totalStreetsBeforeFilter) streets to \(filteredStreets.count) by Stadtteil (\(routeStadtteile.count) neighborhoods)")
-                }
-            } else {
-                // Fallback to all streets if Stadtteil detection fails
-                filteredStreets = allDistrictStreets
-            }
-
-            // Rebuild streetsByDistrictMap with filtered streets
-            streetsByDistrictMap.removeAll()
-            for street in filteredStreets {
-                streetsByDistrictMap[street.district, default: []].append(street)
-            }
-
-            let totalStreets = filteredStreets.count
-            await MainActor.run {
-                processingStatus = "Route \(index + 1)/\(newRoutes.count): Checking \(totalStreets) streets in \(routeStadtteile.count) neighborhoods..."
-            }
-
-            // Sample route coordinates to reduce comparisons (every 10th coordinate)
-            let routeSamplingInterval = max(10, route.coordinates.count / 50)
-            var sampledRouteCoords: [CLLocationCoordinate2D] = []
-            for i in stride(from: 0, to: route.coordinates.count, by: routeSamplingInterval) {
-                sampledRouteCoords.append(route.coordinates[i])
-            }
-            // Always include last point
-            if let last = route.coordinates.last {
-                sampledRouteCoords.append(last)
-            }
-
-            var candidateStreets: [(street: BerlinStreets.Street, matchedPoints: Set<Int>)] = []
-            var totalStreetsChecked = 0
-            for district in districtsArray {
-                guard let streets = streetsByDistrictMap[district] else { continue }
-                totalStreetsChecked += streets.count
-
-                for street in streets {
-                    // Quick check: sample 10 points on street
-                    let step = max(1, street.coordinates.count / 10)
-                    var matchedPoints = Set<Int>()
-
-                    for i in stride(from: 0, to: street.coordinates.count, by: step) {
-                        let streetPoint = CLLocation(latitude: street.coordinates[i].lat,
-                                                    longitude: street.coordinates[i].lon)
-
-                        // Check if any SAMPLED route point is within 15m
-                        for routeCoord in sampledRouteCoords {
-                            let routePoint = CLLocation(latitude: routeCoord.latitude, longitude: routeCoord.longitude)
-                            if streetPoint.distance(from: routePoint) <= 15 {
-                                matchedPoints.insert(i)
-                                break
-                            }
-                        }
-                    }
-
-                    if !matchedPoints.isEmpty {
-                        candidateStreets.append((street: street, matchedPoints: matchedPoints))
-                    }
-                }
-            }
-
-            if index < 3 {
-                print("🔍 Route \(index + 1): Checked \(totalStreetsChecked) streets, found \(candidateStreets.count) candidates")
-            }
-
-            await MainActor.run {
-                processingStatus = "Route \(index + 1)/\(newRoutes.count): Found \(candidateStreets.count) candidate streets, refining..."
-            }
-
-            if candidateStreets.isEmpty {
-                print("⚠️ Route \(index + 1): No candidate streets found in \(districtsArray). Total streets checked: \(totalStreets)")
-            }
-
-            // Step 3: Refine coverage for candidate streets
-            var newSegments: [StreetSegment] = []
-            var debugCandidateCount = 0
-            for candidate in candidateStreets {
-                let street = candidate.street
-                debugCandidateCount += 1
-
-                // Check uncovered segments only
-                var uncoveredRanges: [(Int, Int)] = []
-                var currentStart: Int? = nil
-
-                for i in 0..<street.coordinates.count {
-                    let segment = StreetSegment(streetName: street.name, district: street.district, stadtteil: street.stadtteil,
-                                               startIndex: i, endIndex: i)
-                    let isAlreadyCovered = streetSegmentsCovered.contains(segment)
-
-                    if !isAlreadyCovered {
-                        if currentStart == nil {
-                            currentStart = i
-                        }
-                    } else {
-                        if let start = currentStart {
-                            uncoveredRanges.append((start, i - 1))
-                            currentStart = nil
-                        }
-                    }
-                }
-                if let start = currentStart {
-                    uncoveredRanges.append((start, street.coordinates.count - 1))
-                }
-
-                if index < 3 && debugCandidateCount <= 3 {
-                    print("   Street '\(street.name)': \(street.coordinates.count) coords, \(uncoveredRanges.count) uncovered ranges")
-                    if !uncoveredRanges.isEmpty {
-                        print("      First range: \(uncoveredRanges[0].0)-\(uncoveredRanges[0].1)")
-                    }
-                }
-
-                // Check which uncovered ranges are now covered by this route
-                // Use sampled route coordinates for faster comparison
-                var rangeSegmentsFound = 0
-                for range in uncoveredRanges {
-                    for i in range.0...range.1 {
-                        let streetPoint = CLLocation(latitude: street.coordinates[i].lat,
-                                                    longitude: street.coordinates[i].lon)
-
-                        var covered = false
-                        for routeCoord in sampledRouteCoords {
-                            let routePoint = CLLocation(latitude: routeCoord.latitude, longitude: routeCoord.longitude)
-                            if streetPoint.distance(from: routePoint) <= 15 {
-                                covered = true
-                                break
-                            }
-                        }
-
-                        if covered {
-                            let segment = StreetSegment(streetName: street.name, district: street.district, stadtteil: street.stadtteil,
-                                                       startIndex: i, endIndex: i)
-                            newSegments.append(segment)
-                            rangeSegmentsFound += 1
-                        }
-                    }
-                }
-
-                if index < 3 && debugCandidateCount <= 3 {
-                    print("      Found \(rangeSegmentsFound) covered points from \(uncoveredRanges.count) ranges")
-                }
-            }
-
-            // Save this route's data
-            await MainActor.run {
-                let data = RouteCoverageData(routeID: routeID,
-                                            districts: districtsArray,
-                                            coveredSegments: newSegments)
-                processedRoutes[routeID] = data
-                streetSegmentsCovered.formUnion(newSegments)
-
-                processingStatus = "Route \(index + 1)/\(newRoutes.count): Saved \(newSegments.count) new street segments (total: \(streetSegmentsCovered.count))"
-                print("✅ Route \(index + 1): \(newSegments.count) segments, total covered: \(streetSegmentsCovered.count)")
-
-                // Save and update achievement every batch
-                if (index + 1) % batchSize == 0 {
-                    saveCachedData()
-                    processingStatus = "Updating achievement (\(index + 1)/\(newRoutes.count))..."
-                }
-            }
-
-            // Incremental achievement update after each batch
-            if (index + 1) % batchSize == 0 {
-                print("📊 Triggering achievement recalculation after route \(index + 1)/\(newRoutes.count)")
-                await updateStreetsAchievement()
-                await MainActor.run {
-                    objectWillChange.send() // Force UI refresh
-                }
-                print("📊 Achievement UI updated after route \(index + 1)/\(newRoutes.count)")
-            }
-        }
-
-        // Final save and update achievement
+        // Use fast processor to analyze all streets
+        let output = await processor.processAllStreets(routes: routes, districts: allDistricts)
+        
+        // Update achievements manager with fast processor results
         await MainActor.run {
-            saveCachedData()
+            self.streetCoverageByID = output.coverageByStreetID
+            self.districtCoverageStats = output.districtStats
+            self.stadtteilCoverageStats = output.stadtteilStats
+            self.overallStreetCoverage = output.overallCoveragePercentage
+            self.totalBerlinStreets = output.totalStreetCount
+            self.coveredBerlinStreets = output.coveredStreetCount
+            self.fullyCoveredBerlinStreets = output.fullyCoveredStreetCount
+            self.coveredBerlinPoints = output.coveredPoints
+            self.totalBerlinPoints = output.totalPoints
+
             processingStatus = "Complete!"
             processingProgress = 1.0
+
+            // Update achievement
+            let (streetsTier, streetsNext) = getTierAndNext(for: overallStreetCoverage, tiers: [10, 20, 40, 80])
+            updateAchievementTier(id: "berlin_streets", tier: streetsTier, currentProgress: overallStreetCoverage, nextGoal: streetsNext)
+
+            saveCachedData()
         }
 
-        await updateStreetsAchievement()
+        print("✅ Fast processor complete: \(String(format: "%.2f", output.overallCoveragePercentage))% coverage")
     }
-
-    func updateStreetsAchievement() async {
-        // Get unique districts from covered segments
-        let coveredDistricts = Set(streetSegmentsCovered.map { $0.district })
-
-        guard !coveredDistricts.isEmpty else {
-            print("⚠️ No covered districts yet")
-            return
-        }
-
-        // Load streets for covered districts if not in memory
-        var allStreets = BerlinStreets.getStreets(forDistricts: Array(coveredDistricts))
-
-        if allStreets.isEmpty {
-            // Need to load from disk/GeoJSON
-            await withCheckedContinuation { continuation in
-                BerlinStreets.loadDistrictsInBackground(Array(coveredDistricts)) { loadedStreets in
-                    allStreets = loadedStreets.values.flatMap { $0 }
-                    continuation.resume()
+        
+        func updateStreetsAchievement() async {
+            // Use fast processor data if available
+            if !streetCoverageByID.isEmpty && overallStreetCoverage > 0 {
+                await MainActor.run {
+                    let (streetsTier, streetsNext) = getTierAndNext(for: overallStreetCoverage, tiers: [10, 20, 40, 80])
+                    updateAchievementTier(id: "berlin_streets", tier: streetsTier, currentProgress: overallStreetCoverage, nextGoal: streetsNext)
+                    objectWillChange.send()
+                    print("🛣️ Streets achievement updated: \(String(format: "%.2f", overallStreetCoverage))% overall coverage, tier: \(streetsTier.rawValue)")
                 }
+                return
             }
-        }
 
-        guard !allStreets.isEmpty else {
-            print("⚠️ Failed to load streets for districts: \(coveredDistricts)")
-            return
-        }
-
-        print("📊 Calculating coverage for \(allStreets.count) street segments across \(coveredDistricts.count) districts")
-
-        // Group streets by name (multiple segments of same street count as one)
-        var streetsByName: [String: [(street: BerlinStreets.Street, coveredIndices: Set<Int>)]] = [:]
-
-        for street in allStreets {
-            // Get unique coordinate indices that are covered for this segment
-            let coveredIndices = Set(streetSegmentsCovered
-                .filter { $0.streetName == street.name && $0.district == street.district }
-                .map { $0.startIndex })
-
-            streetsByName[street.name, default: []].append((street: street, coveredIndices: coveredIndices))
-        }
-
-        // Calculate coverage per unique street name
-        var streetCoverage: [(name: String, percentage: Double)] = []
-        var totalCoordsAll = 0
-        var totalCoveredAll = 0
-
-        for (name, segments) in streetsByName {
-            let totalCoords = segments.reduce(0) { $0 + $1.street.coordinates.count }
-            let coveredCoords = segments.reduce(0) { $0 + $1.coveredIndices.count }
-            // Cap at 100% (indices are per-segment so can theoretically exceed total)
-            let percentage = totalCoords > 0 ? min(100.0, (Double(coveredCoords) / Double(totalCoords)) * 100.0) : 0
-            streetCoverage.append((name: name, percentage: percentage))
-
-            totalCoordsAll += totalCoords
-            totalCoveredAll += coveredCoords
-        }
-
-        // Calculate overall percentage (total covered coords / total coords across all streets)
-        let overallPercentage = totalCoordsAll > 0 ? (Double(totalCoveredAll) / Double(totalCoordsAll)) * 100.0 : 0
-        let completedStreets = streetCoverage.filter { $0.percentage >= 50 }.count
-        let totalStreets = streetsByName.count
-
-        print("📊 Grouped \(allStreets.count) segments into \(totalStreets) unique streets")
-        print("📊 Example streets: \(Array(streetsByName.keys.prefix(5)))")
-        print("📊 Overall coverage: \(String(format: "%.2f", overallPercentage))% of all street coordinates")
-
-        await MainActor.run {
-            let (streetsTier, streetsNext) = getTierAndNext(for: overallPercentage, tiers: [10, 20, 40, 80])
-            updateAchievementTier(id: "berlin_streets", tier: streetsTier, currentProgress: overallPercentage, nextGoal: streetsNext)
-
-            // Force UI update
-            objectWillChange.send()
-
-            print("🛣️ Streets achievement updated: \(completedStreets)/\(totalStreets) streets completed, \(String(format: "%.2f", overallPercentage))% overall coverage")
+            // No data yet - fast processor hasn't run or is still processing
+            print("⚠️ No street coverage data yet - waiting for fast processor")
         }
     }
-}
 
 // MARK: - Achievement Detail View
 
@@ -1646,7 +1601,7 @@ struct AchievementDetailView: View {
     var visitedBerlinDistricts: Set<String>? = nil
     var achievementsManager: AchievementsManager? = nil
     @Environment(\.dismiss) var dismiss
-
+    
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
@@ -1656,18 +1611,18 @@ struct AchievementDetailView: View {
                         Circle()
                             .fill(achievement.isUnlocked ?
                                   LinearGradient(colors: [achievement.currentTier.color, achievement.currentTier.color.opacity(0.6)], startPoint: .topLeading, endPoint: .bottomTrailing) :
-                                  LinearGradient(colors: [.gray.opacity(0.3)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                                    LinearGradient(colors: [.gray.opacity(0.3)], startPoint: .topLeading, endPoint: .bottomTrailing))
                             .frame(width: 120, height: 120)
-
+                        
                         Image(systemName: achievement.iconName)
                             .font(.system(size: 48))
                             .foregroundColor(achievement.isUnlocked ? .white : .gray)
                     }
-
+                    
                     Text(achievement.title)
                         .font(.title)
                         .fontWeight(.bold)
-
+                    
                     if achievement.isUnlocked {
                         Text(achievement.currentTier.rawValue)
                             .font(.headline)
@@ -1677,13 +1632,13 @@ struct AchievementDetailView: View {
                             .background(achievement.currentTier.color)
                             .cornerRadius(8)
                     }
-
+                    
                     Text(achievement.progressMessage)
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
                 .padding()
-
+                
                 // Content based on achievement type
                 if achievement.id == "berlin_districts" {
                     // Show Berlin districts list (uses cached set if available)
@@ -1709,17 +1664,17 @@ struct AchievementDetailView: View {
         .navigationTitle("Achievement Details")
         .navigationBarTitleDisplayMode(.inline)
     }
-
+    
     @ViewBuilder
     private func distanceGraphView(achievement: Achievement) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Progress Over Time")
                 .font(.headline)
                 .padding(.horizontal)
-
+            
             let workoutType: HKWorkoutActivityType = achievement.id.contains("running") ? .running : .walking
             let filteredRoutes = routes.filter { $0.workoutType == workoutType }.sorted { $0.date < $1.date }
-
+            
             if !filteredRoutes.isEmpty {
                 CumulativeDistanceGraph(routes: filteredRoutes, achievement: achievement)
                     .frame(height: 300)
@@ -1734,16 +1689,16 @@ struct AchievementDetailView: View {
         .background(Color.gray.opacity(0.1))
         .cornerRadius(12)
     }
-
+    
     @ViewBuilder
     private func locationListView(achievement: Achievement) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Qualified Locations")
                 .font(.headline)
                 .padding(.horizontal)
-
+            
             let locations = getQualifiedLocations(achievement: achievement)
-
+            
             if !locations.isEmpty {
                 ForEach(locations, id: \.name) { location in
                     Button(action: {
@@ -1784,7 +1739,7 @@ struct AchievementDetailView: View {
             }
         }
     }
-
+    
     @ViewBuilder
     private func berlinDistrictsView() -> some View {
         BerlinDistrictsListView(
@@ -1792,9 +1747,10 @@ struct AchievementDetailView: View {
             cachedVisited: visitedBerlinDistricts,
             onDistrictSelected: onDistrictSelected,
             onShowAllDistricts: onShowAllDistricts,
-            dismiss: dismiss)
+            dismiss: dismiss,
+            achievementsManager: achievementsManager)
     }
-
+    
     @ViewBuilder
     private func berlinStadtteileView() -> some View {
         if let achievementsManager = achievementsManager {
@@ -1806,21 +1762,22 @@ struct AchievementDetailView: View {
                 .foregroundColor(.secondary)
         }
     }
-
+    
     private struct BerlinDistrictsListView: View {
         let routes: [Route]
         let cachedVisited: Set<String>?
         let onDistrictSelected: ((String, Double, Double) -> Void)?
         let onShowAllDistricts: (() -> Void)?
         let dismiss: DismissAction
-
+        let achievementsManager: AchievementsManager?
+        
         @State private var visitedDistricts: Set<String> = []
         @State private var isComputing = true
         @State private var totalRoutes: Int = 0
         @State private var processedRoutes: Int = 0
         @State private var totalCoords: Int = 0
         @State private var processedCoords: Int = 0
-
+        
         var body: some View {
             VStack(alignment: .leading, spacing: 16) {
                 // Show All Districts button
@@ -1846,7 +1803,7 @@ struct AchievementDetailView: View {
                     .cornerRadius(12)
                 }
                 .padding(.horizontal)
-
+                
                 if isComputing {
                     VStack(spacing: 8) {
                         ProgressView(value: totalRoutes == 0 ? 0 : Double(processedRoutes) / Double(totalRoutes))
@@ -1863,20 +1820,21 @@ struct AchievementDetailView: View {
                 } else {
                     let allDistricts = BerlinDistricts.districts.map { $0.name }
                     let missingDistricts = allDistricts.filter { !visitedDistricts.contains($0) }
-
+                    
                     if !visitedDistricts.isEmpty {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("Visited Districts (\(visitedDistricts.count)/12)")
                                 .font(.headline)
                                 .padding(.horizontal)
-
+                            
                             ForEach(Array(visitedDistricts.sorted()), id: \.self) { district in
-                                Button(action: {
-                                    if let districtInfo = BerlinDistricts.districts.first(where: { $0.name == district }) {
-                                onDistrictSelected?(district, districtInfo.lat, districtInfo.lon)
-                                        dismiss()
-                                    }
-                                }) {
+                                NavigationLink(destination: DistrictStreetListView(
+                                    districtName: district,
+                                    stadtteilName: nil,
+                                    streets: achievementsManager?.streetsByDistrict[district] ?? [],
+                                    routes: routes,
+                                    processor: achievementsManager?.fastProcessor ?? FastStreetProcessor()
+                                )) {
                                     HStack {
                                         Image(systemName: "checkmark.circle.fill")
                                             .foregroundColor(.green)
@@ -1884,33 +1842,35 @@ struct AchievementDetailView: View {
                                             .font(.body)
                                             .foregroundColor(.primary)
                                         Spacer()
-                                        Image(systemName: "map.fill")
-                                            .foregroundColor(.blue)
+                                        Image(systemName: "chevron.right")
+                                            .foregroundColor(.gray)
                                             .font(.caption)
                                     }
                                     .padding()
                                     .background(Color.green.opacity(0.1))
                                     .cornerRadius(8)
                                 }
+                                .buttonStyle(PlainButtonStyle())
                             }
                             .padding(.horizontal)
                         }
                     }
-
+                    
                     if !missingDistricts.isEmpty {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("Not Yet Visited (\(missingDistricts.count)/12)")
                                 .font(.headline)
                                 .padding(.horizontal)
                                 .padding(.top, 8)
-
+                            
                             ForEach(missingDistricts.sorted(), id: \.self) { district in
-                                Button(action: {
-                                    if let districtInfo = BerlinDistricts.districts.first(where: { $0.name == district }) {
-                                onDistrictSelected?(district, districtInfo.lat, districtInfo.lon)
-                                        dismiss()
-                                    }
-                                }) {
+                                NavigationLink(destination: DistrictStreetListView(
+                                    districtName: district,
+                                    stadtteilName: nil,
+                                    streets: achievementsManager?.streetsByDistrict[district] ?? [],
+                                    routes: routes,
+                                    processor: achievementsManager?.fastProcessor ?? FastStreetProcessor()
+                                )) {
                                     HStack {
                                         Image(systemName: "circle")
                                             .foregroundColor(.gray)
@@ -1918,7 +1878,7 @@ struct AchievementDetailView: View {
                                             .font(.body)
                                             .foregroundColor(.secondary)
                                         Spacer()
-                                        Image(systemName: "map.fill")
+                                        Image(systemName: "chevron.right")
                                             .foregroundColor(.gray)
                                             .font(.caption)
                                     }
@@ -1926,11 +1886,12 @@ struct AchievementDetailView: View {
                                     .background(Color.gray.opacity(0.1))
                                     .cornerRadius(8)
                                 }
+                                .buttonStyle(PlainButtonStyle())
                             }
                             .padding(.horizontal)
                         }
                     }
-
+                    
                     if visitedDistricts.isEmpty && missingDistricts.count == 12 {
                         Text("No Berlin districts visited yet. Start exploring Berlin!")
                             .foregroundColor(.secondary)
@@ -1948,7 +1909,7 @@ struct AchievementDetailView: View {
                 }
             }
         }
-
+        
         private func computeVisitedAsync() async {
             await MainActor.run {
                 isComputing = true
@@ -1998,11 +1959,11 @@ struct AchievementDetailView: View {
     
     private func getBerlinDistrictsVisited() -> Set<String> {
         var visitedDistricts = Set<String>()
-
+        
         for route in routes {
             // Check multiple points along the route to catch all districts
             let checkPoints = stride(from: 0, to: route.coordinates.count, by: max(1, route.coordinates.count / 10))
-
+            
             for i in checkPoints {
                 let coord = route.coordinates[i]
                 if let district = BerlinDistricts.getDistrict(lat: coord.latitude, lon: coord.longitude) {
@@ -2010,32 +1971,32 @@ struct AchievementDetailView: View {
                 }
             }
         }
-
+        
         return visitedDistricts
     }
-
+    
     @ViewBuilder
     private func berlinStreetsView() -> some View {
         if let manager = achievementsManager {
-            BerlinStreetsListView(achievementsManager: manager)
+            BerlinStreetsListView(achievementsManager: manager, routes: routes)
         } else {
             Text("Loading...")
         }
     }
-
+    
     @ViewBuilder
     private func dailyDistanceView() -> some View {
         VStack(alignment: .leading, spacing: 16) {
             // Determine if this is running-only or all workouts
             let isRunningOnly = achievement.id == "daily_running"
             let dailyDistances = calculateDailyDistances(runningOnly: isRunningOnly)
-
+            
             // Count achievements by tier
             let bronzeCount = dailyDistances.filter { $0.value >= 10.0 && $0.value < 15.0 }.count
             let silverCount = dailyDistances.filter { $0.value >= 15.0 && $0.value < 20.0 }.count
             let goldCount = dailyDistances.filter { $0.value >= 20.0 && $0.value < 30.0 }.count
             let platinumCount = dailyDistances.filter { $0.value >= 30.0 }.count
-
+            
             // Tier summary
             HStack(spacing: 20) {
                 if bronzeCount > 0 {
@@ -2081,15 +2042,15 @@ struct AchievementDetailView: View {
             }
             .frame(maxWidth: .infinity)
             .padding()
-
+            
             Divider()
-
+            
             Text("All Achievements (Highest to Lowest)")
                 .font(.headline)
                 .padding(.horizontal)
-
+            
             let sortedDays = dailyDistances.filter { $0.value >= 10.0 }.sorted { $0.value > $1.value }
-
+            
             if !sortedDays.isEmpty {
                 ForEach(sortedDays, id: \.key) { date, distance in
                     HStack {
@@ -2129,16 +2090,16 @@ struct AchievementDetailView: View {
             }
         }
     }
-
+    
     private func getQualifiedLocations(achievement: Achievement) -> [(name: String, distance: Double)] {
         var locationDistances: [String: Double] = [:]
         let isCity = achievement.category == .city
-
+        
         for route in routes {
             guard let firstCoord = route.coordinates.first else { continue }
             let geocodeResult = LocalGeocoder.geocode(latitude: firstCoord.latitude, longitude: firstCoord.longitude)
             let locationName = isCity ? geocodeResult.city : geocodeResult.country
-
+            
             // Filter out "Other" cities and unknown locations
             if !locationName.isEmpty && locationName != "Unknown" {
                 if isCity && locationName.starts(with: "Other ") {
@@ -2147,7 +2108,7 @@ struct AchievementDetailView: View {
                 locationDistances[locationName, default: 0] += route.distanceKm
             }
         }
-
+        
         // Filter based on achievement type
         let threshold: Double
         if achievement.id.contains("visited") {
@@ -2159,18 +2120,18 @@ struct AchievementDetailView: View {
         } else {
             threshold = 0.0
         }
-
+        
         return locationDistances
             .filter { $0.value >= threshold }
             .map { (name: $0.key, distance: $0.value) }
             .sorted { $0.distance > $1.distance }
     }
-
+    
     private func calculateDailyDistances(runningOnly: Bool = false) -> [String: Double] {
         var dailyDistances: [String: Double] = [:]
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd"
-
+        
         for route in routes {
             if runningOnly && route.workoutType != .running {
                 continue
@@ -2178,10 +2139,10 @@ struct AchievementDetailView: View {
             let dateKey = dateFormatter.string(from: route.date)
             dailyDistances[dateKey, default: 0] += route.distanceKm
         }
-
+        
         return dailyDistances
     }
-
+    
     private func formatDate(_ dateString: String) -> String {
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd"
@@ -2191,19 +2152,19 @@ struct AchievementDetailView: View {
         }
         return dateString
     }
-
+    
     // Berlin Stadtteile List View
     private struct BerlinStadtteileListView: View {
         let visitedStadtteile: Set<String>
         let streetSegments: Set<StreetSegment>
-
+        
         @State private var allStadtteile: Set<String> = []
         @State private var isLoading = true
-
+        
         var body: some View {
             VStack(alignment: .leading, spacing: 16) {
                 let missingStadtteile = allStadtteile.subtracting(visitedStadtteile)
-
+                
                 if !allStadtteile.isEmpty {
                     // Summary
                     VStack(spacing: 8) {
@@ -2217,14 +2178,14 @@ struct AchievementDetailView: View {
                     .background(Color.blue.opacity(0.1))
                     .cornerRadius(12)
                     .padding(.horizontal)
-
+                    
                     // Visited Stadtteile
                     if !visitedStadtteile.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("✅ Visited (\(visitedStadtteile.count))")
                                 .font(.headline)
                                 .padding(.horizontal)
-
+                            
                             ForEach(Array(visitedStadtteile.sorted()), id: \.self) { stadtteil in
                                 HStack {
                                     Image(systemName: "checkmark.circle.fill")
@@ -2241,7 +2202,7 @@ struct AchievementDetailView: View {
                             .padding(.horizontal)
                         }
                     }
-
+                    
                     // Missing Stadtteile
                     if !missingStadtteile.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
@@ -2249,7 +2210,7 @@ struct AchievementDetailView: View {
                                 .font(.headline)
                                 .padding(.horizontal)
                                 .padding(.top, 8)
-
+                            
                             ForEach(Array(missingStadtteile.sorted()), id: \.self) { stadtteil in
                                 HStack {
                                     Image(systemName: "circle")
@@ -2292,11 +2253,11 @@ struct AchievementDetailView: View {
                 await loadAllStadtteile()
             }
         }
-
+        
         private func loadAllStadtteile() async {
             // Load all Berlin districts to get all streets
             let allDistricts = BerlinDistricts.districts.map { $0.name }
-
+            
             // Get all streets from all districts
             await withCheckedContinuation { continuation in
                 BerlinStreets.loadDistrictsInBackground(allDistricts) { loadedStreets in
@@ -2304,446 +2265,981 @@ struct AchievementDetailView: View {
                     let stadtteile = Set(loadedStreets.values.flatMap { streets in
                         streets.compactMap { $0.stadtteil }
                     }.filter { !$0.isEmpty && $0 != "Unknown" })
-
+                    
                     Task { @MainActor in
                         allStadtteile = stadtteile
                         isLoading = false
                         print("📍 Loaded \(stadtteile.count) total Stadtteile in Berlin")
                     }
-
+                    
                     continuation.resume()
                 }
             }
         }
     }
-
+    
     // Berlin Streets List View
     private struct BerlinStreetsListView: View {
         @ObservedObject var achievementsManager: AchievementsManager
+        let routes: [Route]
 
-        @State private var streetCoverage: [(street: BerlinStreets.Street, coverage: Double)] = []
-        @State private var districtStats: [(district: String, covered: Int, total: Int)] = []
-        @State private var stadtteilStats: [(stadtteil: String, district: String, covered: Int, total: Int)] = []
+        @State private var streetCoverage: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)] = []
         @State private var overallPercentage: Double = 0
-        @State private var selectedStreet: BerlinStreets.Street?
+        @State private var selectedStreet: ConsolidatedStreet?
+        @State private var isTriggeringProcessing = false
+        @State private var districtStats: [DistrictCoverageStats] = []
+        @State private var stadtteilStats: [StadtteilCoverageStats] = []
+        @State private var selectedDistrictFilter: String?
+        @State private var selectedStadtteilFilter: String?
+        @State private var showMissingStreetsMap: Bool = false
 
         var body: some View {
             VStack(alignment: .leading, spacing: 16) {
-                // Always show overall coverage (starts at 0.0% before loading)
-                VStack(spacing: 8) {
-                    Text(String(format: "%.2f%%", overallPercentage))
-                        .font(.system(size: 48, weight: .bold))
-                        .foregroundColor(.blue)
-                    Text("Overall Street Coverage")
-                        .font(.headline)
-                    if !streetCoverage.isEmpty {
-                        Text("\(streetCoverage.filter { $0.coverage >= 50 }.count)/\(streetCoverage.count) streets >50% covered")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                headerView
+                contentView
+            }
+            .padding()
+            .task { await computeStreetCoverage() }
+            .onReceive(achievementsManager.$streetCoverageByID) { _ in
+                Task { await computeStreetCoverage() }
+            }
+            .sheet(item: Binding(
+                get: { selectedStreet.map { IdentifiableStreet(street: $0) } },
+                set: { selectedStreet = $0?.street }
+            )) { identifiableStreet in
+                StreetMapView(
+                    street: identifiableStreet.street,
+                    routes: routes,
+                    processor: achievementsManager.fastProcessor ?? FastStreetProcessor()
+                )
+            }
+            .sheet(item: Binding(
+                get: { selectedDistrictFilter.map { IdentifiableString(value: $0) } },
+                set: { selectedDistrictFilter = $0?.value }
+            )) { district in
+                FilteredStreetListView(
+                    title: "Streets in \(district.value)",
+                    allStreets: streetCoverage,
+                    filterType: .district(district.value),
+                    routes: routes,
+                    processor: achievementsManager.fastProcessor ?? FastStreetProcessor()
+                )
+            }
+            .sheet(item: Binding(
+                get: { selectedStadtteilFilter.map { IdentifiableString(value: $0) } },
+                set: { selectedStadtteilFilter = $0?.value }
+            )) { stadtteil in
+                FilteredStreetListView(
+                    title: "Streets in \(stadtteil.value)",
+                    allStreets: streetCoverage,
+                    filterType: .stadtteil(stadtteil.value),
+                    routes: routes,
+                    processor: achievementsManager.fastProcessor ?? FastStreetProcessor()
+                )
+            }
+            .sheet(isPresented: $showMissingStreetsMap) {
+                MissingStreetsMapView(
+                    allStreets: streetCoverage,
+                    routes: routes,
+                    processor: achievementsManager.fastProcessor ?? FastStreetProcessor()
+                )
+            }
+        }
+
+        struct IdentifiableString: Identifiable {
+            let value: String
+            var id: String { value }
+        }
+
+        // Data model for district coverage statistics
+        struct DistrictCoverageStats: Identifiable {
+            let id: String
+            let district: String
+            let totalStreets: Int
+            let coveredStreets: Int
+            let fullyCoveredStreets: Int
+            let averageCoverage: Double
+
+            var coveragePercentage: Double {
+                totalStreets > 0 ? (Double(coveredStreets) / Double(totalStreets)) * 100.0 : 0.0
+            }
+        }
+
+        // Data model for stadtteil coverage statistics
+        struct StadtteilCoverageStats: Identifiable {
+            let id: String
+            let stadtteil: String
+            let district: String
+            let totalStreets: Int
+            let coveredStreets: Int
+            let fullyCoveredStreets: Int
+            let averageCoverage: Double
+
+            var coveragePercentage: Double {
+                totalStreets > 0 ? (Double(coveredStreets) / Double(totalStreets)) * 100.0 : 0.0
+            }
+        }
+
+        private func startProcessing() {
+            guard !isTriggeringProcessing else { return }
+            isTriggeringProcessing = true
+            Task {
+                // Clear the cache to force reprocessing
+                await MainActor.run {
+                    achievementsManager.streetCoverageByID = [:]
+                    achievementsManager.processedRoutes = [:]
+                }
+                await achievementsManager.processStreetsFast(routes: routes)
+                await MainActor.run { isTriggeringProcessing = false }
+            }
+        }
+        private func computeStreetCoverage() async {
+            if !achievementsManager.streetCoverageByID.isEmpty {
+                let coverageDict = achievementsManager.streetCoverageByID
+                let consolidated = achievementsManager.fastProcessor?.consolidatedStreets ?? []
+
+                guard !consolidated.isEmpty else {
+                    await MainActor.run {
+                        streetCoverage = []
+                        overallPercentage = achievementsManager.overallStreetCoverage
+                        districtStats = []
+                        stadtteilStats = []
+                    }
+                    return
+                }
+
+                var entries: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)] = []
+                for street in consolidated {
+                    if let coverage = coverageDict[street.id] {
+                        entries.append((street: street, coverage: coverage))
                     }
                 }
-                .padding()
-                .background(Color.blue.opacity(0.1))
-                .cornerRadius(12)
-                .padding(.horizontal)
 
-                // Show live processing status
-                if !achievementsManager.processingStatus.isEmpty && achievementsManager.processingProgress < 1.0 {
-                    VStack(spacing: 8) {
-                        ProgressView(value: achievementsManager.processingProgress)
-                        Text(achievementsManager.processingStatus)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Text(String(format: "%.0f%%", achievementsManager.processingProgress * 100))
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                    .padding()
+                // Compute district statistics
+                var districtData: [String: (total: Int, covered: Int, fullyCovered: Int, totalCoverage: Double)] = [:]
+                for entry in entries {
+                    let district = entry.street.district
+                    let current = districtData[district] ?? (total: 0, covered: 0, fullyCovered: 0, totalCoverage: 0.0)
+                    districtData[district] = (
+                        total: current.total + 1,
+                        covered: current.covered + (entry.coverage.percentage > 0 ? 1 : 0),
+                        fullyCovered: current.fullyCovered + (entry.coverage.isFullyCovered ? 1 : 0),
+                        totalCoverage: current.totalCoverage + entry.coverage.percentage
+                    )
                 }
 
-                // Show content if loaded
-                if !streetCoverage.isEmpty {
+                let districtStatistics = districtData.map { district, data in
+                    DistrictCoverageStats(
+                        id: district,
+                        district: district,
+                        totalStreets: data.total,
+                        coveredStreets: data.covered,
+                        fullyCoveredStreets: data.fullyCovered,
+                        averageCoverage: data.total > 0 ? data.totalCoverage / Double(data.total) : 0.0
+                    )
+                }.sorted { $0.averageCoverage > $1.averageCoverage }
 
-                    // Per-district stats
-                    if !districtStats.isEmpty {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("By District:")
-                                .font(.subheadline)
-                                .fontWeight(.medium)
-                            ForEach(districtStats, id: \.district) { stat in
-                                HStack {
-                                    Text(stat.district)
-                                        .font(.caption)
-                                    Spacer()
-                                    Text("\(stat.covered)/\(stat.total) (\(String(format: "%.1f%%", Double(stat.covered) / Double(stat.total) * 100)))")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
+                // Compute stadtteil statistics - get stadtteil from first segment of each street
+                var stadtteilData: [String: (district: String, total: Int, covered: Int, fullyCovered: Int, totalCoverage: Double)] = [:]
+                for entry in entries {
+                    if let firstSegment = entry.street.segments.first {
+                        let stadtteil = firstSegment.stadtteil
+                        let district = firstSegment.district
+                        let current = stadtteilData[stadtteil] ?? (district: district, total: 0, covered: 0, fullyCovered: 0, totalCoverage: 0.0)
+                        stadtteilData[stadtteil] = (
+                            district: district,
+                            total: current.total + 1,
+                            covered: current.covered + (entry.coverage.percentage > 0 ? 1 : 0),
+                            fullyCovered: current.fullyCovered + (entry.coverage.isFullyCovered ? 1 : 0),
+                            totalCoverage: current.totalCoverage + entry.coverage.percentage
+                        )
+                    }
+                }
+
+                let stadtteilStatistics = stadtteilData.map { stadtteil, data in
+                    StadtteilCoverageStats(
+                        id: stadtteil,
+                        stadtteil: stadtteil,
+                        district: data.district,
+                        totalStreets: data.total,
+                        coveredStreets: data.covered,
+                        fullyCoveredStreets: data.fullyCovered,
+                        averageCoverage: data.total > 0 ? data.totalCoverage / Double(data.total) : 0.0
+                    )
+                }.sorted { $0.averageCoverage > $1.averageCoverage }
+
+                await MainActor.run {
+                    streetCoverage = entries.sorted { lhs, rhs in
+                        if abs(lhs.coverage.percentage - rhs.coverage.percentage) < 0.1 {
+                            return lhs.street.totalLength > rhs.street.totalLength
+                        }
+                        return lhs.coverage.percentage > rhs.coverage.percentage
+                    }
+                    overallPercentage = achievementsManager.overallStreetCoverage
+                    districtStats = districtStatistics
+                    stadtteilStats = stadtteilStatistics
+                }
+                return
+            }
+            await MainActor.run {
+                streetCoverage = []
+                overallPercentage = 0
+                districtStats = []
+                stadtteilStats = []
+            }
+        }
+
+        private var headerView: some View {
+            Text(String(format: "%.2f%% overall coverage", overallPercentage))
+                .font(.system(size: 32, weight: .bold))
+                .foregroundColor(.blue)
+                .frame(maxWidth: .infinity, alignment: .center)
+        }
+
+        @ViewBuilder
+        private var contentView: some View {
+            if streetCoverage.isEmpty {
+                processingPrompt
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    summaryLabel
+                    progressSection
+
+                    // Coverage map button
+                    Button {
+                        showMissingStreetsMap = true
+                    } label: {
+                        HStack {
+                            Image(systemName: "map.fill")
+                                .foregroundColor(.blue)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("View Coverage Map")
+                                    .font(.subheadline)
+                                    .fontWeight(.semibold)
+                                Text("See all street points colored by coverage")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            VStack(alignment: .trailing, spacing: 2) {
+                                HStack(spacing: 4) {
+                                    Circle()
+                                        .fill(Color.green)
+                                        .frame(width: 8, height: 8)
+                                    Text("Covered")
+                                        .font(.caption2)
+                                }
+                                HStack(spacing: 4) {
+                                    Circle()
+                                        .fill(Color.red)
+                                        .frame(width: 8, height: 8)
+                                    Text("Missing")
+                                        .font(.caption2)
                                 }
                             }
                         }
-                        .padding()
+                        .padding(12)
                         .background(Color.blue.opacity(0.1))
                         .cornerRadius(8)
-                        .padding(.horizontal)
+                    }
+                    .buttonStyle(.plain)
+
+                    // District overview
+                    if !districtStats.isEmpty {
+                        districtOverviewSection
                     }
 
-                    // Per-Stadtteil stats
+                    // Stadtteil overview
                     if !stadtteilStats.isEmpty {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("By Stadtteil (Neighborhood):")
-                                .font(.subheadline)
-                                .fontWeight(.medium)
-                            ForEach(stadtteilStats, id: \.stadtteil) { stat in
+                        stadtteilOverviewSection
+                    }
+
+                    streetList
+                }
+            }
+        }
+
+        private var processingPrompt: some View {
+            VStack(spacing: 10) {
+                Text("Street coverage not processed yet.")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                Button(action: startProcessing) {
+                    if isTriggeringProcessing {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                    }
+                    Text(isTriggeringProcessing ? "Processing…" : "Process Streets Now")
+                        .font(.headline)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(Color.blue)
+                        .foregroundColor(.white)
+                        .clipShape(Capsule())
+                }
+                .disabled(isTriggeringProcessing)
+            }
+            .frame(maxWidth: .infinity)
+        }
+
+        private var summaryLabel: some View {
+            let counts = streetCoverage.reduce(into: CoverageSummary()) { result, entry in
+                if entry.coverage.percentage > 0 { result.covered += 1 }
+                if entry.coverage.isFullyCovered { result.fullyCovered += 1 }
+            }
+
+            return Text("\(counts.covered) streets with coverage, \(counts.fullyCovered) fully covered")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+        }
+
+        @ViewBuilder
+        private var progressSection: some View {
+            let value = achievementsManager.processingProgress
+            let status = achievementsManager.processingStatus
+            if !status.isEmpty && value < 1.0 {
+                VStack(spacing: 6) {
+                    if let info = achievementsManager.currentStadtteilProgressInfo {
+                        Text("Processing \(info.stadtteil)")
+                            .font(.caption)
+                    }
+                    ProgressView(value: value)
+                        .progressViewStyle(.linear)
+                    Text(status)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+
+        private struct CoverageSummary {
+            var covered: Int = 0
+            var fullyCovered: Int = 0
+        }
+
+        private var districtOverviewSection: some View {
+            DisclosureGroup {
+                VStack(spacing: 8) {
+                    ForEach(districtStats) { stat in
+                        Button {
+                            selectedDistrictFilter = stat.district
+                        } label: {
+                            VStack(spacing: 4) {
+                                HStack {
+                                    Text(stat.district)
+                                        .font(.subheadline)
+                                        .fontWeight(.semibold)
+                                    Spacer()
+                                    Text(String(format: "%.1f%%", stat.averageCoverage))
+                                        .font(.subheadline)
+                                        .fontWeight(.bold)
+                                        .foregroundColor(colorForCoverage(stat.averageCoverage))
+                                }
+
+                            HStack(spacing: 16) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "road.lanes")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                    Text("\(stat.totalStreets) streets")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+
+                                HStack(spacing: 4) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.caption2)
+                                        .foregroundColor(.green)
+                                    Text("\(stat.coveredStreets) covered")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+
+                                if stat.fullyCoveredStreets > 0 {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "star.fill")
+                                            .font(.caption2)
+                                            .foregroundColor(.orange)
+                                        Text("\(stat.fullyCoveredStreets) 100%")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+
+                            // Coverage bar
+                            GeometryReader { geometry in
+                                ZStack(alignment: .leading) {
+                                    Rectangle()
+                                        .fill(Color.gray.opacity(0.2))
+                                        .frame(height: 6)
+                                        .cornerRadius(3)
+
+                                    Rectangle()
+                                        .fill(colorForCoverage(stat.averageCoverage))
+                                        .frame(width: geometry.size.width * (stat.averageCoverage / 100.0), height: 6)
+                                        .cornerRadius(3)
+                                }
+                            }
+                            .frame(height: 6)
+                            }
+                            .padding(12)
+                            .background(Color.gray.opacity(0.1))
+                            .cornerRadius(8)
+                        }
+                    }
+                }
+                .padding(.top, 8)
+            } label: {
+                HStack {
+                    Text("Coverage by Bezirk (District)")
+                        .font(.headline)
+                    Spacer()
+                    Text("(\(districtStats.count) districts)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+
+        private var stadtteilOverviewSection: some View {
+            DisclosureGroup {
+                VStack(spacing: 8) {
+                    ForEach(Array(stadtteilStats.prefix(10))) { stat in
+                        Button {
+                            selectedStadtteilFilter = stat.stadtteil
+                        } label: {
+                            VStack(spacing: 4) {
                                 HStack {
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(stat.stadtteil)
-                                            .font(.caption)
+                                            .font(.subheadline)
+                                            .fontWeight(.semibold)
                                         Text(stat.district)
                                             .font(.caption2)
                                             .foregroundColor(.secondary)
                                     }
                                     Spacer()
-                                    Text("\(stat.covered)/\(stat.total) (\(String(format: "%.1f%%", Double(stat.covered) / Double(stat.total) * 100)))")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
+                                    Text(String(format: "%.1f%%", stat.averageCoverage))
+                                        .font(.subheadline)
+                                        .fontWeight(.bold)
+                                        .foregroundColor(colorForCoverage(stat.averageCoverage))
                                 }
-                            }
-                        }
-                        .padding()
-                        .background(Color.green.opacity(0.1))
-                        .cornerRadius(8)
-                        .padding(.horizontal)
-                    }
 
-                    ForEach(Array(streetCoverage.prefix(100).enumerated()), id: \.offset) { index, item in
-                        Button(action: {
-                            selectedStreet = item.street
-                        }) {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(item.street.name)
-                                        .font(.body)
-                                        .fontWeight(.semibold)
-                                        .foregroundColor(.primary)
-                                HStack(spacing: 8) {
-                                    Text(String(format: "%.1f%% covered", item.coverage))
-                                        .font(.caption)
+                            HStack(spacing: 12) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "road.lanes")
+                                        .font(.caption2)
                                         .foregroundColor(.secondary)
-                                    Text("•")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                    Text(String(format: "%.0f m", item.street.lengthMeters))
+                                    Text("\(stat.totalStreets)")
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                 }
+
+                                HStack(spacing: 4) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.caption2)
+                                        .foregroundColor(.green)
+                                    Text("\(stat.coveredStreets)")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+
+                                if stat.fullyCoveredStreets > 0 {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "star.fill")
+                                            .font(.caption2)
+                                            .foregroundColor(.orange)
+                                        Text("\(stat.fullyCoveredStreets)")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
                             }
-                            Spacer()
-                            // Progress bar
-                            GeometryReader { geo in
+
+                            // Coverage bar
+                            GeometryReader { geometry in
                                 ZStack(alignment: .leading) {
                                     Rectangle()
                                         .fill(Color.gray.opacity(0.2))
-                                        .frame(width: 60, height: 8)
-                                        .cornerRadius(4)
+                                        .frame(height: 6)
+                                        .cornerRadius(3)
+
                                     Rectangle()
-                                        .fill(item.coverage >= 50 ? Color.green : Color.orange)
-                                        .frame(width: min(60, 60 * item.coverage / 100), height: 8)
-                                        .cornerRadius(4)
+                                        .fill(colorForCoverage(stat.averageCoverage))
+                                        .frame(width: geometry.size.width * (stat.averageCoverage / 100.0), height: 6)
+                                        .cornerRadius(3)
                                 }
                             }
-                            .frame(width: 60, height: 8)
+                            .frame(height: 6)
+                            }
+                            .padding(12)
+                            .background(Color.gray.opacity(0.1))
+                            .cornerRadius(8)
+                        }
+                    }
+                }
+                .padding(.top, 8)
+            } label: {
+                HStack {
+                    Text("Coverage by Stadtteil (Neighborhood)")
+                        .font(.headline)
+                    Spacer()
+                    Text("(top 10)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+
+        private func colorForCoverage(_ percentage: Double) -> Color {
+            if percentage >= 75 {
+                return .green
+            } else if percentage >= 50 {
+                return .orange
+            } else if percentage >= 25 {
+                return .yellow
+            } else {
+                return .red
+            }
+        }
+
+        private var streetList: some View {
+            let limited = Array(streetCoverage.prefix(50))
+            return DisclosureGroup(isExpanded: .constant(true)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(limited, id: \.street.id) { item in
+                        Button {
+                            selectedStreet = item.street
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(item.street.name)
+                                    .font(.headline)
+                                Text(String(format: "%.1f%% · %.0f m", item.coverage.percentage, item.street.totalLength))
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                            .background(Color.gray.opacity(0.1))
+                            .cornerRadius(8)
+                        }
+                    }
+                }
+                .padding(.top, 8)
+            } label: {
+                HStack {
+                    Text("Top 50 Streets by Coverage")
+                        .font(.headline)
+                    Spacer()
+                    Text("(tap to view map)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    // Filtered street list view
+    private struct FilteredStreetListView: View {
+        let title: String
+        let allStreets: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)]
+        let filterType: FilterType
+        let routes: [Route]
+        let processor: FastStreetProcessor
+
+        @State private var sortOption: SortOption = .coverageDesc
+        @State private var selectedStreet: ConsolidatedStreet?
+        @State private var viewMode: ViewMode = .list
+        @Environment(\.dismiss) var dismiss
+
+        enum FilterType {
+            case district(String)
+            case stadtteil(String)
+        }
+
+        enum ViewMode: String, CaseIterable {
+            case list = "List"
+            case lines = "Lines"
+            case dots = "Dots"
+        }
+
+        enum SortOption: String, CaseIterable {
+            case coverageDesc = "Coverage (High to Low)"
+            case coverageAsc = "Coverage (Low to High)"
+            case nameAsc = "Name (A-Z)"
+            case missing = "Missing Streets First"
+            case completed = "Completed Streets First"
+        }
+
+        var filteredStreets: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)] {
+            let filtered: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)]
+
+            switch filterType {
+            case .district(let district):
+                filtered = allStreets.filter { $0.street.district == district }
+            case .stadtteil(let stadtteil):
+                filtered = allStreets.filter { $0.street.segments.first?.stadtteil == stadtteil }
+            }
+
+            switch sortOption {
+            case .coverageDesc:
+                return filtered.sorted { $0.coverage.percentage > $1.coverage.percentage }
+            case .coverageAsc:
+                return filtered.sorted { $0.coverage.percentage < $1.coverage.percentage }
+            case .nameAsc:
+                return filtered.sorted { $0.street.name < $1.street.name }
+            case .missing:
+                return filtered.sorted { ($0.coverage.percentage == 0 ? 0 : 1, $0.street.name) < ($1.coverage.percentage == 0 ? 0 : 1, $1.street.name) }
+            case .completed:
+                return filtered.sorted { ($0.coverage.isFullyCovered ? 0 : 1, -$0.coverage.percentage) < ($1.coverage.isFullyCovered ? 0 : 1, -$1.coverage.percentage) }
+            }
+        }
+
+        var body: some View {
+            NavigationView {
+                VStack(spacing: 0) {
+                    // Stats bar
+                    let missing = filteredStreets.filter { $0.coverage.percentage == 0 }.count
+                    let partial = filteredStreets.filter { $0.coverage.percentage > 0 && !$0.coverage.isFullyCovered }.count
+                    let completed = filteredStreets.filter { $0.coverage.isFullyCovered }.count
+
+                    HStack(spacing: 16) {
+                        VStack {
+                            Text("\(missing)")
+                                .font(.title2)
+                                .fontWeight(.bold)
+                                .foregroundColor(.red)
+                            Text("Missing")
+                                .font(.caption)
+                        }
+                        VStack {
+                            Text("\(partial)")
+                                .font(.title2)
+                                .fontWeight(.bold)
+                                .foregroundColor(.orange)
+                            Text("Partial")
+                                .font(.caption)
+                        }
+                        VStack {
+                            Text("\(completed)")
+                                .font(.title2)
+                                .fontWeight(.bold)
+                                .foregroundColor(.green)
+                            Text("Complete")
+                                .font(.caption)
+                        }
+                    }
+                    .padding()
+                    .background(Color.gray.opacity(0.1))
+
+                    // View toggle and sort picker
+                    HStack {
+                        Picker("View", selection: $viewMode) {
+                            ForEach(ViewMode.allCases, id: \.self) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        if viewMode == .list {
+                            Spacer()
+                            Picker("Sort", selection: $sortOption) {
+                                ForEach(SortOption.allCases, id: \.self) { option in
+                                    Text(option.rawValue).tag(option)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                        }
+                    }
+                    .padding(.horizontal)
+
+                    // Content
+                    if viewMode == .lines {
+                        MultiStreetMapView(
+                            streets: filteredStreets,
+                            routes: routes,
+                            processor: processor,
+                            showDots: false
+                        )
+                    } else if viewMode == .dots {
+                        MultiStreetMapView(
+                            streets: filteredStreets,
+                            routes: routes,
+                            processor: processor,
+                            showDots: true
+                        )
+                    } else {
+                        // Street list
+                        ScrollView {
+                        LazyVStack(spacing: 8) {
+                            ForEach(filteredStreets, id: \.street.id) { item in
+                                Button {
+                                    selectedStreet = item.street
+                                } label: {
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text(item.street.name)
+                                                .font(.headline)
+                                            Text(String(format: "%.1f%% · %.0f m", item.coverage.percentage, item.street.totalLength))
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        Spacer()
+                                        if item.coverage.isFullyCovered {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .foregroundColor(.green)
+                                        } else if item.coverage.percentage == 0 {
+                                            Image(systemName: "circle")
+                                                .foregroundColor(.red)
+                                        } else {
+                                            Image(systemName: "circle.lefthalf.filled")
+                                                .foregroundColor(.orange)
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(12)
+                                    .background(Color.gray.opacity(0.1))
+                                    .cornerRadius(8)
+                                }
                             }
                         }
                         .padding()
-                        .background(Color.gray.opacity(0.1))
-                        .cornerRadius(8)
+                        }
                     }
-                    .padding(.horizontal)
-                    .sheet(item: Binding(
-                        get: { selectedStreet.map { IdentifiableStreet(street: $0) } },
-                        set: { selectedStreet = $0?.street }
-                    )) { identifiableStreet in
-                        StreetMapView(street: identifiableStreet.street, achievementsManager: achievementsManager)
-                    }
-
-                    if streetCoverage.count > 100 {
-                        Text("Showing top 100 streets")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal)
-                    }
-                } // End if !streetCoverage.isEmpty
-            }
-            .task {
-                await computeStreetCoverage()
-            }
-        }
-
-        private func computeStreetCoverage() async {
-            // Get unique districts from covered segments
-            let coveredDistricts = Set(achievementsManager.streetSegmentsCovered.map { $0.district })
-
-            // Load streets only for districts that have coverage
-            let allStreets = BerlinStreets.getStreets(forDistricts: Array(coveredDistricts))
-
-            // If no streets in memory, load them
-            if allStreets.isEmpty && !coveredDistricts.isEmpty {
-                await withCheckedContinuation { continuation in
-                    BerlinStreets.loadDistrictsInBackground(Array(coveredDistricts)) { _ in
-                        continuation.resume()
+                }
+                .navigationTitle(title)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("Done") {
+                            dismiss()
+                        }
                     }
                 }
             }
-
-            let loadedStreets = BerlinStreets.getStreets(forDistricts: Array(coveredDistricts))
-            guard !loadedStreets.isEmpty else { return }
-
-            // Group streets by name (same logic as achievement calculation)
-            var streetsByName: [String: [(street: BerlinStreets.Street, coveredIndices: Set<Int>)]] = [:]
-
-            for street in loadedStreets {
-                // Get unique coordinate indices that are covered for this segment
-                let coveredIndices = Set(achievementsManager.streetSegmentsCovered
-                    .filter { $0.streetName == street.name && $0.district == street.district }
-                    .map { $0.startIndex })
-
-                streetsByName[street.name, default: []].append((street: street, coveredIndices: coveredIndices))
-            }
-
-            // Calculate coverage per unique street name
-            var coverage: [(street: BerlinStreets.Street, coverage: Double)] = []
-            var totalCoordsAll = 0
-            var totalCoveredAll = 0
-
-            for (name, segments) in streetsByName {
-                // Calculate total coordinates across all segments
-                let totalCoords = segments.reduce(0) { $0 + $1.street.coordinates.count }
-
-                // Calculate covered coordinates - each segment's covered indices are independent
-                // We can't just sum them because indices are per-segment
-                var totalCovered = 0
-                for segment in segments {
-                    totalCovered += segment.coveredIndices.count
-                }
-
-                totalCoordsAll += totalCoords
-                totalCoveredAll += totalCovered
-
-                // Percentage is capped at 100%
-                let percentage = totalCoords > 0 ? min(100.0, (Double(totalCovered) / Double(totalCoords)) * 100.0) : 0
-
-                // Sum all segment lengths for total street length
-                let totalLength = segments.reduce(0.0) { $0 + $1.street.lengthMeters }
-
-                // Create a representative street with combined length
-                let firstSegment = segments[0].street
-                let combinedStreet = BerlinStreets.Street(
-                    name: name,
-                    district: firstSegment.district,
-                    stadtteil: firstSegment.stadtteil,
-                    coordinates: firstSegment.coordinates,
-                    lengthMeters: totalLength
+            .sheet(item: Binding(
+                get: { selectedStreet.map { IdentifiableStreet(street: $0) } },
+                set: { selectedStreet = $0?.street }
+            )) { identifiableStreet in
+                StreetMapView(
+                    street: identifiableStreet.street,
+                    routes: routes,
+                    processor: processor
                 )
-
-                coverage.append((street: combinedStreet, coverage: percentage))
-            }
-
-            let overallPct = totalCoordsAll > 0 ? (Double(totalCoveredAll) / Double(totalCoordsAll)) * 100.0 : 0
-            print("📊 Detail view: Grouped \(loadedStreets.count) segments into \(coverage.count) unique streets, overall: \(String(format: "%.2f", overallPct))%")
-
-            // Calculate per-district stats
-            var districtCounts: [String: (covered: Int, total: Int)] = [:]
-            for (_, segments) in streetsByName {
-                guard let firstSegment = segments.first else { continue }
-                let district = firstSegment.street.district
-
-                let totalCoords = segments.reduce(0) { $0 + $1.street.coordinates.count }
-                let coveredCoords = segments.reduce(0) { $0 + $1.coveredIndices.count }
-                let isCovered = coveredCoords >= totalCoords / 2  // 50% threshold
-
-                if districtCounts[district] == nil {
-                    districtCounts[district] = (covered: 0, total: 0)
-                }
-                districtCounts[district]?.total += 1
-                if isCovered {
-                    districtCounts[district]?.covered += 1
-                }
-            }
-
-            let stats = districtCounts.map { (district: $0.key, covered: $0.value.covered, total: $0.value.total) }
-                .sorted { $0.district < $1.district }
-
-            // Calculate per-Stadtteil stats
-            var stadtteilCounts: [String: (district: String, covered: Int, total: Int)] = [:]
-            for (_, segments) in streetsByName {
-                guard let firstSegment = segments.first else { continue }
-                let stadtteil = firstSegment.street.stadtteil
-                let district = firstSegment.street.district
-
-                let totalCoords = segments.reduce(0) { $0 + $1.street.coordinates.count }
-                let coveredCoords = segments.reduce(0) { $0 + $1.coveredIndices.count }
-                let isCovered = coveredCoords >= totalCoords / 2  // 50% threshold
-
-                if stadtteilCounts[stadtteil] == nil {
-                    stadtteilCounts[stadtteil] = (district: district, covered: 0, total: 0)
-                }
-                stadtteilCounts[stadtteil]?.total += 1
-                if isCovered {
-                    stadtteilCounts[stadtteil]?.covered += 1
-                }
-            }
-
-            let stadtteilStatsArray = stadtteilCounts.map {
-                (stadtteil: $0.key, district: $0.value.district, covered: $0.value.covered, total: $0.value.total)
-            }
-            .sorted { first, second in
-                // Calculate coverage percentages
-                let firstPct = first.total > 0 ? Double(first.covered) / Double(first.total) : 0
-                let secondPct = second.total > 0 ? Double(second.covered) / Double(second.total) : 0
-                return firstPct > secondPct  // Highest to lowest
-            }
-
-            // Sort by coverage (descending), then by length (descending) for ties
-            coverage.sort { a, b in
-                if abs(a.coverage - b.coverage) < 0.1 {
-                    return a.street.lengthMeters > b.street.lengthMeters
-                }
-                return a.coverage > b.coverage
-            }
-
-            await MainActor.run {
-                streetCoverage = coverage
-                districtStats = stats
-                stadtteilStats = stadtteilStatsArray
-                overallPercentage = overallPct
             }
         }
     }
 
-    // Helper to make Street identifiable for sheet
-    private struct IdentifiableStreet: Identifiable {
-        let id = UUID()
-        let street: BerlinStreets.Street
-    }
-
-    // Map view that shows true 15m radius circles using MKCircle overlays
-    private struct StreetCircleMapView: UIViewRepresentable {
-        let coordinates: [CLLocationCoordinate2D]
-        @Binding var region: MKCoordinateRegion
+    // Multi-street map view showing all streets in a district/stadtteil
+    private struct MultiStreetMapView: UIViewRepresentable {
+        let streets: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)]
+        let routes: [Route]
+        let processor: FastStreetProcessor
+        let showDots: Bool
 
         func makeUIView(context: Context) -> MKMapView {
             let mapView = MKMapView()
             mapView.delegate = context.coordinator
-            mapView.setRegion(region, animated: false)
 
-            // Add circle overlays for each coordinate with 15m radius
-            for coordinate in coordinates {
-                let circle = MKCircle(center: coordinate, radius: 15.0) // 15 meters
-                mapView.addOverlay(circle)
+            // Calculate region to fit all streets
+            var allCoords: [CLLocationCoordinate2D] = []
+            for item in streets {
+                for segment in item.street.segments {
+                    allCoords.append(contentsOf: segment.coordinates.map {
+                        CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
+                    })
+                }
+            }
+
+            if let firstCoord = allCoords.first {
+                let minLat = allCoords.map { $0.latitude }.min() ?? firstCoord.latitude
+                let maxLat = allCoords.map { $0.latitude }.max() ?? firstCoord.latitude
+                let minLon = allCoords.map { $0.longitude }.min() ?? firstCoord.longitude
+                let maxLon = allCoords.map { $0.longitude }.max() ?? firstCoord.longitude
+
+                let centerLat = (minLat + maxLat) / 2
+                let centerLon = (minLon + maxLon) / 2
+                let spanLat = (maxLat - minLat) * 1.3 // Add 30% padding
+                let spanLon = (maxLon - minLon) * 1.3
+
+                let region = MKCoordinateRegion(
+                    center: CLLocationCoordinate2D(latitude: centerLat, longitude: centerLon),
+                    span: MKCoordinateSpan(latitudeDelta: max(spanLat, 0.01), longitudeDelta: max(spanLon, 0.01))
+                )
+                mapView.setRegion(region, animated: false)
+            }
+
+            if showDots {
+                // Build spatial index for point-by-point coverage checking
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let spatialIndex = SpatialIndex(metersPerCell: 40)
+
+                    // Add all route coordinates to index
+                    for route in routes {
+                        let coords = route.coordinates.map { ($0.latitude, $0.longitude) }
+                        spatialIndex.addRoute(coords)
+                    }
+
+                    // Check each point individually
+                    var overlays: [ColoredCircle] = []
+                    for item in streets {
+                        for segment in item.street.segments {
+                            for coord in segment.coordinates {
+                                let result = spatialIndex.isNearRoute(lat: coord.lat, lon: coord.lon, thresholdMeters: 20)
+
+                                let circle = ColoredCircle(
+                                    center: CLLocationCoordinate2D(latitude: coord.lat, longitude: coord.lon),
+                                    radius: 20.0
+                                )
+
+                                // Color based on actual point coverage
+                                circle.color = result.isNear ? .green : .red
+
+                                overlays.append(circle)
+                            }
+                        }
+                    }
+
+                    // Add to map on main thread
+                    DispatchQueue.main.async {
+                        for circle in overlays {
+                            mapView.addOverlay(circle)
+                        }
+                        print("🗺️ Added \(overlays.count) coverage dots to map")
+                    }
+                }
+            } else {
+                // Add polylines for each street with color based on coverage
+                for item in streets {
+                    for segment in item.street.segments {
+                        let coords = segment.coordinates.map {
+                            CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
+                        }
+
+                        if !coords.isEmpty {
+                            let polyline = ColoredPolyline(coordinates: coords, count: coords.count)
+
+                            // Determine color based on coverage
+                            if item.coverage.isFullyCovered {
+                                polyline.color = .green
+                            } else if item.coverage.percentage == 0 {
+                                polyline.color = .red
+                            } else {
+                                polyline.color = .orange
+                            }
+
+                            polyline.streetName = item.street.name
+                            polyline.coveragePercentage = item.coverage.percentage
+
+                            mapView.addOverlay(polyline)
+                        }
+                    }
+                }
             }
 
             return mapView
         }
 
         func updateUIView(_ mapView: MKMapView, context: Context) {
-            mapView.setRegion(region, animated: true)
+            // Nothing to update
         }
 
         func makeCoordinator() -> Coordinator {
-            Coordinator(self)
+            Coordinator()
         }
 
         class Coordinator: NSObject, MKMapViewDelegate {
-            var parent: StreetCircleMapView
-
-            init(_ parent: StreetCircleMapView) {
-                self.parent = parent
-            }
-
             func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
-                if let circleOverlay = overlay as? MKCircle {
-                    let renderer = MKCircleRenderer(circle: circleOverlay)
-                    renderer.fillColor = UIColor.blue.withAlphaComponent(0.3)
-                    renderer.strokeColor = UIColor.blue
+                if let polyline = overlay as? ColoredPolyline {
+                    let renderer = MKPolylineRenderer(polyline: polyline)
+                    renderer.strokeColor = UIColor(polyline.color)
+                    renderer.lineWidth = 4
+                    renderer.alpha = 0.95  // Less transparent
+                    return renderer
+                } else if let circle = overlay as? ColoredCircle {
+                    let renderer = MKCircleRenderer(circle: circle)
+                    renderer.fillColor = UIColor(circle.color).withAlphaComponent(0.6)
+                    renderer.strokeColor = UIColor(circle.color).withAlphaComponent(0.95)
                     renderer.lineWidth = 1
                     return renderer
                 }
                 return MKOverlayRenderer(overlay: overlay)
             }
+        }
 
-            func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
-                parent.region = mapView.region
-            }
+        // Custom polyline class to store color and metadata
+        class ColoredPolyline: MKPolyline {
+            var color: Color = .blue
+            var streetName: String = ""
+            var coveragePercentage: Double = 0
+        }
+
+        // Custom circle class to store color
+        class ColoredCircle: MKCircle {
+            var color: Color = .blue
         }
     }
 
-    // Street Map View - shows street coordinates with 15m radius circles
-    private struct StreetMapView: View {
-        let street: BerlinStreets.Street
-        @ObservedObject var achievementsManager: AchievementsManager
+    // Map view showing all street points in Berlin colored by coverage
+    private struct MissingStreetsMapView: View {
+        let allStreets: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)]
+        let routes: [Route]
+        let processor: FastStreetProcessor
+
         @Environment(\.dismiss) var dismiss
-
-        @State private var region: MKCoordinateRegion
-
-        init(street: BerlinStreets.Street, achievementsManager: AchievementsManager) {
-            self.street = street
-            self.achievementsManager = achievementsManager
-
-            // Calculate region to fit all street coordinates
-            if let firstCoord = street.coordinates.first {
-                let allCoords = street.clCoordinates
-                let minLat = allCoords.map { $0.latitude }.min() ?? firstCoord.lat
-                let maxLat = allCoords.map { $0.latitude }.max() ?? firstCoord.lat
-                let minLon = allCoords.map { $0.longitude }.min() ?? firstCoord.lon
-                let maxLon = allCoords.map { $0.longitude }.max() ?? firstCoord.lon
-
-                let centerLat = (minLat + maxLat) / 2
-                let centerLon = (minLon + maxLon) / 2
-                let spanLat = (maxLat - minLat) * 1.5 // Add 50% padding
-                let spanLon = (maxLon - minLon) * 1.5
-
-                _region = State(initialValue: MKCoordinateRegion(
-                    center: CLLocationCoordinate2D(latitude: centerLat, longitude: centerLon),
-                    span: MKCoordinateSpan(latitudeDelta: max(spanLat, 0.01), longitudeDelta: max(spanLon, 0.01))
-                ))
-            } else {
-                _region = State(initialValue: MKCoordinateRegion(
-                    center: CLLocationCoordinate2D(latitude: 52.52, longitude: 13.405),
-                    span: MKCoordinateSpan(latitudeDelta: 0.1, longitudeDelta: 0.1)
-                ))
-            }
-        }
+        @State private var isProcessing = true
+        @State private var coveredPoints = 0
+        @State private var uncoveredPoints = 0
 
         var body: some View {
             NavigationView {
-                ZStack {
-                    StreetCircleMapView(coordinates: street.clCoordinates, region: $region)
-                        .edgesIgnoringSafeArea(.all)
-
-                    VStack {
-                        // Info card at top
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(street.name)
-                                .font(.headline)
-                            Text("District: \(street.district)")
+                VStack(spacing: 0) {
+                    // Stats bar
+                    HStack(spacing: 16) {
+                        VStack {
+                            if isProcessing {
+                                ProgressView()
+                            } else {
+                                Text("\(uncoveredPoints)")
+                                    .font(.title)
+                                    .fontWeight(.bold)
+                                    .foregroundColor(.red)
+                            }
+                            Text("Red Points")
                                 .font(.caption)
-                                .foregroundColor(.secondary)
-                            Text("Length: \(String(format: "%.0f m", street.lengthMeters))")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            Text("\(street.coordinates.count) sample points shown (15m radius each)")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
                         }
-                        .padding()
-                        .background(Color.white.opacity(0.95))
-                        .cornerRadius(10)
-                        .shadow(radius: 5)
-                        .padding()
-
-                        Spacer()
+                        VStack {
+                            if !isProcessing {
+                                Text("\(coveredPoints)")
+                                    .font(.title)
+                                    .fontWeight(.bold)
+                                    .foregroundColor(.green)
+                            }
+                            Text("Green Points")
+                                .font(.caption)
+                        }
                     }
+                    .padding()
+                    .background(Color.gray.opacity(0.1))
+
+                    // Map
+                    CoveragePointsMapRepresentable(
+                        streets: allStreets,
+                        routes: routes,
+                        processor: processor,
+                        onStatsUpdate: { covered, uncovered in
+                            coveredPoints = covered
+                            uncoveredPoints = uncovered
+                            isProcessing = false
+                        }
+                    )
                 }
+                .navigationTitle("Coverage Map - All Points")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .navigationBarTrailing) {
@@ -2754,41 +3250,214 @@ struct AchievementDetailView: View {
                 }
             }
         }
+    }
 
-        // Helper struct for map annotations
-        private struct StreetPoint: Identifiable {
-            let id: Int
-            let coordinate: CLLocationCoordinate2D
+    // UIKit map view that colors each point based on actual coverage
+    private struct CoveragePointsMapRepresentable: UIViewRepresentable {
+        let streets: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)]
+        let routes: [Route]
+        let processor: FastStreetProcessor
+        let onStatsUpdate: (Int, Int) -> Void  // (covered, uncovered)
 
-            init(index: Int, coordinate: CLLocationCoordinate2D) {
-                self.id = index
-                self.coordinate = coordinate
+        func makeUIView(context: Context) -> MKMapView {
+            let mapView = MKMapView()
+            mapView.delegate = context.coordinator
+
+            // Set region to all of Berlin
+            let berlinCenter = CLLocationCoordinate2D(latitude: 52.52, longitude: 13.405)
+            let region = MKCoordinateRegion(
+                center: berlinCenter,
+                span: MKCoordinateSpan(latitudeDelta: 0.3, longitudeDelta: 0.4)
+            )
+            mapView.setRegion(region, animated: false)
+
+            // Build spatial index from routes in background
+            DispatchQueue.global(qos: .userInitiated).async {
+                let spatialIndex = SpatialIndex(metersPerCell: 40)
+
+                // Add all route coordinates to index
+                for route in routes {
+                    let coords = route.coordinates.map { ($0.latitude, $0.longitude) }
+                    spatialIndex.addRoute(coords)
+                }
+
+                print("🗺️ Built spatial index for coverage map")
+
+                // Only process streets with low coverage to reduce point count
+                let streetsToShow = streets.filter { $0.coverage.percentage < 75 }
+                print("🗺️ Showing \(streetsToShow.count) streets with <75% coverage (filtered from \(streets.count) total)")
+
+                var coveredCount = 0
+                var uncoveredCount = 0
+                var redPoints: [CLLocationCoordinate2D] = []
+                var greenPoints: [CLLocationCoordinate2D] = []
+
+                // Sample points to avoid overwhelming the map (every 2nd point)
+                for item in streetsToShow {
+                    for segment in item.street.segments {
+                        for (index, coord) in segment.coordinates.enumerated() {
+                            // Sample every 2nd point for performance
+                            guard index % 2 == 0 else { continue }
+
+                            let result = spatialIndex.isNearRoute(lat: coord.lat, lon: coord.lon, thresholdMeters: 20)
+
+                            if result.isNear {
+                                greenPoints.append(CLLocationCoordinate2D(latitude: coord.lat, longitude: coord.lon))
+                                coveredCount += 1
+                            } else {
+                                redPoints.append(CLLocationCoordinate2D(latitude: coord.lat, longitude: coord.lon))
+                                uncoveredCount += 1
+                            }
+                        }
+                    }
+                }
+
+                print("🗺️ Processed \(coveredCount + uncoveredCount) points: \(coveredCount) covered, \(uncoveredCount) uncovered")
+
+                // Add overlays to map in batches on main thread
+                let batchSize = 500
+                DispatchQueue.main.async {
+                    // Add red points first (in batches)
+                    for batchStart in stride(from: 0, to: redPoints.count, by: batchSize) {
+                        let batchEnd = min(batchStart + batchSize, redPoints.count)
+                        for i in batchStart..<batchEnd {
+                            let circle = ColoredCircle(center: redPoints[i], radius: 20.0)
+                            circle.isCovered = false
+                            mapView.addOverlay(circle)
+                        }
+                    }
+
+                    // Add green points (in batches)
+                    for batchStart in stride(from: 0, to: greenPoints.count, by: batchSize) {
+                        let batchEnd = min(batchStart + batchSize, greenPoints.count)
+                        for i in batchStart..<batchEnd {
+                            let circle = ColoredCircle(center: greenPoints[i], radius: 20.0)
+                            circle.isCovered = true
+                            mapView.addOverlay(circle)
+                        }
+                    }
+
+                    onStatsUpdate(coveredCount, uncoveredCount)
+                    print("🗺️ Finished adding \(coveredCount + uncoveredCount) overlays to map")
+                }
+            }
+
+            return mapView
+        }
+
+        func updateUIView(_ mapView: MKMapView, context: Context) {
+            // Nothing to update
+        }
+
+        func makeCoordinator() -> Coordinator {
+            Coordinator()
+        }
+
+        class Coordinator: NSObject, MKMapViewDelegate {
+            func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+                if let circle = overlay as? ColoredCircle {
+                    let renderer = MKCircleRenderer(circle: circle)
+                    if circle.isCovered {
+                        renderer.fillColor = UIColor.green.withAlphaComponent(0.5)
+                        renderer.strokeColor = UIColor.green.withAlphaComponent(0.9)
+                    } else {
+                        renderer.fillColor = UIColor.red.withAlphaComponent(0.5)
+                        renderer.strokeColor = UIColor.red.withAlphaComponent(0.9)
+                    }
+                    renderer.lineWidth = 1
+                    return renderer
+                }
+                return MKOverlayRenderer(overlay: overlay)
+            }
+        }
+
+        // Custom circle class to store coverage status
+        class ColoredCircle: MKCircle {
+            var isCovered: Bool = false
+        }
+    }
+
+    // Helper to make Street identifiable for sheet
+    private struct IdentifiableStreet: Identifiable {
+        let street: ConsolidatedStreet
+        var id: String { street.id }
+    }
+    
+    // Map view that shows true 20m radius circles using MKCircle overlays
+    private struct StreetCircleMapView: UIViewRepresentable {
+        let coordinates: [CLLocationCoordinate2D]
+        @Binding var region: MKCoordinateRegion
+        
+        func makeUIView(context: Context) -> MKMapView {
+            let mapView = MKMapView()
+            mapView.delegate = context.coordinator
+            mapView.setRegion(region, animated: false)
+            
+            // Add circle overlays for each coordinate with 20m radius
+            for coordinate in coordinates {
+                let circle = MKCircle(center: coordinate, radius: 20.0) // 20 meters
+                mapView.addOverlay(circle)
+            }
+            
+            return mapView
+        }
+        
+        func updateUIView(_ mapView: MKMapView, context: Context) {
+            mapView.setRegion(region, animated: true)
+        }
+        
+        func makeCoordinator() -> Coordinator {
+            Coordinator(self)
+        }
+        
+        class Coordinator: NSObject, MKMapViewDelegate {
+            var parent: StreetCircleMapView
+            
+            init(_ parent: StreetCircleMapView) {
+                self.parent = parent
+            }
+            
+            func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+                if let circleOverlay = overlay as? MKCircle {
+                    let renderer = MKCircleRenderer(circle: circleOverlay)
+                    renderer.fillColor = UIColor.blue.withAlphaComponent(0.3)
+                    renderer.strokeColor = UIColor.blue
+                    renderer.lineWidth = 1
+                    return renderer
+                }
+                return MKOverlayRenderer(overlay: overlay)
+            }
+            
+            func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
+                parent.region = mapView.region
             }
         }
     }
+    
+    // Street Map View - shows street coordinates with 20m radius circles
 }
 
 // MARK: - Cumulative Distance Graph
-
+    
 struct CumulativeDistanceGraph: View {
     let routes: [Route]
     let achievement: Achievement
-
+    
     var body: some View {
         GeometryReader { geometry in
             let data = calculateCumulativeData()
             let _ = data.last?.cumulative ?? 0
             let thresholds = getThresholds()
-
+            
             // Define margins for axes
             let leftMargin: CGFloat = 50
             let bottomMargin: CGFloat = 40
             let topMargin: CGFloat = 20
             let rightMargin: CGFloat = 80
-
+            
             let graphWidth = geometry.size.width - leftMargin - rightMargin
             let graphHeight = geometry.size.height - topMargin - bottomMargin
-
+            
             ZStack(alignment: .topLeading) {
                 // Draw Y axis
                 Path { path in
@@ -2796,29 +3465,29 @@ struct CumulativeDistanceGraph: View {
                     path.addLine(to: CGPoint(x: leftMargin, y: topMargin + graphHeight))
                 }
                 .stroke(Color.gray, lineWidth: 2)
-
+                
                 // Draw X axis
                 Path { path in
                     path.move(to: CGPoint(x: leftMargin, y: topMargin + graphHeight))
                     path.addLine(to: CGPoint(x: leftMargin + graphWidth, y: topMargin + graphHeight))
                 }
                 .stroke(Color.gray, lineWidth: 2)
-
+                
                 // Calculate max Y value as 10% higher than highest threshold
                 let maxYValue = (thresholds.last?.value ?? 100) * 1.1
-
+                
                 // Y-axis labels
                 let ySteps = 5
                 ForEach(0...ySteps, id: \.self) { i in
                     let value = maxYValue * Double(i) / Double(ySteps)
                     let y = topMargin + graphHeight - (CGFloat(i) / CGFloat(ySteps) * graphHeight)
-
+                    
                     Text(String(format: "%.0f", value))
                         .font(.caption2)
                         .foregroundColor(.secondary)
                         .position(x: leftMargin - 20, y: y)
                 }
-
+                
                 // X-axis labels (dates)
                 if !data.isEmpty {
                     let xSteps = min(4, data.count - 1)
@@ -2826,7 +3495,7 @@ struct CumulativeDistanceGraph: View {
                         let index = i * (data.count - 1) / xSteps
                         let date = data[index].date
                         let x = leftMargin + (CGFloat(i) / CGFloat(xSteps) * graphWidth)
-
+                        
                         Text(formatDate(date))
                             .font(.caption2)
                             .foregroundColor(.secondary)
@@ -2834,27 +3503,27 @@ struct CumulativeDistanceGraph: View {
                             .position(x: x, y: topMargin + graphHeight + 25)
                     }
                 }
-
+                
                 // Draw threshold lines (without labels)
                 ForEach(thresholds, id: \.value) { threshold in
                     let y = topMargin + graphHeight - (threshold.value / maxYValue * graphHeight)
-
+                    
                     Path { path in
                         path.move(to: CGPoint(x: leftMargin, y: y))
                         path.addLine(to: CGPoint(x: leftMargin + graphWidth, y: y))
                     }
                     .stroke(threshold.color, style: StrokeStyle(lineWidth: 2, dash: [5, 5]))
                 }
-
+                
                 // Draw cumulative distance line
                 Path { path in
                     guard !data.isEmpty else { return }
-
+                    
                     let xScale = graphWidth / CGFloat(data.count - 1)
                     let yScale = graphHeight / maxYValue
-
+                    
                     path.move(to: CGPoint(x: leftMargin, y: topMargin + graphHeight - data[0].cumulative * yScale))
-
+                    
                     for (index, point) in data.enumerated() {
                         let x = leftMargin + CGFloat(index) * xScale
                         let y = topMargin + graphHeight - point.cumulative * yScale
@@ -2865,13 +3534,13 @@ struct CumulativeDistanceGraph: View {
             }
         }
     }
-
+    
     private func formatDate(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "MMM yy"
         return formatter.string(from: date)
     }
-
+    
     private func calculateCumulativeData() -> [(date: Date, cumulative: Double)] {
         var cumulative: Double = 0
         return routes.map { route in
@@ -2879,7 +3548,7 @@ struct CumulativeDistanceGraph: View {
             return (date: route.date, cumulative: cumulative)
         }
     }
-
+    
     private func getThresholds() -> [(value: Double, name: String, color: Color)] {
         let allThresholds = [
             (value: 500.0, name: "Bronze", color: AchievementTier.bronze.color),
@@ -2887,7 +3556,7 @@ struct CumulativeDistanceGraph: View {
             (value: 2500.0, name: "Gold", color: AchievementTier.gold.color),
             (value: 10000.0, name: "Platinum", color: AchievementTier.platinum.color)
         ]
-
+        
         // Include up to current tier + 1
         let currentTierIndex: Int
         switch achievement.currentTier {
@@ -2897,7 +3566,7 @@ struct CumulativeDistanceGraph: View {
         case .gold: currentTierIndex = 3
         case .platinum: currentTierIndex = 4
         }
-
+        
         return Array(allThresholds.prefix(currentTierIndex + 1))
     }
 }
@@ -2911,7 +3580,7 @@ struct AchievementsView: View {
     var onShowAllDistricts: (() -> Void)? = nil
     var onLocationSelected: ((String, String) -> Void)? = nil  // (country, city)
     @Environment(\.dismiss) var dismiss
-
+    
     var body: some View {
         NavigationView {
             ScrollView {
@@ -2926,7 +3595,7 @@ struct AchievementsView: View {
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
-
+                        
                         VStack(spacing: 4) {
                             Text("\(achievementsManager.achievements.filter { $0.currentTier == .silver }.count)")
                                 .font(.system(size: 24, weight: .bold))
@@ -2935,7 +3604,7 @@ struct AchievementsView: View {
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
-
+                        
                         VStack(spacing: 4) {
                             Text("\(achievementsManager.achievements.filter { $0.currentTier == .gold }.count)")
                                 .font(.system(size: 24, weight: .bold))
@@ -2944,7 +3613,7 @@ struct AchievementsView: View {
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
-
+                        
                         VStack(spacing: 4) {
                             Text("\(achievementsManager.achievements.filter { $0.currentTier == .platinum }.count)")
                                 .font(.system(size: 24, weight: .bold))
@@ -2953,10 +3622,10 @@ struct AchievementsView: View {
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
-
+                        
                         Divider()
                             .frame(height: 40)
-
+                        
                         VStack(spacing: 4) {
                             Text("\(achievementsManager.achievements.count)")
                                 .font(.system(size: 24, weight: .bold))
@@ -2966,7 +3635,7 @@ struct AchievementsView: View {
                         }
                     }
                     .padding()
-
+                    
                     // Achievements grouped by category
                     ForEach(Achievement.AchievementCategory.allCases, id: \.self) { category in
                         let categoryAchievements = achievementsManager.achievements.filter { $0.category == category }
@@ -2976,7 +3645,7 @@ struct AchievementsView: View {
                                     .font(.title2)
                                     .bold()
                                     .padding(.horizontal)
-
+                                
                                 LazyVGrid(columns: [
                                     GridItem(.flexible()),
                                     GridItem(.flexible()),
@@ -2999,6 +3668,12 @@ struct AchievementsView: View {
             .navigationTitle("Achievements")
             .navigationBarTitleDisplayMode(.large)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    NavigationLink(destination: StreetDebugView(routes: routes)) {
+                        Image(systemName: "ant.fill")
+                    }
+                }
+
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") {
                         dismiss()
@@ -3024,28 +3699,28 @@ struct AchievementsView: View {
 
 struct AchievementCard: View {
     let achievement: Achievement
-
+    
     var body: some View {
         VStack(spacing: 8) {
             ZStack {
                 Circle()
                     .fill(achievement.isUnlocked ?
                           LinearGradient(colors: [achievement.currentTier.color, achievement.currentTier.color.opacity(0.6)], startPoint: .topLeading, endPoint: .bottomTrailing) :
-                          LinearGradient(colors: [.gray.opacity(0.3)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                            LinearGradient(colors: [.gray.opacity(0.3)], startPoint: .topLeading, endPoint: .bottomTrailing))
                     .frame(width: 80, height: 80)
-
+                
                 Image(systemName: achievement.iconName)
                     .font(.system(size: 32))
                     .foregroundColor(achievement.isUnlocked ? .white : .gray)
             }
-
+            
             Text(achievement.title)
                 .font(.caption)
                 .fontWeight(.semibold)
                 .multilineTextAlignment(.center)
                 .lineLimit(2)
                 .frame(height: 32)
-
+            
             // Show current tier badge
             Group {
                 if achievement.isUnlocked {
@@ -3064,14 +3739,14 @@ struct AchievementCard: View {
                 }
             }
             .frame(height: 18)
-
+            
             Text(achievement.currentDescription)
                 .font(.caption2)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
                 .lineLimit(2)
                 .frame(height: 28)
-
+            
             // Show tier progress indicators
             HStack(spacing: 4) {
                 ForEach([AchievementTier.bronze, .silver, .gold, .platinum], id: \.self) { tier in
@@ -3082,7 +3757,7 @@ struct AchievementCard: View {
                     }
                 }
             }
-
+            
             // Show progress to next tier
             Text(achievement.progressMessage)
                 .font(.caption2)
