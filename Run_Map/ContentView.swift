@@ -425,6 +425,24 @@ class DistrictPolygon: MKPolygon {
     var colorIndex: Int = 0
 }
 
+class DistrictAnnotation: MKPointAnnotation {}
+
+private struct LiveRouteSignature: Equatable {
+    let count: Int
+    let firstLatitude: Double?
+    let firstLongitude: Double?
+    let lastLatitude: Double?
+    let lastLongitude: Double?
+
+    init(coordinates: [CLLocationCoordinate2D]) {
+        count = coordinates.count
+        firstLatitude = coordinates.first?.latitude
+        firstLongitude = coordinates.first?.longitude
+        lastLatitude = coordinates.last?.latitude
+        lastLongitude = coordinates.last?.longitude
+    }
+}
+
 private extension RoutePolyline {
     /// Convenience factory because `MKPolyline(coordinates:count:)`
     /// is a *convenience* initializer that isn’t inherited by subclasses.
@@ -1126,14 +1144,13 @@ struct RouteMapView: UIViewRepresentable {
     }
 
     func updateUIView(_ mapView: MKMapView, context: Context) {
+        context.coordinator.parent = self
+
         // Update region when it changes (use larger tolerance to ensure updates work)
         if !mapView.region.center.isEqual(to: region.center, tolerance: 0.01) ||
            abs(mapView.region.span.latitudeDelta - region.span.latitudeDelta) > 0.01 ||
            abs(mapView.region.span.longitudeDelta - region.span.longitudeDelta) > 0.01 {
-            print("🗺️ Map updating region to: center=\(region.center), span=\(region.span)")
             mapView.setRegion(region, animated: true)
-        } else {
-            print("🗺️ Map region unchanged, skipping update")
         }
 
         if mapView.showsUserLocation != showUserLocation {
@@ -1144,89 +1161,23 @@ struct RouteMapView: UIViewRepresentable {
             mapView.mapType = mapType
         }
 
-        // Remove existing district overlays and annotations
-        let existingDistrictOverlays = mapView.overlays.filter { $0 is MKCircle }
-        let existingDistrictAnnotations = mapView.annotations.compactMap { $0 as? MKPointAnnotation }.filter {
-            $0.title?.contains("District") ?? false
-        }
-        if !existingDistrictOverlays.isEmpty { mapView.removeOverlays(existingDistrictOverlays) }
-        if !existingDistrictAnnotations.isEmpty { mapView.removeAnnotations(existingDistrictAnnotations) }
+        context.coordinator.reconcileDistrictOverlays(
+            on: mapView,
+            districtOverlay: districtOverlay,
+            showAllBerlinDistricts: showAllBerlinDistricts
+        )
 
-        // Add Berlin district overlays if requested (polygons + label-only annotations)
-        if showAllBerlinDistricts {
-            for district in BerlinDistricts.districts {
-                let center = CLLocationCoordinate2D(latitude: district.lat, longitude: district.lon)
-                let ann = MKPointAnnotation()
-                ann.coordinate = center
-                ann.title = district.name
-                ann.subtitle = "District Label"
-                mapView.addAnnotation(ann)
-                if let boundary = BerlinDistricts.boundaries.first(where: { $0.name == district.name }) {
-                    for polygon in boundary.polygons {
-                        if let outer = polygon.first, outer.count >= 3 {
-                            let mkPolygon = DistrictPolygon(coordinates: outer, count: outer.count)
-                            mkPolygon.districtName = district.name
-                            mkPolygon.colorIndex = BerlinDistricts.districts.firstIndex(where: { $0.name == district.name }) ?? 0
-                            mapView.addOverlay(mkPolygon)
-                        }
-                    }
-                }
-            }
-        } else if let d = districtOverlay {
-            let center = CLLocationCoordinate2D(latitude: d.lat, longitude: d.lon)
-            let ann = MKPointAnnotation()
-            ann.coordinate = center
-            ann.title = d.name
-            ann.subtitle = "District Label"
-            mapView.addAnnotation(ann)
-            // Add district outline as MKPolygon(s)
-            if let boundary = BerlinDistricts.boundaries.first(where: { $0.name == d.name }) {
-                for polygon in boundary.polygons {
-                    if let outer = polygon.first, outer.count >= 3 {
-                        let mkPolygon = DistrictPolygon(coordinates: outer, count: outer.count)
-                        mkPolygon.districtName = d.name
-                        mkPolygon.colorIndex = BerlinDistricts.districts.firstIndex(where: { $0.name == d.name }) ?? 0
-                        mapView.addOverlay(mkPolygon)
-                    }
-                }
-            }
-        }
+        context.coordinator.reconcileLiveRoute(on: mapView, coordinates: liveCoordinates)
 
-        // Remove existing live overlays (those without routeID)
-        let liveExisting = mapView.overlays.compactMap { $0 as? MKPolyline }
-            .filter { ($0 as? RoutePolyline)?.routeID == nil }
-        mapView.removeOverlays(liveExisting)
-
-        // Clean up any existing "Start" annotation
-        mapView.annotations
-            .filter { $0.title == "Start" }
-            .forEach(mapView.removeAnnotation)
-
-        if liveCoordinates.count > 1 {
-            let live = RoutePolyline.fromCoordinates(liveCoordinates)
-            mapView.addOverlay(live)
-
-            // Drop a pin at the start
-            if let start = liveCoordinates.first {
-                let pin = MKPointAnnotation()
-                pin.coordinate = start
-                pin.title = "Start"
-                mapView.addAnnotation(pin)
-            }
-        }
-
-        let existing = mapView.overlays.compactMap { $0 as? RoutePolyline }
-        let existingIDs = Set(existing.compactMap(\.routeID))
+        let existingIDs = Set(context.coordinator.routeOverlaysByID.keys)
         let desiredIDs = Set(routes.map(\.id))
 
-        // Remove unneeded
-        let toRemove = existing.filter {
-            guard let id = $0.routeID else { return false }
-            return !desiredIDs.contains(id)
+        let staleIDs = existingIDs.subtracting(desiredIDs)
+        let staleOverlays = staleIDs.compactMap { context.coordinator.routeOverlaysByID.removeValue(forKey: $0) }
+        if !staleOverlays.isEmpty {
+            mapView.removeOverlays(staleOverlays)
         }
-        if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
 
-        // Add missing
         var toAdd: [MKOverlay] = []
         for route in routes where !existingIDs.contains(route.id) {
             let pl = RoutePolyline.fromCoordinates(route.coordinates)
@@ -1235,13 +1186,13 @@ struct RouteMapView: UIViewRepresentable {
             pl.workoutType = route.workoutType
             pl.isHighlighted = highlightedRouteIDs.contains(route.id)
             pl.averageSpeed = route.averageSpeedKmH
+            context.coordinator.routeOverlaysByID[route.id] = pl
             toAdd.append(pl)
         }
         if !toAdd.isEmpty { mapView.addOverlays(toAdd) }
 
-        // Update highlighting
-        for pl in mapView.overlays.compactMap({ $0 as? RoutePolyline }) {
-            let shouldHighlight = pl.routeID.map { highlightedRouteIDs.contains($0) } ?? false
+        for (routeID, pl) in context.coordinator.routeOverlaysByID {
+            let shouldHighlight = highlightedRouteIDs.contains(routeID)
             if pl.isHighlighted != shouldHighlight {
                 pl.isHighlighted = shouldHighlight
                 if let r = mapView.renderer(for: pl) as? MKPolylineRenderer {
@@ -1258,8 +1209,111 @@ struct RouteMapView: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     
     class Coordinator: NSObject, MKMapViewDelegate {
-        let parent: RouteMapView
+        var parent: RouteMapView
+        private var districtOverlayKey: String?
+        private var districtOverlays: [MKOverlay] = []
+        private var districtAnnotations: [MKAnnotation] = []
+        private var liveRouteSignature: LiveRouteSignature?
+        private var liveRouteOverlay: RoutePolyline?
+        private var liveStartAnnotation: MKPointAnnotation?
+        var routeOverlaysByID: [UUID: RoutePolyline] = [:]
+
         init(_ parent: RouteMapView) { self.parent = parent }
+
+        func reconcileDistrictOverlays(
+            on mapView: MKMapView,
+            districtOverlay: (name: String, lat: Double, lon: Double)?,
+            showAllBerlinDistricts: Bool
+        ) {
+            let nextKey: String
+            if showAllBerlinDistricts {
+                nextKey = "all"
+            } else if let districtOverlay {
+                nextKey = "single:\(districtOverlay.name)"
+            } else {
+                nextKey = "none"
+            }
+
+            guard nextKey != districtOverlayKey else { return }
+
+            if !districtOverlays.isEmpty {
+                mapView.removeOverlays(districtOverlays)
+                districtOverlays.removeAll(keepingCapacity: true)
+            }
+            if !districtAnnotations.isEmpty {
+                mapView.removeAnnotations(districtAnnotations)
+                districtAnnotations.removeAll(keepingCapacity: true)
+            }
+
+            districtOverlayKey = nextKey
+            guard nextKey != "none" else { return }
+
+            let districtsToRender: [(name: String, lat: Double, lon: Double)]
+            if showAllBerlinDistricts {
+                districtsToRender = BerlinDistricts.districts.map { ($0.name, $0.lat, $0.lon) }
+            } else if let districtOverlay {
+                districtsToRender = [districtOverlay]
+            } else {
+                districtsToRender = []
+            }
+
+            for district in districtsToRender {
+                let center = CLLocationCoordinate2D(latitude: district.lat, longitude: district.lon)
+                let ann = DistrictAnnotation()
+                ann.coordinate = center
+                ann.title = district.name
+                ann.subtitle = "District Label"
+                districtAnnotations.append(ann)
+
+                if let boundary = BerlinDistricts.boundaries.first(where: { $0.name == district.name }) {
+                    for polygon in boundary.polygons {
+                        if let outer = polygon.first, outer.count >= 3 {
+                            let mkPolygon = DistrictPolygon(coordinates: outer, count: outer.count)
+                            mkPolygon.districtName = district.name
+                            mkPolygon.colorIndex = BerlinDistricts.districts.firstIndex(where: { $0.name == district.name }) ?? 0
+                            districtOverlays.append(mkPolygon)
+                        }
+                    }
+                }
+            }
+
+            if !districtAnnotations.isEmpty {
+                mapView.addAnnotations(districtAnnotations)
+            }
+            if !districtOverlays.isEmpty {
+                mapView.addOverlays(districtOverlays)
+            }
+        }
+
+        func reconcileLiveRoute(on mapView: MKMapView, coordinates: [CLLocationCoordinate2D]) {
+            let nextSignature = LiveRouteSignature(coordinates: coordinates)
+            guard nextSignature != liveRouteSignature else { return }
+
+            if let liveRouteOverlay {
+                mapView.removeOverlay(liveRouteOverlay)
+                self.liveRouteOverlay = nil
+            }
+            if let liveStartAnnotation {
+                mapView.removeAnnotation(liveStartAnnotation)
+                self.liveStartAnnotation = nil
+            }
+
+            liveRouteSignature = nextSignature
+            guard coordinates.count > 1 else { return }
+
+            let live = RoutePolyline.fromCoordinates(coordinates)
+            liveRouteOverlay = live
+            mapView.addOverlay(live)
+
+            if let start = coordinates.first {
+                let pin = MKPointAnnotation()
+                pin.coordinate = start
+                pin.title = "Start"
+                liveStartAnnotation = pin
+                mapView.addAnnotation(pin)
+            }
+        }
+
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let polygon = overlay as? DistrictPolygon {
                 let renderer = MKPolygonRenderer(polygon: polygon)
