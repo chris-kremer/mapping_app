@@ -16,6 +16,7 @@ struct RoutePlannerView: View {
     @State private var showSavePlanDialog = false
     @State private var planTitle = ""
     @State private var showCurrentStreetCoverage = false
+    @State private var focusRequestID = UUID()
 
     private var waypointSignature: String {
         waypoints
@@ -32,6 +33,7 @@ struct RoutePlannerView: View {
                     showCurrentStreetCoverage: showCurrentStreetCoverage,
                     consolidatedStreets: consolidatedStreets,
                     streetCoverageByID: streetCoverageByID,
+                    focusRequestID: focusRequestID,
                     onAddWaypoint: { coordinate in
                         waypoints.append(coordinate)
                     }
@@ -165,6 +167,7 @@ struct RoutePlannerView: View {
                     HStack(spacing: 10) {
                         Button {
                             waypoints = plan.coordinates
+                            focusRequestID = UUID()
                         } label: {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(plan.title)
@@ -313,6 +316,7 @@ private struct PlannerMapView: UIViewRepresentable {
     let showCurrentStreetCoverage: Bool
     let consolidatedStreets: [ConsolidatedStreet]
     let streetCoverageByID: [String: ConsolidatedStreet.CoverageResult]
+    let focusRequestID: UUID
     let onAddWaypoint: (CLLocationCoordinate2D) -> Void
 
     func makeUIView(context: Context) -> MKMapView {
@@ -338,6 +342,7 @@ private struct PlannerMapView: UIViewRepresentable {
             on: mapView
         )
         context.coordinator.render(waypoints: waypoints, on: mapView)
+        context.coordinator.focusIfNeeded(waypoints: waypoints, focusRequestID: focusRequestID, on: mapView)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -349,6 +354,7 @@ private struct PlannerMapView: UIViewRepresentable {
         weak var mapView: MKMapView?
         private var renderedSignature = ""
         private var renderedCoverageSignature = ""
+        private var handledFocusRequestID: UUID?
         private var overlays: [MKOverlay] = []
         private var coverageOverlays: [MKOverlay] = []
         private var annotations: [MKAnnotation] = []
@@ -444,6 +450,15 @@ private struct PlannerMapView: UIViewRepresentable {
             if !annotations.isEmpty {
                 mapView.addAnnotations(annotations)
             }
+        }
+
+        func focusIfNeeded(waypoints: [CLLocationCoordinate2D], focusRequestID: UUID, on mapView: MKMapView) {
+            guard handledFocusRequestID != focusRequestID else { return }
+            handledFocusRequestID = focusRequestID
+            guard waypoints.count >= 2 else { return }
+
+            let region = coordinateRegion(for: waypoints)
+            mapView.setRegion(region, animated: true)
         }
 
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
