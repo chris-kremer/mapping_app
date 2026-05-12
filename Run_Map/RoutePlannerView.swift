@@ -26,6 +26,7 @@ struct RoutePlannerView: View {
     @State private var simulationStats = PlanSimulationStats.empty
     @State private var isComputingSimulation = false
     @State private var savedPlanSort: SavedPlanSortMode = .distance
+    @State private var previewGeneration = 0
     private var waypointSignature: String {
         waypoints
             .map { "\(String(format: "%.5f", $0.latitude)),\(String(format: "%.5f", $0.longitude))" }
@@ -581,9 +582,25 @@ struct RoutePlannerView: View {
         let plannedCoordinates = waypoints
         let streets = plannerConsolidatedStreets
         let existingCoverage = streetCoverageByID
+        previewGeneration += 1
+        let generation = previewGeneration
 
         guard !plannedCoordinates.isEmpty else {
             stats = .empty
+            isComputingStats = false
+            return
+        }
+
+        stats = PlannedRouteStats.lightweight(coordinates: plannedCoordinates)
+        guard plannedCoordinates.count >= 2 else {
+            isComputingStats = false
+            return
+        }
+        guard plannedCoordinates.count <= 30 else {
+            isComputingStats = false
+            return
+        }
+        guard !streets.isEmpty, streets.count <= 18_000 else {
             isComputingStats = false
             return
         }
@@ -597,6 +614,7 @@ struct RoutePlannerView: View {
             )
 
             DispatchQueue.main.async {
+                guard generation == previewGeneration else { return }
                 stats = calculated
                 isComputingStats = false
             }
@@ -785,6 +803,20 @@ struct RoutePlannerView: View {
             isComputingSimulation = false
             return
         }
+        guard !streets.isEmpty, streets.count <= 18_000 else {
+            let distanceKm = plans
+                .map { PlannedRouteStats.totalDistanceKm(for: $0.coordinates) }
+                .reduce(0, +)
+            simulationStats = PlanSimulationStats(
+                selectedPlanCount: plans.count,
+                distanceKm: distanceKm,
+                coverageBeforePercent: 0,
+                coverageAfterPercent: 0,
+                newStreetCount: 0
+            )
+            isComputingSimulation = false
+            return
+        }
 
         isComputingSimulation = true
         DispatchQueue.global(qos: .userInitiated).async {
@@ -906,13 +938,11 @@ private struct PlannerMapView: UIViewRepresentable {
             plannedStreetOverlay = nil
 
             guard showCurrentStreetCoverage else { return }
+            guard !consolidatedStreets.isEmpty, consolidatedStreets.count <= 18_000 else { return }
 
             DispatchQueue.global(qos: .userInitiated).async {
-                let streets = consolidatedStreets.isEmpty
-                    ? Self.loadFallbackConsolidatedStreets()
-                    : consolidatedStreets
                 let groups = Self.makeStreetCoveragePolylineGroups(
-                    streets: streets,
+                    streets: consolidatedStreets,
                     coverageByID: streetCoverageByID,
                     projectedPlans: projectedPlans
                 )
@@ -946,10 +976,6 @@ private struct PlannerMapView: UIViewRepresentable {
                     }
                 }
             }
-        }
-
-        private static func loadFallbackConsolidatedStreets() -> [ConsolidatedStreet] {
-            RoutePlannerStreetData.loadFallbackConsolidatedStreets()
         }
 
         private static func makeStreetCoveragePolylineGroups(
@@ -1640,6 +1666,17 @@ private struct PlannedRouteStats {
         stadtteile: [],
         newStreetNames: []
     )
+
+    static func lightweight(coordinates: [CLLocationCoordinate2D]) -> PlannedRouteStats {
+        PlannedRouteStats(
+            distanceKm: totalDistanceKm(for: coordinates),
+            countries: [],
+            cities: [],
+            districts: [],
+            stadtteile: [],
+            newStreetNames: []
+        )
+    }
 
     var walkDurationText: String {
         durationText(hours: distanceKm / 5.0)
