@@ -27,6 +27,8 @@ struct RoutePlannerView: View {
     @State private var isComputingSimulation = false
     @State private var savedPlanSort: SavedPlanSortMode = .distance
     @State private var previewGeneration = 0
+    @State private var achievementPreviewItems: [RouteAchievementPreviewItem] = []
+    @State private var isComputingAchievementPreview = false
     private var waypointSignature: String {
         waypoints
             .map { "\(String(format: "%.5f", $0.latitude)),\(String(format: "%.5f", $0.longitude))" }
@@ -65,16 +67,6 @@ struct RoutePlannerView: View {
         savedPlans.sorted { lhs, rhs in
             savedPlanSort.compare(lhs, rhs, previews: savedPlanPreviews)
         }
-    }
-
-    private var achievementPreviewItems: [RouteAchievementPreviewItem] {
-        RouteAchievementPreviewBuilder.makeItems(
-            plannedCoordinates: waypoints,
-            plannedStats: stats,
-            existingRoutes: routes,
-            consolidatedStreets: plannerConsolidatedStreets,
-            streetCoverageByID: streetCoverageByID
-        )
     }
 
     var body: some View {
@@ -501,11 +493,18 @@ struct RoutePlannerView: View {
         let items = achievementPreviewItems
 
         return VStack(alignment: .leading, spacing: 8) {
-            Text("Achievement Preview")
-                .font(.headline)
+            HStack {
+                Text("Achievement Preview")
+                    .font(.headline)
+                Spacer()
+                if isComputingAchievementPreview {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                }
+            }
 
             if items.isEmpty {
-                Text("No achievement progress detected for this plan yet.")
+                Text(isComputingAchievementPreview ? "Calculating achievement preview." : "No achievement progress detected for this plan yet.")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
             } else {
@@ -582,41 +581,60 @@ struct RoutePlannerView: View {
         let plannedCoordinates = waypoints
         let streets = plannerConsolidatedStreets
         let existingCoverage = streetCoverageByID
+        let existingRoutes = routes
         previewGeneration += 1
         let generation = previewGeneration
 
         guard !plannedCoordinates.isEmpty else {
             stats = .empty
+            achievementPreviewItems = []
             isComputingStats = false
+            isComputingAchievementPreview = false
             return
         }
 
         stats = PlannedRouteStats.lightweight(coordinates: plannedCoordinates)
         guard plannedCoordinates.count >= 2 else {
+            achievementPreviewItems = []
             isComputingStats = false
+            isComputingAchievementPreview = false
             return
         }
         guard plannedCoordinates.count <= 80 else {
+            achievementPreviewItems = []
             isComputingStats = false
+            isComputingAchievementPreview = false
             return
         }
         guard !streets.isEmpty else {
+            achievementPreviewItems = []
             isComputingStats = false
+            isComputingAchievementPreview = false
             return
         }
 
         isComputingStats = true
-        DispatchQueue.global(qos: .userInitiated).async {
+        isComputingAchievementPreview = true
+        DispatchQueue.global(qos: .utility).async {
             let calculated = PlannedRouteStats.calculate(
                 coordinates: plannedCoordinates,
                 consolidatedStreets: streets,
                 existingCoverage: existingCoverage
             )
+            let previewItems = RouteAchievementPreviewBuilder.makeItems(
+                plannedCoordinates: plannedCoordinates,
+                plannedStats: calculated,
+                existingRoutes: existingRoutes,
+                consolidatedStreets: streets,
+                streetCoverageByID: existingCoverage
+            )
 
             DispatchQueue.main.async {
                 guard generation == previewGeneration else { return }
                 stats = calculated
+                achievementPreviewItems = previewItems
                 isComputingStats = false
+                isComputingAchievementPreview = false
             }
         }
     }
@@ -1371,18 +1389,31 @@ private enum RouteAchievementPreviewBuilder {
         guard plannedCoordinates.count >= 2, plannedStats.distanceKm > 0 else { return [] }
 
         var items: [RouteAchievementPreviewItem] = []
+        let allowHistoricalRouteScan = historicalCoordinateCount(in: existingRoutes) <= 25_000
+
         appendDistanceItems(to: &items, plannedStats: plannedStats, existingRoutes: existingRoutes)
-        appendLocationItems(to: &items, plannedStats: plannedStats, existingRoutes: existingRoutes)
+        if allowHistoricalRouteScan {
+            appendLocationItems(to: &items, plannedStats: plannedStats, existingRoutes: existingRoutes)
+        }
         appendBerlinItems(
             to: &items,
             plannedStats: plannedStats,
             existingRoutes: existingRoutes,
             consolidatedStreets: consolidatedStreets,
-            streetCoverageByID: streetCoverageByID
+            streetCoverageByID: streetCoverageByID,
+            allowHistoricalRouteScan: allowHistoricalRouteScan
         )
-        appendMauerwegItem(to: &items, plannedCoordinates: plannedCoordinates, existingRoutes: existingRoutes)
+        if allowHistoricalRouteScan {
+            appendMauerwegItem(to: &items, plannedCoordinates: plannedCoordinates, existingRoutes: existingRoutes)
+        }
 
         return items
+    }
+
+    private static func historicalCoordinateCount(in routes: [Route]) -> Int {
+        routes.reduce(0) { partialResult, route in
+            partialResult + route.coordinates.count
+        }
     }
 
     private static func appendDistanceItems(
@@ -1453,29 +1484,32 @@ private enum RouteAchievementPreviewBuilder {
         plannedStats: PlannedRouteStats,
         existingRoutes: [Route],
         consolidatedStreets: [ConsolidatedStreet],
-        streetCoverageByID: [String: ConsolidatedStreet.CoverageResult]
+        streetCoverageByID: [String: ConsolidatedStreet.CoverageResult],
+        allowHistoricalRouteScan: Bool
     ) {
-        let existingDistricts = Set(existingRoutes.flatMap { route in
-            route.coordinates.compactMap { BerlinDistricts.getDistrict(lat: $0.latitude, lon: $0.longitude) }
-        })
-        appendCountItem(
-            to: &items,
-            title: "Berlin Districts",
-            iconName: "building.columns.fill",
-            before: existingDistricts.count,
-            after: existingDistricts.union(plannedStats.districts).count,
-            thresholds: [3, 6, 9, 12]
-        )
+        if allowHistoricalRouteScan {
+            let existingDistricts = Set(existingRoutes.flatMap { route in
+                route.coordinates.compactMap { BerlinDistricts.getDistrict(lat: $0.latitude, lon: $0.longitude) }
+            })
+            appendCountItem(
+                to: &items,
+                title: "Berlin Districts",
+                iconName: "building.columns.fill",
+                before: existingDistricts.count,
+                after: existingDistricts.union(plannedStats.districts).count,
+                thresholds: [3, 6, 9, 12]
+            )
 
-        let existingStadtteile = Set(BerlinStreets.getStadtteileFromCoordinates(existingRoutes.flatMap(\.coordinates)))
-        appendCountItem(
-            to: &items,
-            title: "Berlin Stadtteile",
-            iconName: "house.fill",
-            before: existingStadtteile.count,
-            after: existingStadtteile.union(plannedStats.stadtteile).count,
-            thresholds: [10, 25, 50, 75]
-        )
+            let existingStadtteile = Set(BerlinStreets.getStadtteileFromCoordinates(existingRoutes.flatMap(\.coordinates)))
+            appendCountItem(
+                to: &items,
+                title: "Berlin Stadtteile",
+                iconName: "house.fill",
+                before: existingStadtteile.count,
+                after: existingStadtteile.union(plannedStats.stadtteile).count,
+                thresholds: [10, 25, 50, 75]
+            )
+        }
 
         let totalStreetCount = max(consolidatedStreets.count, 1)
         let coveredStreetCount = streetCoverageByID.values.filter { $0.coveredPoints > 0 || $0.percentage > 0 }.count
