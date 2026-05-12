@@ -1129,10 +1129,10 @@ class AchievementsManager: ObservableObject {
                 iconName: "building.2",
                 category: .city,
                 tiers: [
-                    .bronze: "Visit 1 city",
-                    .silver: "Visit 10 cities",
-                    .gold: "Visit 25 cities",
-                    .platinum: "Visit 50 cities"
+                    .bronze: "Visit 10 cities",
+                    .silver: "Visit 50 cities",
+                    .gold: "Visit 100 cities",
+                    .platinum: "Visit 500 cities"
                 ],
                 currentTier: .none
             ),
@@ -1596,7 +1596,7 @@ class AchievementsManager: ObservableObject {
                 let (countriesMasteredTier, countriesMasteredNext) = self.getCountTierAndNext(for: metrics.countriesMastered, tiers: [1, 10, 25, 50])
                 self.updateAchievementTier(id: "countries_mastered", tier: countriesMasteredTier, currentProgress: Double(metrics.countriesMastered), nextGoal: countriesMasteredNext)
 
-                let (citiesVisitedTier, citiesVisitedNext) = self.getCountTierAndNext(for: metrics.citiesVisited, tiers: [1, 10, 25, 50])
+                let (citiesVisitedTier, citiesVisitedNext) = self.getCountTierAndNext(for: metrics.citiesVisited, tiers: [10, 50, 100, 500])
                 self.updateAchievementTier(id: "cities_visited", tier: citiesVisitedTier, currentProgress: Double(metrics.citiesVisited), nextGoal: citiesVisitedNext)
 
                 let (citiesExploredTier, citiesExploredNext) = self.getCountTierAndNext(for: metrics.citiesExplored, tiers: [1, 10, 25, 50])
@@ -1715,7 +1715,7 @@ class AchievementsManager: ObservableObject {
         
         // Check cities visited (at least 1km)
         let citiesVisited = cityDistances.filter { $0.value >= 1 }.count
-        let (citiesVisitedTier, citiesVisitedNext) = getCountTierAndNext(for: citiesVisited, tiers: [1, 10, 25, 50])
+        let (citiesVisitedTier, citiesVisitedNext) = getCountTierAndNext(for: citiesVisited, tiers: [10, 50, 100, 500])
         updateAchievementTier(id: "cities_visited", tier: citiesVisitedTier, currentProgress: Double(citiesVisited), nextGoal: citiesVisitedNext)
         
         // Check cities explored (at least 100km)

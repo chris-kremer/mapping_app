@@ -1422,7 +1422,7 @@ private enum RouteAchievementPreviewBuilder {
             iconName: "building.2",
             before: existing.cities.count,
             after: cityAfter.count,
-            thresholds: [1, 10, 25, 50]
+            thresholds: [10, 50, 100, 500]
         )
     }
 
