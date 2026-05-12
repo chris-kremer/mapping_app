@@ -116,22 +116,33 @@ class RouteStorage {
     
     func loadRoutes() -> [Route] {
         do {
-            let data = try Data(contentsOf: fileURL)
-            let persistedRoutes = try JSONDecoder().decode([PersistedRoute].self, from: data)
-            let routes = persistedRoutes.compactMap { persistedRoute -> Route? in
-                let route = persistedRoute.toRoute()
-                // Filter out routes with no coordinates
-                guard !route.coordinates.isEmpty else {
-                    print("⚠️ Filtering out cached route with no coordinates: \(route.id)")
-                    return nil
+            let routes = try RunMapPerformanceMetrics.measure("route_cache_decode") {
+                let data = try Data(contentsOf: fileURL)
+                let persistedRoutes = try JSONDecoder().decode([PersistedRoute].self, from: data)
+                return persistedRoutes.compactMap { persistedRoute -> Route? in
+                    let route = persistedRoute.toRoute()
+                    // Filter out routes with no coordinates
+                    guard !route.coordinates.isEmpty else {
+                        print("⚠️ Filtering out cached route with no coordinates: \(route.id)")
+                        return nil
+                    }
+                    return route
                 }
-                return route
             }
             print("✅ Loaded \(routes.count) routes from cache")
             return routes
         } catch {
             print("ℹ️ No cached routes found or failed to load: \(error.localizedDescription)")
             return []
+        }
+    }
+
+    func loadRoutesAsync(completion: @escaping ([Route]) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let routes = self.loadRoutes()
+            DispatchQueue.main.async {
+                completion(routes)
+            }
         }
     }
     
@@ -187,32 +198,30 @@ class RunViewModel: ObservableObject {
     
     func loadRuns() {
         // First, load cached routes immediately for instant UI
-        let cachedRoutes = routeStorage.loadRoutes()
-        if !cachedRoutes.isEmpty {
-            // Clean up any routes with insufficient coordinates
-            let validRoutes = cachedRoutes.filter { route in
-                if route.coordinates.count <= 1 {
-                    print("🧹 Removing cached route with insufficient coordinates: \(route.id) (count: \(route.coordinates.count))")
-                    return false
+        routeStorage.loadRoutesAsync { cachedRoutes in
+            if !cachedRoutes.isEmpty {
+                // Clean up any routes with insufficient coordinates
+                let validRoutes = cachedRoutes.filter { route in
+                    if route.coordinates.count <= 1 {
+                        print("🧹 Removing cached route with insufficient coordinates: \(route.id) (count: \(route.coordinates.count))")
+                        return false
+                    }
+                    return true
                 }
-                return true
-            }
-            
-            DispatchQueue.main.async {
+
                 self.routes = validRoutes
                 self.hasContent = !validRoutes.isEmpty
-                self.loadProgress = 1.0
+
+                // Save cleaned routes back to cache if we removed any
+                if validRoutes.count != cachedRoutes.count {
+                    print("💾 Saving cleaned routes to cache: \(validRoutes.count) routes (removed \(cachedRoutes.count - validRoutes.count))")
+                    self.routeStorage.saveRoutes(validRoutes)
+                }
             }
-            
-            // Save cleaned routes back to cache if we removed any
-            if validRoutes.count != cachedRoutes.count {
-                print("💾 Saving cleaned routes to cache: \(validRoutes.count) routes (removed \(cachedRoutes.count - validRoutes.count))")
-                routeStorage.saveRoutes(validRoutes)
-            }
+
+            // Then fetch new routes in background
+            self.loadNewRuns()
         }
-        
-        // Then fetch new routes in background
-        loadNewRuns()
     }
     
     func loadAllRunsFromScratch() {
@@ -274,6 +283,126 @@ class RunViewModel: ObservableObject {
                 self.routeStorage.saveRoutes(self.routes)
                 self.routeStorage.setLastSyncDate(Date())
             }
+        }
+    }
+
+    func refreshFromHealthKit() {
+        DispatchQueue.main.async {
+            self.totalToLoad = 0
+            self.loadedCount = 0
+            self.loadProgress = 0
+        }
+
+        healthManager.requestAuthorization { [weak self] authorized in
+            guard let self = self else { return }
+            guard authorized else {
+                DispatchQueue.main.async {
+                    self.loadProgress = 1.0
+                }
+                print("⚠️ HealthKit authorization was not granted; keeping cached routes")
+                return
+            }
+
+            self.reloadAllHealthKitRoutesPreservingCache()
+        }
+    }
+
+    private func reloadAllHealthKitRoutesPreservingCache() {
+        let cachedRoutes = routes
+
+        healthManager.fetchRunningWorkouts { workouts in
+            DispatchQueue.main.async {
+                self.totalToLoad = workouts.count
+                self.loadedCount = 0
+                self.loadProgress = workouts.isEmpty ? 1 : 0
+            }
+
+            guard !workouts.isEmpty else {
+                print("ℹ️ HealthKit returned no running/walking workouts; keeping cached routes")
+                return
+            }
+
+            var refreshedRoutes: [Route] = []
+            var workoutsMissingRoutes: [HKWorkout] = []
+            let group = DispatchGroup()
+
+            for workout in workouts {
+                group.enter()
+                self.healthManager.fetchRoute(for: workout) { locations in
+                    let coordinates = locations.map { $0.coordinate }
+
+                    if coordinates.isEmpty {
+                        workoutsMissingRoutes.append(workout)
+                    } else {
+                        let segments = self.filterRoute(coordinates)
+                        for segment in segments {
+                            guard segment.count > 1 else { continue }
+                            refreshedRoutes.append(Route(coordinates: segment,
+                                                         date: workout.startDate,
+                                                         workoutType: workout.workoutActivityType,
+                                                         durationSec: workout.duration))
+                        }
+                    }
+
+                    DispatchQueue.main.async {
+                        self.loadedCount += 1
+                        if self.totalToLoad > 0 {
+                            self.loadProgress = Double(self.loadedCount) / Double(self.totalToLoad)
+                        }
+                    }
+                    group.leave()
+                }
+            }
+
+            group.notify(queue: .main) {
+                var mergedRoutes = refreshedRoutes
+
+                for workout in workoutsMissingRoutes {
+                    let cachedForWorkout = cachedRoutes.filter { route in
+                        abs(route.date.timeIntervalSince1970 - workout.startDate.timeIntervalSince1970) < 1.0
+                    }
+                    mergedRoutes.append(contentsOf: cachedForWorkout)
+                }
+
+                let dedupedRoutes = self.deduplicatedRoutes(mergedRoutes).sorted { $0.date > $1.date }
+
+                if !dedupedRoutes.isEmpty {
+                    self.routes = dedupedRoutes
+                    self.hasContent = true
+                    self.routeStorage.saveRoutes(dedupedRoutes)
+                    print("💾 Full HealthKit refresh saved \(dedupedRoutes.count) routes")
+                } else {
+                    print("ℹ️ Full HealthKit refresh found no route data; keeping existing cache")
+                    self.hasContent = !self.routes.isEmpty
+                }
+
+                self.routeStorage.setLastSyncDate(Date())
+                self.loadProgress = 1.0
+
+                if !workoutsMissingRoutes.isEmpty {
+                    print("⏳ \(workoutsMissingRoutes.count) workouts had no route samples yet; scheduling a follow-up check")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                        self?.loadNewRuns()
+                    }
+                }
+            }
+        }
+    }
+
+    private func deduplicatedRoutes(_ routes: [Route]) -> [Route] {
+        var seen = Set<String>()
+        return routes.filter { route in
+            let first = route.coordinates.first
+            let last = route.coordinates.last
+            let key = [
+                String(Int(route.date.timeIntervalSince1970.rounded())),
+                String(route.coordinates.count),
+                String(format: "%.6f", first?.latitude ?? 0),
+                String(format: "%.6f", first?.longitude ?? 0),
+                String(format: "%.6f", last?.latitude ?? 0),
+                String(format: "%.6f", last?.longitude ?? 0)
+            ].joined(separator: "_")
+            return seen.insert(key).inserted
         }
     }
     
@@ -423,23 +552,219 @@ class RoutePolyline: MKPolyline {
 class DistrictPolygon: MKPolygon {
     var districtName: String = ""
     var colorIndex: Int = 0
+    var isVisited: Bool = false
 }
 
 class DistrictAnnotation: MKPointAnnotation {}
 
-private struct LiveRouteSignature: Equatable {
-    let count: Int
-    let firstLatitude: Double?
-    let firstLongitude: Double?
-    let lastLatitude: Double?
-    let lastLongitude: Double?
+class StadtteilPolygon: MKPolygon {
+    var stadtteilName: String = ""
+    var isVisited: Bool = false
+}
 
-    init(coordinates: [CLLocationCoordinate2D]) {
-        count = coordinates.count
-        firstLatitude = coordinates.first?.latitude
-        firstLongitude = coordinates.first?.longitude
-        lastLatitude = coordinates.last?.latitude
-        lastLongitude = coordinates.last?.longitude
+class StadtteilAnnotation: MKPointAnnotation {
+    var isVisited: Bool = false
+}
+
+private struct StadtteilBoundary {
+    let name: String
+    let center: CLLocationCoordinate2D
+    let polygons: [[[CLLocationCoordinate2D]]]
+}
+
+private struct BoundaryPoint: Hashable, Comparable {
+    let lon: Double
+    let lat: Double
+
+    static func < (lhs: BoundaryPoint, rhs: BoundaryPoint) -> Bool {
+        if lhs.lon == rhs.lon { return lhs.lat < rhs.lat }
+        return lhs.lon < rhs.lon
+    }
+}
+
+private enum BerlinStadtteilBoundaryBuilder {
+    private static var cachedSignature: String?
+    private static var cachedBoundaries: [StadtteilBoundary] = []
+    private static var cachedOfficialBoundaries: [StadtteilBoundary]?
+    private static var cachedFallbackStreetsByStadtteil: [String: [ConsolidatedStreet]]?
+
+    static func fallbackStreetsByStadtteil() -> [String: [ConsolidatedStreet]] {
+        if let cachedFallbackStreetsByStadtteil {
+            return cachedFallbackStreetsByStadtteil
+        }
+
+        let allDistricts = BerlinDistricts.districts.map { $0.name }
+        let streets = BerlinStreets.getStreets(forDistricts: allDistricts)
+        let consolidated = StreetConsolidator.consolidate(streets: streets)
+
+        var grouped: [String: [ConsolidatedStreet]] = [:]
+        for street in consolidated {
+            guard let stadtteil = street.segments.first?.stadtteil, !stadtteil.isEmpty, stadtteil != "Unknown" else {
+                continue
+            }
+            grouped[stadtteil, default: []].append(street)
+        }
+
+        cachedFallbackStreetsByStadtteil = grouped
+        return grouped
+    }
+
+    static func boundaries(from streetsByStadtteil: [String: [ConsolidatedStreet]]) -> [StadtteilBoundary] {
+        if let official = officialBoundaries(), !official.isEmpty {
+            return official
+        }
+
+        let signature = streetsByStadtteil
+            .map { key, streets in "\(key):\(streets.count):\(streets.reduce(0) { $0 + $1.totalPoints })" }
+            .sorted()
+            .joined(separator: "|")
+
+        if signature == cachedSignature {
+            return cachedBoundaries
+        }
+
+        let boundaries = streetsByStadtteil.compactMap { stadtteil, streets -> StadtteilBoundary? in
+            let trimmedName = stadtteil.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedName.isEmpty, trimmedName != "Unknown" else { return nil }
+
+            let totalPoints = streets.reduce(0) { $0 + $1.totalPoints }
+            guard totalPoints >= 3 else { return nil }
+
+            let sampleStride = max(1, totalPoints / 900)
+            var seen = Set<BoundaryPoint>()
+            var points: [BoundaryPoint] = []
+            points.reserveCapacity(min(totalPoints, 900))
+
+            var index = 0
+            for street in streets {
+                for coordinate in street.allCoordinates {
+                    defer { index += 1 }
+                    guard index % sampleStride == 0 else { continue }
+                    guard coordinate.lat.isFinite, coordinate.lon.isFinite else { continue }
+                    guard abs(coordinate.lat) <= 90, abs(coordinate.lon) <= 180 else { continue }
+
+                    let point = BoundaryPoint(lon: coordinate.lon, lat: coordinate.lat)
+                    if seen.insert(point).inserted {
+                        points.append(point)
+                    }
+                }
+            }
+
+            guard points.count >= 3 else { return nil }
+            let hullPoints = convexHull(points.sorted())
+            guard hullPoints.count >= 3 else { return nil }
+
+            let hull = hullPoints.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+            let center = CLLocationCoordinate2D(
+                latitude: hullPoints.reduce(0) { $0 + $1.lat } / Double(hullPoints.count),
+                longitude: hullPoints.reduce(0) { $0 + $1.lon } / Double(hullPoints.count)
+            )
+
+            return StadtteilBoundary(name: trimmedName, center: center, polygons: [[hull]])
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+        cachedSignature = signature
+        cachedBoundaries = boundaries
+        return boundaries
+    }
+
+    private static func officialBoundaries() -> [StadtteilBoundary]? {
+        if let cachedOfficialBoundaries {
+            return cachedOfficialBoundaries
+        }
+
+        guard let url = Bundle.main.url(forResource: "alkis_ortsteile", withExtension: "geojson"),
+              let data = try? Data(contentsOf: url),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let features = json["features"] as? [[String: Any]] else {
+            return nil
+        }
+
+        let boundaries = features.compactMap { feature -> StadtteilBoundary? in
+            guard let properties = feature["properties"] as? [String: Any],
+                  let geometry = feature["geometry"] as? [String: Any],
+                  let type = geometry["type"] as? String else {
+                return nil
+            }
+
+            let name = ((properties["OTEIL"] as? String) ?? (properties["spatial_alias"] as? String) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { return nil }
+
+            let polygons = parsePolygons(type: type, geometry: geometry)
+            guard !polygons.isEmpty else { return nil }
+
+            let centerPoints = polygons.flatMap { polygon in polygon.first ?? [] }
+            guard !centerPoints.isEmpty else { return nil }
+            let center = CLLocationCoordinate2D(
+                latitude: centerPoints.reduce(0) { $0 + $1.latitude } / Double(centerPoints.count),
+                longitude: centerPoints.reduce(0) { $0 + $1.longitude } / Double(centerPoints.count)
+            )
+
+            return StadtteilBoundary(name: name, center: center, polygons: polygons)
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+        cachedOfficialBoundaries = boundaries
+        print("✅ Loaded \(boundaries.count) official Berlin Ortsteil boundaries")
+        return boundaries
+    }
+
+    private static func parsePolygons(type: String, geometry: [String: Any]) -> [[[CLLocationCoordinate2D]]] {
+        if type == "MultiPolygon", let coordinates = geometry["coordinates"] as? [[[[Double]]]] {
+            return coordinates.compactMap { polygon in
+                parseRings(polygon)
+            }
+        }
+
+        if type == "Polygon", let coordinates = geometry["coordinates"] as? [[[Double]]] {
+            return parseRings(coordinates).map { [$0] } ?? []
+        }
+
+        return []
+    }
+
+    private static func parseRings(_ rings: [[[Double]]]) -> [[CLLocationCoordinate2D]]? {
+        let parsed = rings.compactMap { ring -> [CLLocationCoordinate2D]? in
+            let coordinates = ring.compactMap { coordinate -> CLLocationCoordinate2D? in
+                guard coordinate.count >= 2 else { return nil }
+                let longitude = coordinate[0]
+                let latitude = coordinate[1]
+                guard latitude.isFinite, longitude.isFinite else { return nil }
+                return CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+            }
+            return coordinates.count >= 3 ? coordinates : nil
+        }
+        return parsed.isEmpty ? nil : parsed
+    }
+
+    private static func convexHull(_ points: [BoundaryPoint]) -> [BoundaryPoint] {
+        guard points.count > 1 else { return points }
+
+        var lower: [BoundaryPoint] = []
+        for point in points {
+            while lower.count >= 2 && cross(lower[lower.count - 2], lower[lower.count - 1], point) <= 0 {
+                lower.removeLast()
+            }
+            lower.append(point)
+        }
+
+        var upper: [BoundaryPoint] = []
+        for point in points.reversed() {
+            while upper.count >= 2 && cross(upper[upper.count - 2], upper[upper.count - 1], point) <= 0 {
+                upper.removeLast()
+            }
+            upper.append(point)
+        }
+
+        lower.removeLast()
+        upper.removeLast()
+        return lower + upper
+    }
+
+    private static func cross(_ origin: BoundaryPoint, _ a: BoundaryPoint, _ b: BoundaryPoint) -> Double {
+        (a.lon - origin.lon) * (b.lat - origin.lat) - (a.lat - origin.lat) * (b.lon - origin.lon)
     }
 }
 
@@ -477,11 +802,192 @@ func coordinateRegion(for coordinates: [CLLocationCoordinate2D]) -> MKCoordinate
     return MKCoordinateRegion(center: center, span: span)
 }
 
+private struct LaunchSummaryData: Identifiable {
+    let id = UUID()
+    let newWalkCount: Int
+    let newDistanceKm: Double
+    let newRoutes: [Route]
+    let newStreetNames: [String]
+    let newDistrictNames: [String]
+    let newStadtteilNames: [String]
+
+    var hasNewRoutes: Bool {
+        newWalkCount > 0 || newDistanceKm > 0
+    }
+
+    var newAreaNames: [String] {
+        (newDistrictNames + newStadtteilNames).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+}
+
+private struct PendingLaunchSummary {
+    let newWalkCount: Int
+    let newDistanceKm: Double
+    let newRoutes: [Route]
+}
+
+private struct LaunchSummarySheet: View {
+    let summary: LaunchSummaryData
+    @Environment(\.dismiss) private var dismiss
+    @State private var showAllStreets = false
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if !summary.hasNewRoutes {
+                        Text("Go explore!")
+                            .font(.title2)
+                            .fontWeight(.semibold)
+                    } else {
+                        Text(String(format: "You added %d %@ for %.1f kilometers.", summary.newWalkCount, summary.walkNoun, summary.newDistanceKm))
+                            .font(.title3)
+                            .fontWeight(.semibold)
+
+                        if !summary.newRoutes.isEmpty {
+                            LaunchSummaryRouteMap(routes: summary.newRoutes)
+                                .frame(height: 220)
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                        }
+
+                        if !summary.newStreetNames.isEmpty {
+                            if summary.newAreaNames.isEmpty {
+                                Text("This was your first time visiting \(compactList(summary.newStreetNames, limit: 5)).")
+                                    .font(.body)
+                            } else {
+                                Text("This was your first time visiting \(compactList(summary.newAreaNames, limit: 5)).")
+                                    .font(.body)
+                                Text("You covered \(summary.newStreetNames.count) new streets:")
+                                    .font(.headline)
+                            }
+
+                            streetList
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+            }
+            .navigationTitle("Nice work")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
+    }
+
+    @ViewBuilder
+    private var streetList: some View {
+        if summary.newStreetNames.count > 5 {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(compactList(summary.newStreetNames, limit: 4))
+                    .font(.body)
+                DisclosureGroup("Show all \(summary.newStreetNames.count) streets", isExpanded: $showAllStreets) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(summary.newStreetNames, id: \.self) { street in
+                            Text(street)
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.top, 6)
+                }
+            }
+        } else {
+            Text(summary.newStreetNames.joined(separator: ", "))
+                .font(.body)
+        }
+    }
+
+    private func compactList(_ names: [String], limit: Int) -> String {
+        let sorted = names.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        guard sorted.count > limit else {
+            return sorted.joined(separator: ", ")
+        }
+
+        let shown = sorted.prefix(limit).joined(separator: ", ")
+        return "\(shown), and \(sorted.count - limit) others"
+    }
+}
+
+private extension LaunchSummaryData {
+    var walkNoun: String {
+        newWalkCount == 1 ? "walk" : "walks"
+    }
+}
+
+private struct LaunchSummaryRouteMap: UIViewRepresentable {
+    let routes: [Route]
+
+    func makeUIView(context: Context) -> MKMapView {
+        let mapView = MKMapView()
+        mapView.delegate = context.coordinator
+        mapView.isScrollEnabled = false
+        mapView.isZoomEnabled = false
+        mapView.isPitchEnabled = false
+        mapView.showsUserLocation = false
+        mapView.pointOfInterestFilter = .excludingAll
+        render(routes: routes, on: mapView)
+        return mapView
+    }
+
+    func updateUIView(_ mapView: MKMapView, context: Context) {
+        render(routes: routes, on: mapView)
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    private func render(routes: [Route], on mapView: MKMapView) {
+        mapView.removeOverlays(mapView.overlays)
+
+        let polylines = routes
+            .filter { $0.coordinates.count > 1 }
+            .map { route in
+                let polyline = RoutePolyline.fromCoordinates(route.coordinates)
+                polyline.workoutType = route.workoutType
+                return polyline
+            }
+
+        if !polylines.isEmpty {
+            mapView.addOverlays(polylines, level: .aboveRoads)
+        }
+
+        let coordinates = routes.flatMap(\.coordinates)
+        if !coordinates.isEmpty {
+            mapView.setRegion(coordinateRegion(for: coordinates), animated: false)
+        }
+    }
+
+    final class Coordinator: NSObject, MKMapViewDelegate {
+        func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            guard let polyline = overlay as? RoutePolyline else {
+                return MKOverlayRenderer(overlay: overlay)
+            }
+
+            let renderer = MKPolylineRenderer(polyline: polyline)
+            renderer.strokeColor = polyline.workoutType == .walking ? UIColor.systemBlue : UIColor.systemGreen
+            renderer.lineWidth = 4
+            renderer.alpha = 0.9
+            renderer.lineCap = .round
+            renderer.lineJoin = .round
+            return renderer
+        }
+    }
+}
+
 // MARK: - ContentView
 
 struct ContentView: View {
     @StateObject private var viewModel = RunViewModel()
     @StateObject private var locationManager = LocationManager()
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     @AppStorage("hasSeenTutorial") private var hasSeenTutorial = false
     @AppStorage("mapType") private var mapTypeRawValue: Int = Int(MKMapType.standard.rawValue)
@@ -504,34 +1010,79 @@ struct ContentView: View {
     @State private var showNewCountryAlert = false
     @State private var newCountriesFound: [String] = []
 
-    // Tracking state variables
-    @State private var isTracking = false
-    @State private var liveCoordinates: [CLLocationCoordinate2D] = []
-    @State private var trackingTimer: Timer?
     @State private var showControls = false
     @State private var showStats = false
     @State private var showAchievementsPage = false
     @State private var showRoutePlanner = false
     @StateObject private var achievementsManager = AchievementsManager()
+    @State private var fakeLoadingPercent = 0
+    @State private var fakeLoadingTask: Task<Void, Never>?
     
     // District overlay state
     @State private var selectedDistrictOverlay: (name: String, lat: Double, lon: Double)? = nil
     @State private var showAllBerlinDistricts = false
+    @State private var showAllBerlinStadtteile = false
 
     // Stats banner state
     @AppStorage("lastRunCount") private var lastRunCount = 0
     @AppStorage("lastDistanceKm") private var lastDistanceKm: Double = 0
     @AppStorage("hasLaunchedBefore") private var hasLaunchedBefore = false
-    @State private var summaryMessage: String?
-    @State private var showSummaryAlert = false
+    @State private var launchSummary: LaunchSummaryData?
+    @State private var pendingLaunchSummary: PendingLaunchSummary?
     @State private var hasShownSummary = false
+    @State private var hasQueuedLaunchAchievementCheck = false
+
+    private var usesRegularWidthLayout: Bool {
+        horizontalSizeClass == .regular
+    }
+
+    private var mapControlSize: CGFloat {
+        usesRegularWidthLayout ? 58 : 48
+    }
+
+    private var hasMapMarks: Bool {
+        !highlightedRouteIDs.isEmpty ||
+        selectedDistrictOverlay != nil ||
+        showAllBerlinDistricts ||
+        showAllBerlinStadtteile
+    }
 
     private func circleButton(icon: String, bg: Color = .blue) -> some View {
         Image(systemName: icon)
+            .font(.system(size: usesRegularWidthLayout ? 21 : 17, weight: .semibold))
             .foregroundColor(.white)
-            .padding()
+            .frame(width: mapControlSize, height: mapControlSize)
             .background(bg)
             .clipShape(Circle())
+            .shadow(color: .black.opacity(0.18), radius: 5, x: 0, y: 3)
+    }
+
+    private func startFakeLoading() {
+        fakeLoadingTask?.cancel()
+        isLoading = true
+        fakeLoadingPercent = 0
+        hasQueuedLaunchAchievementCheck = false
+
+        fakeLoadingTask = Task {
+            for percent in 0...99 {
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    fakeLoadingPercent = percent
+                }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+    }
+
+    private func finishFakeLoading() {
+        fakeLoadingTask?.cancel()
+        fakeLoadingTask = nil
+        fakeLoadingPercent = 100
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            isLoading = false
+            fakeLoadingPercent = 0
+        }
     }
 
 
@@ -541,10 +1092,13 @@ struct ContentView: View {
                          region: region,
                          highlightedRouteIDs: highlightedRouteIDs,
                          showUserLocation: showUserLocation,
-                         liveCoordinates: liveCoordinates,
                          mapType: mapType,
                          districtOverlay: selectedDistrictOverlay,
-                         showAllBerlinDistricts: showAllBerlinDistricts)
+                         showAllBerlinDistricts: showAllBerlinDistricts,
+                         visitedBerlinDistricts: achievementsManager.berlinDistrictsVisitedCached,
+                         showAllBerlinStadtteile: showAllBerlinStadtteile,
+                         visitedBerlinStadtteile: achievementsManager.berlinStadtteileVisitedCached,
+                         streetsByStadtteil: achievementsManager.streetsByStadtteil)
                 .onReceive(locationManager.$currentLocation) { location in
                     // Center map on user's current location when first obtained
                     if let location = location, !hasSetInitialLocation {
@@ -600,7 +1154,7 @@ struct ContentView: View {
             }
             
             if isLoading {
-                Text("Loading \(Int(viewModel.loadProgress * 100))%")
+                Text("Loading \(fakeLoadingPercent)%")
                     .padding()
                     .background(Color.black.opacity(0.6))
                     .foregroundColor(.white)
@@ -609,48 +1163,26 @@ struct ContentView: View {
             
             VStack {
                 Spacer()
-                VStack(spacing: 12) {
+                VStack(spacing: usesRegularWidthLayout ? 16 : 12) {
                     if showControls {
                         // Highlight button
-                        circleButton(icon: "highlighter")
+                        circleButton(icon: hasMapMarks ? "eraser.fill" : "highlighter")
                             .onTapGesture {
-                                if let latest = viewModel.routes.sorted(by: { $0.date > $1.date }).first {
-                                    let calendar = Calendar.current
-
-                                    // Find all routes from the same day
-                                    let routesFromLatestDay = viewModel.routes.filter { route in
-                                        calendar.isDate(route.date, inSameDayAs: latest.date)
-                                    }
-
-                                    highlightedRouteIDs = Set(routesFromLatestDay.map { $0.id })
-
-                                    // Create region that encompasses all routes from that day
-                                    let allCoordinates = routesFromLatestDay.flatMap { $0.coordinates }
-                                    region = coordinateRegion(for: allCoordinates)
-
-                                    showLatestDayLabel = true
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                        showLatestDayLabel = false
-                                    }
+                                if hasMapMarks {
+                                    clearMapMarks()
+                                } else {
+                                    markLatestDayRoutes()
                                 }
                             }
                             .onLongPressGesture {
-                                highlightedRouteIDs.removeAll()
-                                selectedDistrictOverlay = nil
-                                showAllBerlinDistricts = false
+                                clearMapMarks()
                             }
-
-                        // Tracking button
-                        circleButton(icon: isTracking ? "pause.circle" : "dot.circle",
-                                     bg: isTracking ? .red : .blue)
-                            .onTapGesture { toggleTracking() }
 
                         // Update‑from‑HealthKit button
                         circleButton(icon: "arrow.clockwise")
                             .onTapGesture {
-                                isLoading = true
-                                viewModel.loadNewRuns()
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { isLoading = false }
+                                startFakeLoading()
+                                viewModel.refreshFromHealthKit()
                             }
 
                         // Re‑center to current location
@@ -694,7 +1226,7 @@ struct ContentView: View {
                             }
 
                         // Route planner button
-                        circleButton(icon: "point.topleft.down.curvedto.point.bottomright.up.fill", bg: .purple)
+                        circleButton(icon: "point.topleft.down.curvedto.point.bottomright.up.fill")
                             .onTapGesture {
                                 showRoutePlanner = true
                             }
@@ -720,11 +1252,12 @@ struct ContentView: View {
                             withAnimation { showControls.toggle() }
                         }
                 }
-                .padding()
+                .padding(usesRegularWidthLayout ? 24 : 16)
                 .frame(maxWidth: .infinity, alignment: .trailing)
             }
         }
         .onAppear {
+            startFakeLoading()
             viewModel.healthManager.requestAuthorization { _ in
                 viewModel.loadRuns()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
@@ -737,7 +1270,6 @@ struct ContentView: View {
                         let allCoordinates = routesFromLatestDay.flatMap { $0.coordinates }
                         region = coordinateRegion(for: allCoordinates)
                     }
-                    isLoading = false
                 }
             }
         }
@@ -746,78 +1278,26 @@ struct ContentView: View {
                 // After all HealthKit queries finish decide whether to show the empty state
                 showNoWorkouts = viewModel.routes.isEmpty
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    isLoading = false
+                    finishFakeLoading()
                     // Check for new countries after loading is complete
                     checkForNewCountries(routes: viewModel.routes)
+                    if !hasQueuedLaunchAchievementCheck {
+                        hasQueuedLaunchAchievementCheck = true
+                        startLaunchAchievementCheckAfterMapLoad()
+                    }
                 }
                 if !hasShownSummary {
-                    let newRuns = viewModel.routes.count - lastRunCount
-                    let newDistance = viewModel.totalDistanceKm - lastDistanceKm
+                    let newRuns = max(0, viewModel.routes.count - lastRunCount)
+                    let newDistance = max(0, viewModel.totalDistanceKm - lastDistanceKm)
+                    let newlyAddedRoutes = Array(viewModel.routes.sorted { $0.date > $1.date }.prefix(newRuns))
                     if hasLaunchedBefore {
-                        if newRuns == 0 && newDistance == 0 {
-                            summaryMessage = "Go explore!"
-                            // Auto-close after 1 second
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                                showSummaryAlert = false
-                            }
-                        } else {
-                            // Get countries from new runs (ensure newRuns is not negative)
-                            let safeNewRuns = max(0, newRuns)
-                            let newRoutes = Array(viewModel.routes.prefix(safeNewRuns))
-                            var newCountries = Set<String>()
-                            
-                            for route in newRoutes {
-                                guard let firstCoord = route.coordinates.first else { continue }
-                                let geocodeResult = LocalGeocoder.geocode(latitude: firstCoord.latitude, longitude: firstCoord.longitude)
-                                if !geocodeResult.country.isEmpty && geocodeResult.country != "Unknown" {
-                                    newCountries.insert(geocodeResult.country)
-                                }
-                            }
-                            
-                            var message = "You added \(newRuns) runs for " + String(format: "%.1f", newDistance) + " km"
-
-                            // Check for new streets in Berlin
-                            var newStreetNames: Set<String> = []
-                            let isBerlinRun = newCountries.contains("Germany") && newRoutes.contains { route in
-                                guard let first = route.coordinates.first else { return false }
-                                return BerlinDistricts.getDistrict(lat: first.latitude, lon: first.longitude) != nil
-                            }
-
-                            if isBerlinRun {
-                                // Get newly covered streets from the latest routes
-                                let newRouteIDs = Set(newRoutes.map { "\($0.date.timeIntervalSince1970)" })
-                                for (routeID, coverageData) in achievementsManager.processedRoutes {
-                                    if newRouteIDs.contains(routeID) {
-                                        // Get unique street names from this route's segments
-                                        let streetNames = Set(coverageData.coveredSegments.map { $0.streetName })
-                                        newStreetNames.formUnion(streetNames)
-                                    }
-                                }
-                            }
-
-                            if !newCountries.isEmpty {
-                                let sortedCountries = Array(newCountries).sorted()
-                                if sortedCountries.count == 1 {
-                                    message += " in \(sortedCountries[0])"
-                                } else {
-                                    message += " in \(sortedCountries.joined(separator: ", "))"
-                                }
-                            }
-
-                            // Add new streets info if any
-                            if !newStreetNames.isEmpty {
-                                let streetList = Array(newStreetNames.prefix(5)).sorted()
-                                if streetList.count <= 3 {
-                                    message += "\n\nNew streets covered: \(streetList.joined(separator: ", "))"
-                                } else {
-                                    message += "\n\nNew streets covered: \(streetList.prefix(3).joined(separator: ", ")) and \(newStreetNames.count - 3) more"
-                                }
-                            }
-
-                            message += "\n\nGreat job!"
-                            summaryMessage = message
+                        if newRuns > 0 {
+                            pendingLaunchSummary = PendingLaunchSummary(
+                                newWalkCount: newRuns,
+                                newDistanceKm: newDistance,
+                                newRoutes: newlyAddedRoutes
+                            )
                         }
-                        showSummaryAlert = true
                     }
                     lastRunCount = viewModel.routes.count
                     lastDistanceKm = viewModel.totalDistanceKm
@@ -825,7 +1305,17 @@ struct ContentView: View {
                     hasLaunchedBefore = true
                 }
             } else {
-                isLoading = true
+                if !isLoading {
+                    startFakeLoading()
+                }
+            }
+        }
+        .onReceive(achievementsManager.$newlyCoveredStreetNames) { _ in
+            presentPendingLaunchSummary()
+        }
+        .onReceive(achievementsManager.$processingProgress) { progress in
+            if progress >= 1 {
+                presentPendingLaunchSummary()
             }
         }
     // end ZStack
@@ -846,6 +1336,7 @@ struct ContentView: View {
             StatsView(routes: viewModel.displayedRoutes) { country, city in
                 navigateToLocation(country: country, city: city)
             }
+            .presentationDetents([.large])
         }
         .sheet(isPresented: $showRoutePlanner) {
             RoutePlannerView(
@@ -862,6 +1353,7 @@ struct ContentView: View {
                 onDistrictSelected: { districtName, lat, lon in
                     selectedDistrictOverlay = (districtName, lat, lon)
                     showAllBerlinDistricts = false
+                    showAllBerlinStadtteile = false
                     let districtCenter = CLLocationCoordinate2D(latitude: lat, longitude: lon)
                     let newRegion = MKCoordinateRegion(
                         center: districtCenter,
@@ -874,6 +1366,20 @@ struct ContentView: View {
                 onShowAllDistricts: {
                     selectedDistrictOverlay = nil
                     showAllBerlinDistricts = true
+                    showAllBerlinStadtteile = false
+                    let berlinCenter = CLLocationCoordinate2D(latitude: 52.52, longitude: 13.405)
+                    let newRegion = MKCoordinateRegion(
+                        center: berlinCenter,
+                        span: MKCoordinateSpan(latitudeDelta: 0.4, longitudeDelta: 0.4)
+                    )
+                    withAnimation(.easeInOut(duration: 1.0)) {
+                        region = newRegion
+                    }
+                },
+                onShowAllStadtteile: {
+                    selectedDistrictOverlay = nil
+                    showAllBerlinDistricts = false
+                    showAllBerlinStadtteile = true
                     let berlinCenter = CLLocationCoordinate2D(latitude: 52.52, longitude: 13.405)
                     let newRegion = MKCoordinateRegion(
                         center: berlinCenter,
@@ -887,9 +1393,17 @@ struct ContentView: View {
                     navigateToLocation(country: country, city: city)
                 }
             )
+            .presentationDetents([.large])
         }
-        .alert(summaryMessage ?? "", isPresented: $showSummaryAlert) {
-            Button("OK", role: .cancel) { }
+        .sheet(item: $launchSummary) { summary in
+            LaunchSummarySheet(summary: summary)
+        }
+        .alert(isPresented: $achievementsManager.showAchievementAlert) {
+            Alert(
+                title: Text(achievementsManager.achievementMessage?.split(separator: "\n").first.map(String.init) ?? "Achievement"),
+                message: Text(achievementsManager.achievementMessage?.split(separator: "\n").dropFirst().joined(separator: "\n") ?? ""),
+                dismissButton: .default(Text("OK"))
+            )
         }
         .alert("🎉 New Country Visited!", isPresented: $showNewCountryAlert) {
             Button("Awesome!", role: .cancel) { }
@@ -920,32 +1434,53 @@ struct ContentView: View {
         viewModel.hasContent = !viewModel.routes.isEmpty
     }
 
-    private func toggleTracking() {
-        if isTracking {
-            trackingTimer?.invalidate()
-            trackingTimer = nil
-            isTracking = false
-            if liveCoordinates.count > 1 {
-                let est = Double(max(liveCoordinates.count - 1, 1)) * 5
-                viewModel.routes.append(
-                    Route(coordinates: liveCoordinates,
-                          date: Date(),
-                          workoutType: .other,
-                          durationSec: est)
-                )
-            }
-            liveCoordinates.removeAll()
-        } else {
-            isTracking = true
-            liveCoordinates.removeAll()
-            if let loc = locationManager.currentLocation?.coordinate {
-                liveCoordinates.append(loc)
-            }
-            trackingTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-                if let loc = locationManager.currentLocation?.coordinate {
-                    liveCoordinates.append(loc)
-                }
-            }
+    private func markLatestDayRoutes() {
+        guard let latest = viewModel.routes.sorted(by: { $0.date > $1.date }).first else { return }
+        let calendar = Calendar.current
+        let routesFromLatestDay = viewModel.routes.filter { route in
+            calendar.isDate(route.date, inSameDayAs: latest.date)
+        }
+
+        highlightedRouteIDs = Set(routesFromLatestDay.map { $0.id })
+        selectedDistrictOverlay = nil
+        showAllBerlinDistricts = false
+        showAllBerlinStadtteile = false
+
+        let allCoordinates = routesFromLatestDay.flatMap { $0.coordinates }
+        region = coordinateRegion(for: allCoordinates)
+
+        showLatestDayLabel = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            showLatestDayLabel = false
+        }
+    }
+
+    private func clearMapMarks() {
+        highlightedRouteIDs.removeAll()
+        selectedDistrictOverlay = nil
+        showAllBerlinDistricts = false
+        showAllBerlinStadtteile = false
+        showLatestDayLabel = false
+    }
+
+    private func presentPendingLaunchSummary() {
+        guard let pending = pendingLaunchSummary else { return }
+        pendingLaunchSummary = nil
+
+        launchSummary = LaunchSummaryData(
+            newWalkCount: pending.newWalkCount,
+            newDistanceKm: pending.newDistanceKm,
+            newRoutes: pending.newRoutes,
+            newStreetNames: achievementsManager.newlyCoveredStreetNames,
+            newDistrictNames: achievementsManager.newlyVisitedDistrictNames,
+            newStadtteilNames: achievementsManager.newlyVisitedStadtteilNames
+        )
+    }
+
+    private func startLaunchAchievementCheckAfterMapLoad() {
+        let routes = viewModel.routes
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            achievementsManager.checkAndUnlockAchievementsInBackground(routes: routes)
         }
     }
 
@@ -1143,10 +1678,13 @@ struct RouteMapView: UIViewRepresentable {
     var region: MKCoordinateRegion
     var highlightedRouteIDs: Set<UUID>
     var showUserLocation: Bool
-    var liveCoordinates: [CLLocationCoordinate2D]
     var mapType: MKMapType
     var districtOverlay: (name: String, lat: Double, lon: Double)? = nil
     var showAllBerlinDistricts: Bool = false
+    var visitedBerlinDistricts: Set<String> = []
+    var showAllBerlinStadtteile: Bool = false
+    var visitedBerlinStadtteile: Set<String> = []
+    var streetsByStadtteil: [String: [ConsolidatedStreet]] = [:]
     
     func makeUIView(context: Context) -> MKMapView {
         let mapView = MKMapView()
@@ -1178,10 +1716,16 @@ struct RouteMapView: UIViewRepresentable {
         context.coordinator.reconcileDistrictOverlays(
             on: mapView,
             districtOverlay: districtOverlay,
-            showAllBerlinDistricts: showAllBerlinDistricts
+            showAllBerlinDistricts: showAllBerlinDistricts,
+            visitedBerlinDistricts: visitedBerlinDistricts
         )
 
-        context.coordinator.reconcileLiveRoute(on: mapView, coordinates: liveCoordinates)
+        context.coordinator.reconcileStadtteilOverlays(
+            on: mapView,
+            showAllBerlinStadtteile: showAllBerlinStadtteile,
+            visitedBerlinStadtteile: visitedBerlinStadtteile,
+            streetsByStadtteil: streetsByStadtteil
+        )
 
         let existingIDs = Set(context.coordinator.routeOverlaysByID.keys)
         let desiredIDs = Set(routes.map(\.id))
@@ -1227,9 +1771,9 @@ struct RouteMapView: UIViewRepresentable {
         private var districtOverlayKey: String?
         private var districtOverlays: [MKOverlay] = []
         private var districtAnnotations: [MKAnnotation] = []
-        private var liveRouteSignature: LiveRouteSignature?
-        private var liveRouteOverlay: RoutePolyline?
-        private var liveStartAnnotation: MKPointAnnotation?
+        private var stadtteilOverlayKey: String?
+        private var stadtteilOverlays: [MKOverlay] = []
+        private var stadtteilAnnotations: [MKAnnotation] = []
         var routeOverlaysByID: [UUID: RoutePolyline] = [:]
 
         init(_ parent: RouteMapView) { self.parent = parent }
@@ -1237,13 +1781,15 @@ struct RouteMapView: UIViewRepresentable {
         func reconcileDistrictOverlays(
             on mapView: MKMapView,
             districtOverlay: (name: String, lat: Double, lon: Double)?,
-            showAllBerlinDistricts: Bool
+            showAllBerlinDistricts: Bool,
+            visitedBerlinDistricts: Set<String>
         ) {
             let nextKey: String
             if showAllBerlinDistricts {
-                nextKey = "all"
+                nextKey = "all:\(visitedBerlinDistricts.sorted().joined(separator: "|"))"
             } else if let districtOverlay {
-                nextKey = "single:\(districtOverlay.name)"
+                let visitedFlag = visitedBerlinDistricts.contains(districtOverlay.name) ? "visited" : "notVisited"
+                nextKey = "single:\(districtOverlay.name):\(visitedFlag)"
             } else {
                 nextKey = "none"
             }
@@ -1285,6 +1831,7 @@ struct RouteMapView: UIViewRepresentable {
                             let mkPolygon = DistrictPolygon(coordinates: outer, count: outer.count)
                             mkPolygon.districtName = district.name
                             mkPolygon.colorIndex = BerlinDistricts.districts.firstIndex(where: { $0.name == district.name }) ?? 0
+                            mkPolygon.isVisited = visitedBerlinDistricts.contains(district.name)
                             districtOverlays.append(mkPolygon)
                         }
                     }
@@ -1299,59 +1846,94 @@ struct RouteMapView: UIViewRepresentable {
             }
         }
 
-        func reconcileLiveRoute(on mapView: MKMapView, coordinates: [CLLocationCoordinate2D]) {
-            let nextSignature = LiveRouteSignature(coordinates: coordinates)
-            guard nextSignature != liveRouteSignature else { return }
-
-            if let liveRouteOverlay {
-                mapView.removeOverlay(liveRouteOverlay)
-                self.liveRouteOverlay = nil
+        func reconcileStadtteilOverlays(
+            on mapView: MKMapView,
+            showAllBerlinStadtteile: Bool,
+            visitedBerlinStadtteile: Set<String>,
+            streetsByStadtteil: [String: [ConsolidatedStreet]]
+        ) {
+            let nextKey: String
+            if showAllBerlinStadtteile {
+                nextKey = "all:\(streetsByStadtteil.count):\(visitedBerlinStadtteile.sorted().joined(separator: "|"))"
+            } else {
+                nextKey = "none"
             }
-            if let liveStartAnnotation {
-                mapView.removeAnnotation(liveStartAnnotation)
-                self.liveStartAnnotation = nil
+
+            guard nextKey != stadtteilOverlayKey else { return }
+
+            if !stadtteilOverlays.isEmpty {
+                mapView.removeOverlays(stadtteilOverlays)
+                stadtteilOverlays.removeAll(keepingCapacity: true)
+            }
+            if !stadtteilAnnotations.isEmpty {
+                mapView.removeAnnotations(stadtteilAnnotations)
+                stadtteilAnnotations.removeAll(keepingCapacity: true)
             }
 
-            liveRouteSignature = nextSignature
-            guard coordinates.count > 1 else { return }
+            stadtteilOverlayKey = nextKey
+            guard showAllBerlinStadtteile else { return }
 
-            let live = RoutePolyline.fromCoordinates(coordinates)
-            liveRouteOverlay = live
-            mapView.addOverlay(live)
+            let overlaySource = streetsByStadtteil.isEmpty
+                ? BerlinStadtteilBoundaryBuilder.fallbackStreetsByStadtteil()
+                : streetsByStadtteil
+            let boundaries = BerlinStadtteilBoundaryBuilder.boundaries(from: overlaySource)
+            for boundary in boundaries {
+                let isVisited = visitedBerlinStadtteile.contains(boundary.name)
 
-            if let start = coordinates.first {
-                let pin = MKPointAnnotation()
-                pin.coordinate = start
-                pin.title = "Start"
-                liveStartAnnotation = pin
-                mapView.addAnnotation(pin)
+                let annotation = StadtteilAnnotation()
+                annotation.coordinate = boundary.center
+                annotation.title = boundary.name
+                annotation.subtitle = "Stadtteil Label"
+                annotation.isVisited = isVisited
+                stadtteilAnnotations.append(annotation)
+
+                for rings in boundary.polygons {
+                    guard let outerRing = rings.first, outerRing.count >= 3 else { continue }
+                    let holes = rings.dropFirst().map { hole in
+                        MKPolygon(coordinates: hole, count: hole.count)
+                    }
+                    let polygon = StadtteilPolygon(
+                        coordinates: outerRing,
+                        count: outerRing.count,
+                        interiorPolygons: holes.isEmpty ? nil : holes
+                    )
+                    polygon.stadtteilName = boundary.name
+                    polygon.isVisited = isVisited
+                    stadtteilOverlays.append(polygon)
+                }
+            }
+
+            if !stadtteilAnnotations.isEmpty {
+                mapView.addAnnotations(stadtteilAnnotations)
+            }
+            if !stadtteilOverlays.isEmpty {
+                mapView.addOverlays(stadtteilOverlays)
             }
         }
 
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let polygon = overlay as? DistrictPolygon {
                 let renderer = MKPolygonRenderer(polygon: polygon)
-                // Black dotted borders
-                renderer.strokeColor = .black
-                renderer.lineWidth = 2
-                renderer.lineDashPattern = [6, 4]
-                // Pastel fill color based on index
-                let palette: [UIColor] = [
-                    UIColor(red: 0.90, green: 0.49, blue: 0.47, alpha: 0.3),
-                    UIColor(red: 0.99, green: 0.76, blue: 0.38, alpha: 0.3),
-                    UIColor(red: 0.99, green: 0.94, blue: 0.60, alpha: 0.3),
-                    UIColor(red: 0.70, green: 0.87, blue: 0.54, alpha: 0.3),
-                    UIColor(red: 0.54, green: 0.80, blue: 0.94, alpha: 0.3),
-                    UIColor(red: 0.80, green: 0.67, blue: 0.94, alpha: 0.3),
-                    UIColor(red: 0.95, green: 0.66, blue: 0.88, alpha: 0.3),
-                    UIColor(red: 0.95, green: 0.84, blue: 0.70, alpha: 0.3),
-                    UIColor(red: 0.66, green: 0.88, blue: 0.80, alpha: 0.3),
-                    UIColor(red: 0.80, green: 0.88, blue: 0.99, alpha: 0.3),
-                    UIColor(red: 0.88, green: 0.80, blue: 0.99, alpha: 0.3),
-                    UIColor(red: 0.99, green: 0.80, blue: 0.88, alpha: 0.3)
-                ]
-                let idx = max(0, min(polygon.colorIndex % palette.count, palette.count - 1))
-                renderer.fillColor = palette[idx]
+                renderer.strokeColor = polygon.isVisited
+                    ? UIColor.systemGreen.withAlphaComponent(0.95)
+                    : UIColor.systemRed.withAlphaComponent(0.95)
+                renderer.fillColor = polygon.isVisited
+                    ? UIColor.systemGreen.withAlphaComponent(0.30)
+                    : UIColor.systemRed.withAlphaComponent(0.28)
+                renderer.lineWidth = polygon.isVisited ? 2.4 : 2.8
+                renderer.lineDashPattern = polygon.isVisited ? nil : [6, 4]
+                return renderer
+            }
+            if let polygon = overlay as? StadtteilPolygon {
+                let renderer = MKPolygonRenderer(polygon: polygon)
+                renderer.strokeColor = polygon.isVisited
+                    ? UIColor.systemGreen.withAlphaComponent(0.95)
+                    : UIColor.systemRed.withAlphaComponent(0.90)
+                renderer.fillColor = polygon.isVisited
+                    ? UIColor.systemGreen.withAlphaComponent(0.24)
+                    : UIColor.systemRed.withAlphaComponent(0.22)
+                renderer.lineWidth = polygon.isVisited ? 2.2 : 2.4
+                renderer.lineDashPattern = polygon.isVisited ? nil : [6, 4]
                 return renderer
             }
             guard let polyline = overlay as? RoutePolyline else {
@@ -1378,8 +1960,10 @@ struct RouteMapView: UIViewRepresentable {
         // Custom label-only annotation views for district labels
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
             guard let point = annotation as? MKPointAnnotation else { return nil }
-            guard point.subtitle == "District Label" else { return nil }
-            let identifier = "DistrictLabelView"
+            guard point.subtitle == "District Label" || point.subtitle == "Stadtteil Label" else { return nil }
+            let isStadtteil = point.subtitle == "Stadtteil Label"
+            let isVisited = (point as? StadtteilAnnotation)?.isVisited ?? false
+            let identifier = isStadtteil ? "StadtteilLabelView" : "DistrictLabelView"
             let view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier) ?? MKAnnotationView(annotation: annotation, reuseIdentifier: identifier)
             view.annotation = annotation
             view.canShowCallout = false
@@ -1389,11 +1973,14 @@ struct RouteMapView: UIViewRepresentable {
             // Add a label
             let label = UILabel()
             label.text = point.title ?? ""
-            label.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
-            label.textColor = UIColor.systemBlue
-            label.backgroundColor = UIColor.white.withAlphaComponent(0.6)
+            label.font = UIFont.systemFont(ofSize: isStadtteil ? 10 : 12, weight: .semibold)
+            label.textColor = isStadtteil
+                ? (isVisited ? UIColor.systemGreen : UIColor.secondaryLabel)
+                : UIColor.systemBlue
+            label.backgroundColor = UIColor.white.withAlphaComponent(isStadtteil ? 0.7 : 0.6)
             label.layer.cornerRadius = 4
             label.layer.masksToBounds = true
+            label.numberOfLines = 1
             label.sizeToFit()
             label.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(label)
@@ -1434,6 +2021,7 @@ struct RouteListView: View {
                 }
             }
         }
+        .navigationViewStyle(.stack)
     }
 }
 
@@ -1441,36 +2029,48 @@ struct RouteListView: View {
 
 struct OnboardingView: View {
     var dismiss: () -> Void
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    private var maxContentWidth: CGFloat {
+        horizontalSizeClass == .regular ? 520 : .infinity
+    }
+
+    private var iconHeight: CGFloat {
+        horizontalSizeClass == .regular ? 150 : 120
+    }
 
     var body: some View {
         TabView {
             VStack(spacing: 24) {
                 Image(systemName: "map")
-                    .resizable().scaledToFit().frame(height: 120)
+                    .resizable().scaledToFit().frame(height: iconHeight)
                 Text("See all your runs and walks on a beautiful map.")
                     .font(.title3).multilineTextAlignment(.center)
             }
+            .frame(maxWidth: maxContentWidth)
             .padding()
 
             VStack(spacing: 24) {
-                Image(systemName: "record.circle")
-                    .resizable().scaledToFit().frame(height: 120)
-                Text("Record a live route with the • button.\nWe’ll plot it in real‑time.")
+                Image(systemName: "arrow.clockwise.circle")
+                    .resizable().scaledToFit().frame(height: iconHeight)
+                Text("Sync workouts from HealthKit and see your saved routes on the map.")
                     .font(.title3).multilineTextAlignment(.center)
             }
+            .frame(maxWidth: maxContentWidth)
             .padding()
 
             VStack(spacing: 24) {
                 Image(systemName: "highlighter")
-                    .resizable().scaledToFit().frame(height: 120)
+                    .resizable().scaledToFit().frame(height: iconHeight)
                 Text("Tap the highlighter to jump to your latest day's workouts.\nLong‑press to clear the highlight.")
                     .font(.title3).multilineTextAlignment(.center)
             }
+            .frame(maxWidth: maxContentWidth)
             .padding()
 
             VStack(spacing: 24) {
                 Image(systemName: "plus.circle")
-                    .resizable().scaledToFit().frame(height: 120)
+                    .resizable().scaledToFit().frame(height: iconHeight)
                 Text("All controls are tucked under the + button.\nTap to expand, tap × to hide.")
                     .font(.title3).multilineTextAlignment(.center)
 
@@ -1482,6 +2082,7 @@ struct OnboardingView: View {
                 .background(Color.blue).foregroundColor(.white)
                 .clipShape(Capsule())
             }
+            .frame(maxWidth: maxContentWidth)
             .padding()
         }
         .tabViewStyle(PageTabViewStyle())
@@ -1491,6 +2092,11 @@ struct OnboardingView: View {
 // MARK: - No Workouts View
 struct NoWorkoutsView: View {
     var loadDemoAndDismiss: () -> Void
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    private var maxContentWidth: CGFloat {
+        horizontalSizeClass == .regular ? 520 : .infinity
+    }
 
     var body: some View {
         VStack(spacing: 28) {
@@ -1513,6 +2119,7 @@ struct NoWorkoutsView: View {
             .background(Color.blue).foregroundColor(.white)
             .clipShape(Capsule())
         }
+        .frame(maxWidth: maxContentWidth)
         .padding()
     }
 }
