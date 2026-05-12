@@ -511,6 +511,7 @@ struct ContentView: View {
     @State private var showControls = false
     @State private var showStats = false
     @State private var showAchievementsPage = false
+    @State private var showRoutePlanner = false
     @StateObject private var achievementsManager = AchievementsManager()
     
     // District overlay state
@@ -692,6 +693,11 @@ struct ContentView: View {
                                 )
                             }
 
+                        // Route planner button
+                        circleButton(icon: "point.topleft.down.curvedto.point.bottomright.up.fill", bg: .purple)
+                            .onTapGesture {
+                                showRoutePlanner = true
+                            }
 
                         // Stats button
                         circleButton(icon: "chart.bar")
@@ -840,6 +846,14 @@ struct ContentView: View {
             StatsView(routes: viewModel.displayedRoutes) { country, city in
                 navigateToLocation(country: country, city: city)
             }
+        }
+        .sheet(isPresented: $showRoutePlanner) {
+            RoutePlannerView(
+                initialRegion: region,
+                consolidatedStreets: achievementsManager.consolidatedStreets,
+                streetCoverageByID: achievementsManager.streetCoverageByID
+            )
+            .presentationDetents([.large])
         }
         .sheet(isPresented: $showAchievementsPage) {
             AchievementsView(

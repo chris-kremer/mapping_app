@@ -29,6 +29,7 @@ This file tracks measurable changes made during the rebuild. Keep entries factua
 | 2026-05-12 | Generic iOS build after adding Stadtteil map overlays and visited/unvisited styling | Passed | App target compiles for generic iOS with `CODE_SIGNING_ALLOWED=NO`; no signing prompt required. |
 | 2026-05-12 | Generic iOS build after adding grouped Berlin street coverage map | Passed | App target compiles for generic iOS with `CODE_SIGNING_ALLOWED=NO`; the map uses two `MKMultiPolyline` overlays instead of thousands of individual street overlays. |
 | 2026-05-12 | Generic iOS build after adding indexed GeoNames city gazetteer | Passed | App target compiles for generic iOS with `CODE_SIGNING_ALLOWED=NO`; city lookup now loads a 63,489-city TSV once and searches nearby 2-degree spatial cells instead of relying only on the hardcoded major-city switch. |
+| 2026-05-12 | Generic iOS build after adding manual route planner preview | Passed | App target compiles for generic iOS with `CODE_SIGNING_ALLOWED=NO`; planned route stats run off the main thread and reuse cached street coverage data instead of mutating real achievement progress. |
 
 ## Current Architectural Baseline
 
@@ -59,6 +60,7 @@ This file tracks measurable changes made during the rebuild. Keep entries factua
 | Stadtteil achievement map | No all-Stadtteile map overlay | Derived, cached Stadtteil hull overlays from loaded street geometry; visited/unvisited state only changes overlay styling | Provide map context without adding a new GeoJSON parse or per-update polygon rebuild. |
 | Berlin Streets achievement map | Point map rebuilt route proximity checks inside the sheet | Uses already computed street coverage and renders covered/uncovered streets as two grouped `MKMultiPolyline` overlays | Avoid external DB work and avoid one-overlay-per-street rendering churn. |
 | City geocoding coverage | Hardcoded list of roughly 80-90 global major cities | Bundled 63,489-row GeoNames city gazetteer indexed into 2-degree spatial cells, with hardcoded list retained as fallback | Improve city achievement coverage without a linear scan across all cities per geocode. |
+| Route planning preview | No way to preview route impact before a walk/run | Manual waypoint planner computes projected distance, walk/run duration, places, Berlin districts/Stadtteile, and likely new streets using existing caches | Let planning reuse rebuilt engines without adding HealthKit writes or achievement side effects. |
 
 ## Change Log
 
@@ -102,3 +104,8 @@ This file tracks measurable changes made during the rebuild. Keep entries factua
 - Excluded GeoNames `PPLX` neighborhood/district rows so Berlin districts such as Kreuzberg or Pankow do not fragment the city-level achievement category.
 - Added a lazy 2-degree spatial grid inside `LocalGeocoder`; city lookup now searches nearby cells filtered by matched country code, then falls back to the previous hardcoded major-city list.
 - Generic iOS app build passes with signing disabled after the city gazetteer change.
+- Added a Route Planner sheet opened from the floating map controls.
+- Planner users can tap waypoints on a map, undo or clear them, and see a planned purple polyline with numbered markers.
+- Planner preview computes distance, estimated walk/run duration, countries/cities, Berlin districts/Stadtteile, and likely new Berlin streets using existing geocoding and street coverage data.
+- Planned route calculations run on a background queue and do not create real routes or mutate achievements.
+- Generic iOS app build passes with signing disabled after the planner change.
