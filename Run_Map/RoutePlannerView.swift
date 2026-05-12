@@ -16,6 +16,7 @@ struct RoutePlannerView: View {
     @State private var savedPlans: [SavedRoutePlan] = []
     @State private var showSavePlanDialog = false
     @State private var planTitle = ""
+    @State private var showCurrentStreetCoverage = false
     @State private var focusRequestID = UUID()
     @State private var fallbackConsolidatedStreets: [ConsolidatedStreet] = []
     @State private var savedPlanPreviews: [UUID: SavedPlanPreview] = [:]
@@ -45,10 +46,13 @@ struct RoutePlannerView: View {
     }
 
     private var canEditWaypoints: Bool {
-        plannerMode.canEditWaypoints
+        plannerMode.canEditWaypoints && !isSimulationMode
     }
 
     private var mapHintText: String {
+        if isSimulationMode {
+            return "Simulation mode"
+        }
         return canEditWaypoints ? "Tap the map to add waypoints" : "Viewing saved plan"
     }
 
@@ -78,12 +82,12 @@ struct RoutePlannerView: View {
                 PlannerMapView(
                     waypoints: waypoints,
                     initialRegion: initialRegion,
-                    showCurrentStreetCoverage: false,
-                    consolidatedStreets: [],
+                    showCurrentStreetCoverage: showCurrentStreetCoverage && !showSavePlanDialog,
+                    consolidatedStreets: plannerConsolidatedStreets,
                     streetCoverageByID: streetCoverageByID,
                     focusRequestID: focusRequestID,
-                    isSimulationMode: false,
-                    simulationPlans: [],
+                    isSimulationMode: isSimulationMode,
+                    simulationPlans: simulatedPlans.map(\.coordinates),
                     onAddWaypoint: { coordinate in
                         guard canEditWaypoints else { return }
                         waypoints.append(coordinate)
@@ -160,9 +164,28 @@ struct RoutePlannerView: View {
             simulatedPlanIDs.formIntersection(Set(savedPlans.map(\.id)))
             recalculateStats()
             recalculateSavedPlanPreviews()
+            recalculateSimulationStats()
         }
         .onChange(of: waypointSignature) { _ in
             recalculateStats()
+        }
+        .onChange(of: plannerDataSignature) { _ in
+            recalculateStats()
+            recalculateSavedPlanPreviews()
+            recalculateSimulationStats()
+        }
+        .onChange(of: isSimulationMode) { _ in
+            focusRequestID = UUID()
+            recalculateSimulationStats()
+        }
+        .onChange(of: showCurrentStreetCoverage) { enabled in
+            if enabled {
+                loadFallbackStreetDataIfNeeded()
+            }
+        }
+        .onChange(of: simulatedPlanIDs) { _ in
+            focusRequestID = UUID()
+            recalculateSimulationStats()
         }
         .alert("Save Plan", isPresented: $showSavePlanDialog) {
             TextField("Title", text: $planTitle)
@@ -197,14 +220,27 @@ struct RoutePlannerView: View {
 
                 modeControlSection
 
-                if waypoints.count < 2 {
+                HStack(spacing: 12) {
+                    Toggle(isOn: $showCurrentStreetCoverage) {
+                        Label("Street Coverage", systemImage: "map")
+                    }
+                    .toggleStyle(.switch)
+                    .font(.subheadline)
+                }
+
+                simulationSection
+
+                if isSimulationMode {
+                    EmptyView()
+                } else if waypoints.count < 2 {
                     Text("Add at least two waypoints to preview route stats.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 } else {
-                    Text("Route planning is running in lightweight mode while coverage previews are disabled.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    statsSection(title: "Places", items: stats.placeLines)
+                    statsSection(title: "Berlin", items: stats.berlinLines)
+                    newStreetSection
+                    achievementPreviewSection
                 }
 
                 savedPlansSection
@@ -543,6 +579,8 @@ struct RoutePlannerView: View {
 
     private func recalculateStats() {
         let plannedCoordinates = waypoints
+        let streets = plannerConsolidatedStreets
+        let existingCoverage = streetCoverageByID
 
         guard !plannedCoordinates.isEmpty else {
             stats = .empty
@@ -551,15 +589,18 @@ struct RoutePlannerView: View {
         }
 
         isComputingStats = true
-        stats = PlannedRouteStats(
-            distanceKm: PlannedRouteStats.totalDistanceKm(for: plannedCoordinates),
-            countries: [],
-            cities: [],
-            districts: [],
-            stadtteile: [],
-            newStreetNames: []
-        )
-        isComputingStats = false
+        DispatchQueue.global(qos: .userInitiated).async {
+            let calculated = PlannedRouteStats.calculate(
+                coordinates: plannedCoordinates,
+                consolidatedStreets: streets,
+                existingCoverage: existingCoverage
+            )
+
+            DispatchQueue.main.async {
+                stats = calculated
+                isComputingStats = false
+            }
+        }
     }
 
     private var defaultPlanTitle: String {
@@ -573,11 +614,13 @@ struct RoutePlannerView: View {
         let trimmedTitle = planTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard waypoints.count >= 2, !trimmedTitle.isEmpty else { return }
 
+        showCurrentStreetCoverage = false
         let plan = SavedRoutePlan(title: trimmedTitle, createdAt: Date(), coordinates: waypoints)
         savedPlans.insert(plan, at: 0)
         plannerMode = .viewing(plan.id)
         SavedRoutePlanStore.save(savedPlans)
         recalculateSavedPlanPreviews()
+        recalculateSimulationStats()
     }
 
     private func deletePlan(_ plan: SavedRoutePlan) {
@@ -589,6 +632,7 @@ struct RoutePlannerView: View {
         SavedRoutePlanStore.save(savedPlans)
         savedPlanPreviews[plan.id] = nil
         recalculateSavedPlanPreviews()
+        recalculateSimulationStats()
     }
 
     private func startNewPlan() {
@@ -617,6 +661,7 @@ struct RoutePlannerView: View {
               let index = savedPlans.firstIndex(where: { $0.id == planID }),
               waypoints.count >= 2 else { return }
 
+        showCurrentStreetCoverage = false
         let existing = savedPlans[index]
         savedPlans[index] = SavedRoutePlan(
             id: existing.id,
@@ -627,6 +672,7 @@ struct RoutePlannerView: View {
         SavedRoutePlanStore.save(savedPlans)
         plannerMode = .viewing(planID)
         recalculateSavedPlanPreviews()
+        recalculateSimulationStats()
     }
 
     private func toggleSimulatedPlan(_ plan: SavedRoutePlan) {
