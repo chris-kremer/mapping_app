@@ -50,12 +50,12 @@ struct Achievement: Identifiable {
     var nextTierGoal: Double = 0 // Goal for next tier
 
     enum AchievementCategory: String, Codable {
-        case distance = "Distance"
+        case distance = "Exploring distance"
         case country = "Countries"
         case city = "Cities"
         case daily = "Daily"
         case exploration = "Exploration"
-        case specials = "Specials"
+        case specials = "Explore Berlin"
     }
 
     var isUnlocked: Bool {
@@ -89,8 +89,8 @@ struct Achievement: Identifiable {
         } else if id == "daily_distance" || id == "daily_running" {
             // For daily achievements, show what's needed today
             return String(format: "%.0f km today for next tier", nextTierGoal)
-        } else if id == "berlin_streets" {
-            // For Berlin streets - show percentage
+        } else if id == "berlin_streets" || id == "mauerweg" {
+            // For Berlin route/street coverage - show percentage
             return String(format: "%.1f%% to next tier", remaining)
         } else if id == "berlin_districts" || id == "berlin_stadtteile" {
             // For Berlin districts/stadtteile - show count
@@ -129,6 +129,91 @@ struct StreetCoverageCache: Codable {
     let coverageByStreetID: [String: ConsolidatedStreet.CoverageResult]
     let districtStats: [DistrictCoverageStats]
     let stadtteilStats: [StadtteilCoverageStats]
+}
+
+// MARK: - Berlin Mauerweg Helper
+
+struct BerlinMauerweg {
+    struct LandmarkSticker: Identifiable {
+        let id: String
+        let title: String
+        let iconName: String
+        let coordinate: CLLocationCoordinate2D
+    }
+
+    private static let routeFileNames = [
+        "Mauerweg 1 - Stadtroute",
+        "Mauerweg 2 - Suedroute",
+        "Mauerweg 3 - Westroute"
+    ]
+
+    private static var cachedCoordinates: [BerlinStreets.SimpleCoordinate]?
+    private static var cachedCoordinateSegments: [[BerlinStreets.SimpleCoordinate]]?
+
+    private static let landmarkStickers = [
+        LandmarkSticker(
+            id: "checkpoint_charlie",
+            title: "Checkpoint Charlie",
+            iconName: "flag.checkered",
+            coordinate: CLLocationCoordinate2D(latitude: 52.50751, longitude: 13.39037)
+        ),
+        LandmarkSticker(
+            id: "brandenburg_gate",
+            title: "Brandenburg Gate",
+            iconName: "building.columns.fill",
+            coordinate: CLLocationCoordinate2D(latitude: 52.51628, longitude: 13.37770)
+        ),
+        LandmarkSticker(
+            id: "bernauerstrasse",
+            title: "Bernauerstrasse",
+            iconName: "mappin.and.ellipse",
+            coordinate: CLLocationCoordinate2D(latitude: 52.53510, longitude: 13.39025)
+        )
+    ]
+
+    static func coordinates() -> [BerlinStreets.SimpleCoordinate] {
+        if let cachedCoordinates {
+            return cachedCoordinates
+        }
+
+        let coordinates = coordinateSegments().flatMap { $0 }
+
+        cachedCoordinates = coordinates
+        return coordinates
+    }
+
+    static func coordinateSegments() -> [[BerlinStreets.SimpleCoordinate]] {
+        if let cachedCoordinateSegments {
+            return cachedCoordinateSegments
+        }
+
+        let segments = routeFileNames
+            .map { loadCoordinatesFromGPX(named: $0) }
+            .map { coordinates in
+                coordinates.map { BerlinStreets.SimpleCoordinate(lat: $0.latitude, lon: $0.longitude) }
+            }
+            .filter { $0.count >= 2 }
+
+        cachedCoordinateSegments = segments
+        return segments
+    }
+
+    static func completedLandmarkStickers(routes: [Route], thresholdMeters: CLLocationDistance = 90) -> [LandmarkSticker] {
+        landmarkStickers.filter { sticker in
+            let stickerLocation = CLLocation(latitude: sticker.coordinate.latitude, longitude: sticker.coordinate.longitude)
+
+            for route in routes {
+                for coordinate in route.coordinates {
+                    let routeLocation = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+                    if routeLocation.distance(from: stickerLocation) <= thresholdMeters {
+                        return true
+                    }
+                }
+            }
+
+            return false
+        }
+    }
 }
 
 // MARK: - Berlin Streets Helper
@@ -294,14 +379,22 @@ struct BerlinStreets {
             }
 
             // Also return any already-loaded districts
-            var finalStreets = loadedStreets
-            await MainActor.run {
+            let cachedMainActorStreets = await MainActor.run {
+                var cached: [String: [Street]] = [:]
                 for district in districts {
-                    if finalStreets[district] == nil {
-                        finalStreets[district] = _streetsByDistrict[district] ?? []
-                    }
+                    cached[district] = _streetsByDistrict[district] ?? []
                 }
-                completion(finalStreets)
+                return cached
+            }
+
+            var finalStreets = loadedStreets
+            for (district, streets) in cachedMainActorStreets where finalStreets[district] == nil {
+                finalStreets[district] = streets
+            }
+
+            let finalStreetsForCompletion = finalStreets
+            await MainActor.run {
+                completion(finalStreetsForCompletion)
             }
         }
     }
@@ -708,12 +801,17 @@ class AchievementsManager: ObservableObject {
     @Published var coveredBerlinPoints: Int = 0
     @Published var totalBerlinPoints: Int = 0
     @Published var streetCoverageLastUpdated: Date?
+    @Published var newlyCoveredStreetNames: [String] = []
+    @Published var newlyVisitedDistrictNames: [String] = []
+    @Published var newlyVisitedStadtteilNames: [String] = []
     var fastProcessor: FastStreetProcessor?
     
     private let storageKey = "unlockedAchievements"
     private let streetCoverageCacheKey = "berlinStreetCoverageCache"
-    private let streetCoverageFormatVersion = 1
+    private let visitedBerlinStreetIDsKey = "visitedBerlinStreetIDs"
+    private let streetCoverageFormatVersion = 2
     private var berlinVisitedFingerprint: String = ""
+    private var streetCoverageStateStoreHasProcessedRoutes = false
     
     init() {
         loadAchievements()
@@ -827,10 +925,14 @@ class AchievementsManager: ObservableObject {
             streetSegmentsCovered = segments
         }
 
-        // Load cached street coverage summaries
+        streetCoverageStateStoreHasProcessedRoutes = hasIncrementalStreetCoverageState()
+
+        // Load cached street coverage summaries only when the rebuilt incremental store exists.
+        // This prevents stale UserDefaults summaries from masking an empty file-backed source of truth.
         if let coverageData = UserDefaults.standard.data(forKey: streetCoverageCacheKey),
            let cache = try? JSONDecoder().decode(StreetCoverageCache.self, from: coverageData),
-           cache.formatVersion == streetCoverageFormatVersion {
+           cache.formatVersion == streetCoverageFormatVersion,
+           streetCoverageStateStoreHasProcessedRoutes {
             streetCoverageByID = cache.coverageByStreetID
             districtCoverageStats = cache.districtStats
             stadtteilCoverageStats = cache.stadtteilStats
@@ -846,6 +948,13 @@ class AchievementsManager: ObservableObject {
             if berlinStadtteileVisitedCached.isEmpty {
                 let visited = cache.stadtteilStats.filter { $0.coveredStreets > 0 }.map { $0.stadtteil }
                 berlinStadtteileVisitedCached = Set(visited)
+            }
+
+            if UserDefaults.standard.object(forKey: visitedBerlinStreetIDsKey) == nil {
+                let visitedStreetIDs = cache.coverageByStreetID.compactMap { streetID, coverage in
+                    (coverage.coveredPoints > 0 || coverage.percentage > 0) ? streetID : nil
+                }
+                UserDefaults.standard.set(visitedStreetIDs, forKey: visitedBerlinStreetIDsKey)
             }
 
             // Initialize fastProcessor if we have cached data but no processor yet
@@ -870,6 +979,9 @@ class AchievementsManager: ObservableObject {
                     }
                 }
             }
+        } else if UserDefaults.standard.object(forKey: streetCoverageCacheKey) != nil && !streetCoverageStateStoreHasProcessedRoutes {
+            UserDefaults.standard.removeObject(forKey: streetCoverageCacheKey)
+            print("🔄 Ignoring stale legacy street coverage summary; rebuilt coverage state will be generated on next processing pass")
         }
         
         // Load fingerprints
@@ -920,6 +1032,16 @@ class AchievementsManager: ObservableObject {
         
         // Save fingerprints
         UserDefaults.standard.set(berlinVisitedFingerprint, forKey: "berlinVisitedFingerprint")
+    }
+
+    private func hasIncrementalStreetCoverageState() -> Bool {
+        do {
+            let store = try StreetCoverageStateStore.appCache()
+            let state = try store.load()
+            return !state.processedRouteIDs.isEmpty
+        } catch {
+            return false
+        }
     }
     
     // Define all possible achievements
@@ -1067,10 +1189,10 @@ class AchievementsManager: ObservableObject {
                 iconName: "figure.run.circle.fill",
                 category: .daily,
                 tiers: [
-                    .bronze: "Run 10km in a single day",
-                    .silver: "Run 15km in a single day",
-                    .gold: "Run 20km in a single day",
-                    .platinum: "Run 30km in a single day"
+                    .bronze: "Run 5km in a single day",
+                    .silver: "Run 10km in a single day",
+                    .gold: "Run 21km in a single day",
+                    .platinum: "Run 42km in a single day"
                 ],
                 currentTier: .none
             ),
@@ -1116,6 +1238,21 @@ class AchievementsManager: ObservableObject {
                     .silver: "Cover 20% of Berlin streets",
                     .gold: "Cover 40% of Berlin streets",
                     .platinum: "Cover 80% of Berlin streets"
+                ],
+                currentTier: .none
+            ),
+
+            // Berlin Mauerweg
+            Achievement(
+                id: "mauerweg",
+                title: "Mauerweg",
+                iconName: "figure.walk.motion",
+                category: .specials,
+                tiers: [
+                    .bronze: "Start the Berlin Mauerweg",
+                    .silver: "Walk 10% of the Mauerweg",
+                    .gold: "Walk 50% of the Mauerweg",
+                    .platinum: "Walk the full Mauerweg"
                 ],
                 currentTier: .none
             ),
@@ -1235,6 +1372,296 @@ class AchievementsManager: ObservableObject {
             return (.none, Double(tiers[0]))
         }
     }
+
+    private func getMauerwegTierAndNext(for value: Double) -> (AchievementTier, Double) {
+        if value >= 99.9 {
+            return (.platinum, 100)
+        } else if value >= 50 {
+            return (.gold, 100)
+        } else if value >= 10 {
+            return (.silver, 50)
+        } else if value > 0 {
+            return (.bronze, 10)
+        } else {
+            return (.none, 0.1)
+        }
+    }
+
+    private func calculateMauerwegCoverage(routes: [Route]) -> Double {
+        let mauerwegCoordinates = BerlinMauerweg.coordinates()
+        guard !routes.isEmpty, !mauerwegCoordinates.isEmpty else { return 0 }
+
+        let checker = FastStreetChecker(routes: routes)
+        let coveredPointCount = checker.checkStreetCoverage(streetCoords: mauerwegCoordinates).filter { $0 }.count
+        return (Double(coveredPointCount) / Double(mauerwegCoordinates.count)) * 100.0
+    }
+
+    private struct BackgroundAchievementMetrics {
+        let runningDistance: Double
+        let walkingDistance: Double
+        let countriesVisited: Int
+        let countriesExplored: Int
+        let countriesMastered: Int
+        let citiesVisited: Int
+        let citiesExplored: Int
+        let citiesMastered: Int
+        let maxDailyDistance: Double
+        let todayDistance: Double
+        let maxDailyRunning: Double
+        let todayRunning: Double
+        let visitedDistricts: Set<String>
+        let didRecalculateDistricts: Bool
+        let mauerwegCoverage: Double
+        let fingerprint: String
+    }
+
+    private func calculateMauerwegCoverage(snapshots: [RunMapRouteSnapshot]) -> Double {
+        let mauerwegCoordinates = BerlinMauerweg.coordinates()
+        guard !snapshots.isEmpty, !mauerwegCoordinates.isEmpty else { return 0 }
+
+        let spatialIndex = SpatialIndex(metersPerCell: 40)
+        for snapshot in snapshots {
+            spatialIndex.addRoute(snapshot.coordinates.map { ($0.latitude, $0.longitude) })
+        }
+
+        let coveredPointCount = mauerwegCoordinates.reduce(0) { count, coordinate in
+            spatialIndex.isNearRoute(lat: coordinate.lat, lon: coordinate.lon).isNear ? count + 1 : count
+        }
+        return (Double(coveredPointCount) / Double(mauerwegCoordinates.count)) * 100.0
+    }
+
+    private func computeBackgroundAchievementMetrics(
+        snapshots: [RunMapRouteSnapshot],
+        previousFingerprint: String,
+        cachedDistricts: Set<String>
+    ) -> BackgroundAchievementMetrics {
+        var runningDistance = 0.0
+        var walkingDistance = 0.0
+        var countryDistances: [String: Double] = [:]
+        var cityDistances: [String: Double] = [:]
+        var dailyDistances: [String: Double] = [:]
+        var dailyRunningDistances: [String: Double] = [:]
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd"
+        let today = dateFormatter.string(from: Date())
+
+        for snapshot in snapshots {
+            let distanceKm = snapshot.distanceMeters / 1_000
+            switch snapshot.activity {
+            case .running:
+                runningDistance += distanceKm
+            case .walking:
+                walkingDistance += distanceKm
+            case .other:
+                break
+            }
+
+            if let firstCoord = snapshot.coordinates.first {
+                let geocodeResult = LocalGeocoder.geocode(latitude: firstCoord.latitude, longitude: firstCoord.longitude)
+                if !geocodeResult.country.isEmpty && geocodeResult.country != "Unknown" {
+                    countryDistances[geocodeResult.country, default: 0] += distanceKm
+                }
+                if LocalGeocoder.isSpecificCityName(geocodeResult.city) {
+                    cityDistances[geocodeResult.city, default: 0] += distanceKm
+                }
+            }
+
+            let dateKey = dateFormatter.string(from: snapshot.startDate)
+            dailyDistances[dateKey, default: 0] += distanceKm
+            if snapshot.activity == .running {
+                dailyRunningDistances[dateKey, default: 0] += distanceKm
+            }
+        }
+
+        let latestDate = snapshots.map { $0.startDate.timeIntervalSince1970 }.max() ?? 0
+        let fingerprint = "\(snapshots.count)_\(Int(latestDate))"
+        let didRecalculateDistricts = fingerprint != previousFingerprint
+        let visitedDistricts: Set<String>
+
+        if didRecalculateDistricts {
+            var visited = Set<String>()
+            for snapshot in snapshots {
+                guard let first = snapshot.coordinates.first else { continue }
+                if let district = BerlinDistricts.getDistrict(lat: first.latitude, lon: first.longitude) {
+                    visited.insert(district)
+                }
+                if let last = snapshot.coordinates.last,
+                   let district = BerlinDistricts.getDistrict(lat: last.latitude, lon: last.longitude) {
+                    visited.insert(district)
+                }
+            }
+
+            for snapshot in snapshots {
+                let coordinates = snapshot.coordinates
+                if coordinates.isEmpty { continue }
+                var routeLikelyCovered = false
+                if let first = coordinates.first,
+                   let district = BerlinDistricts.getDistrict(lat: first.latitude, lon: first.longitude),
+                   visited.contains(district) {
+                    routeLikelyCovered = true
+                }
+                if let last = coordinates.last,
+                   let district = BerlinDistricts.getDistrict(lat: last.latitude, lon: last.longitude),
+                   visited.contains(district) {
+                    routeLikelyCovered = true
+                }
+                if routeLikelyCovered { continue }
+
+                let step = max(1, coordinates.count / 10)
+                var routeFound = false
+                for index in stride(from: 0, to: coordinates.count, by: step) {
+                    let coordinate = coordinates[index]
+                    if let district = BerlinDistricts.getDistrict(lat: coordinate.latitude, lon: coordinate.longitude) {
+                        visited.insert(district)
+                        routeFound = true
+                    }
+                }
+                if !routeFound {
+                    let quarterIndices = [coordinates.count / 4, coordinates.count / 2, (3 * coordinates.count) / 4]
+                        .filter { $0 >= 0 && $0 < coordinates.count }
+                    for index in quarterIndices {
+                        let coordinate = coordinates[index]
+                        if let district = BerlinDistricts.getDistrict(lat: coordinate.latitude, lon: coordinate.longitude) {
+                            visited.insert(district)
+                        }
+                    }
+                }
+            }
+            visitedDistricts = visited
+        } else {
+            visitedDistricts = cachedDistricts
+        }
+
+        return BackgroundAchievementMetrics(
+            runningDistance: runningDistance,
+            walkingDistance: walkingDistance,
+            countriesVisited: countryDistances.filter { $0.value >= 1 }.count,
+            countriesExplored: countryDistances.filter { $0.value >= 100 }.count,
+            countriesMastered: countryDistances.filter { $0.value >= 1000 }.count,
+            citiesVisited: cityDistances.filter { $0.value >= 1 }.count,
+            citiesExplored: cityDistances.filter { $0.value >= 100 }.count,
+            citiesMastered: cityDistances.filter { $0.value >= 1000 }.count,
+            maxDailyDistance: dailyDistances.values.max() ?? 0,
+            todayDistance: dailyDistances[today] ?? 0,
+            maxDailyRunning: dailyRunningDistances.values.max() ?? 0,
+            todayRunning: dailyRunningDistances[today] ?? 0,
+            visitedDistricts: visitedDistricts,
+            didRecalculateDistricts: didRecalculateDistricts,
+            mauerwegCoverage: calculateMauerwegCoverage(snapshots: snapshots),
+            fingerprint: fingerprint
+        )
+    }
+
+    func checkAndUnlockAchievementsInBackground(routes: [Route]) {
+        let previousFingerprint = berlinVisitedFingerprint
+        let previousDistricts = berlinDistrictsVisitedCached
+        let previousStadtteile = berlinStadtteileVisitedCached
+        let cachedStadtteilStats = stadtteilCoverageStats
+        let cachedStreetSegments = streetSegmentsCovered
+        let processedRouteIDs = Set(processedRoutes.keys)
+        let hasStreetCoverage = !streetCoverageByID.isEmpty
+        let hasIncrementalState = hasIncrementalStreetCoverageState()
+        let cachedOverallStreetCoverage = overallStreetCoverage
+        let cachedTotalBerlinStreets = totalBerlinStreets
+        let needsStreetProcessing = routes.contains { route in
+            processedRoutes["\(route.date.timeIntervalSince1970)"] == nil
+        } || !hasStreetCoverage || !hasIncrementalState
+
+        processingStatus = "Checking achievements..."
+        processingProgress = 0.02
+
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let snapshots = routes.map(RunMapRouteSnapshot.init(route:))
+            let metrics = self.computeBackgroundAchievementMetrics(
+                snapshots: snapshots,
+                previousFingerprint: previousFingerprint,
+                cachedDistricts: previousDistricts
+            )
+
+            await MainActor.run {
+                let (runningTier, runningNext) = self.getTierAndNext(for: metrics.runningDistance, tiers: [500, 1000, 2500, 10000])
+                self.updateAchievementTier(id: "running_distance", tier: runningTier, currentProgress: metrics.runningDistance, nextGoal: runningNext)
+
+                let (walkingTier, walkingNext) = self.getTierAndNext(for: metrics.walkingDistance, tiers: [500, 1000, 2500, 10000])
+                self.updateAchievementTier(id: "walking_distance", tier: walkingTier, currentProgress: metrics.walkingDistance, nextGoal: walkingNext)
+
+                let (countriesVisitedTier, countriesVisitedNext) = self.getCountTierAndNext(for: metrics.countriesVisited, tiers: [1, 10, 25, 50])
+                self.updateAchievementTier(id: "countries_visited", tier: countriesVisitedTier, currentProgress: Double(metrics.countriesVisited), nextGoal: countriesVisitedNext)
+
+                let (countriesExploredTier, countriesExploredNext) = self.getCountTierAndNext(for: metrics.countriesExplored, tiers: [1, 10, 25, 50])
+                self.updateAchievementTier(id: "countries_explored", tier: countriesExploredTier, currentProgress: Double(metrics.countriesExplored), nextGoal: countriesExploredNext)
+
+                let (countriesMasteredTier, countriesMasteredNext) = self.getCountTierAndNext(for: metrics.countriesMastered, tiers: [1, 10, 25, 50])
+                self.updateAchievementTier(id: "countries_mastered", tier: countriesMasteredTier, currentProgress: Double(metrics.countriesMastered), nextGoal: countriesMasteredNext)
+
+                let (citiesVisitedTier, citiesVisitedNext) = self.getCountTierAndNext(for: metrics.citiesVisited, tiers: [1, 10, 25, 50])
+                self.updateAchievementTier(id: "cities_visited", tier: citiesVisitedTier, currentProgress: Double(metrics.citiesVisited), nextGoal: citiesVisitedNext)
+
+                let (citiesExploredTier, citiesExploredNext) = self.getCountTierAndNext(for: metrics.citiesExplored, tiers: [1, 10, 25, 50])
+                self.updateAchievementTier(id: "cities_explored", tier: citiesExploredTier, currentProgress: Double(metrics.citiesExplored), nextGoal: citiesExploredNext)
+
+                let (citiesMasteredTier, citiesMasteredNext) = self.getCountTierAndNext(for: metrics.citiesMastered, tiers: [1, 10, 25, 50])
+                self.updateAchievementTier(id: "cities_mastered", tier: citiesMasteredTier, currentProgress: Double(metrics.citiesMastered), nextGoal: citiesMasteredNext)
+
+                let (dailyTier, dailyNext) = self.getTierAndNext(for: metrics.maxDailyDistance, tiers: [10, 15, 20, 30])
+                self.updateAchievementTier(id: "daily_distance", tier: dailyTier, currentProgress: metrics.todayDistance, nextGoal: dailyNext)
+
+                let (dailyRunningTier, dailyRunningNext) = self.getTierAndNext(for: metrics.maxDailyRunning, tiers: [5, 10, 21, 42])
+                self.updateAchievementTier(id: "daily_running", tier: dailyRunningTier, currentProgress: metrics.todayRunning, nextGoal: dailyRunningNext)
+
+                if metrics.didRecalculateDistricts {
+                    self.berlinDistrictsVisitedCached = metrics.visitedDistricts
+                    self.berlinVisitedFingerprint = metrics.fingerprint
+                    self.newlyVisitedDistrictNames = metrics.visitedDistricts.subtracting(previousDistricts).sorted()
+                } else {
+                    self.newlyVisitedDistrictNames = []
+                }
+                let (berlinTier, berlinNext) = self.getCountTierAndNext(for: self.berlinDistrictsVisitedCached.count, tiers: [3, 6, 9, 12])
+                self.updateAchievementTier(id: "berlin_districts", tier: berlinTier, currentProgress: Double(self.berlinDistrictsVisitedCached.count), nextGoal: berlinNext)
+
+                let visitedStadtteile: Set<String>
+                if !cachedStadtteilStats.isEmpty {
+                    visitedStadtteile = Set(cachedStadtteilStats.filter { $0.coveredStreets > 0 }.map { $0.stadtteil })
+                } else if !cachedStreetSegments.isEmpty {
+                    visitedStadtteile = Set(cachedStreetSegments.compactMap { $0.stadtteil })
+                } else {
+                    visitedStadtteile = []
+                }
+                if !visitedStadtteile.isEmpty {
+                    self.berlinStadtteileVisitedCached = visitedStadtteile
+                    self.newlyVisitedStadtteilNames = visitedStadtteile.subtracting(previousStadtteile).sorted()
+                }
+                let (stadtteilTier, stadtteilNext) = self.getCountTierAndNext(for: self.berlinStadtteileVisitedCached.count, tiers: [10, 25, 50, 75])
+                self.updateAchievementTier(id: "berlin_stadtteile", tier: stadtteilTier, currentProgress: Double(self.berlinStadtteileVisitedCached.count), nextGoal: stadtteilNext)
+
+                let (mauerwegTier, mauerwegNext) = self.getMauerwegTierAndNext(for: metrics.mauerwegCoverage)
+                self.updateAchievementTier(id: "mauerweg", tier: mauerwegTier, currentProgress: metrics.mauerwegCoverage, nextGoal: mauerwegNext)
+
+                if !needsStreetProcessing {
+                    self.processingStatus = "Streets up to date ✓"
+                    self.processingProgress = 1.0
+                    self.processedBerlinStreets = cachedTotalBerlinStreets
+                    if cachedOverallStreetCoverage > 0 {
+                        let (streetsTier, streetsNext) = self.getTierAndNext(for: cachedOverallStreetCoverage, tiers: [10, 20, 40, 80])
+                        self.updateAchievementTier(id: "berlin_streets", tier: streetsTier, currentProgress: cachedOverallStreetCoverage, nextGoal: streetsNext)
+                    }
+                    for route in routes {
+                        let routeID = "\(route.date.timeIntervalSince1970)"
+                        if !processedRouteIDs.contains(routeID), self.processedRoutes[routeID] == nil {
+                            self.processedRoutes[routeID] = RouteCoverageData(routeID: routeID, districts: [], coveredSegments: [])
+                        }
+                    }
+                    self.saveCachedData()
+                }
+            }
+
+            if needsStreetProcessing {
+                await self.processStreetsFast(routes: routes)
+            }
+        }
+    }
     
     // Helper functions for checking achievements based on stats
     func checkAndUnlockAchievements(routes: [Route]) {
@@ -1266,8 +1693,7 @@ class AchievementsManager: ObservableObject {
             if !country.isEmpty && country != "Unknown" {
                 countryDistances[country, default: 0] += route.distanceKm
             }
-            // Filter out "Other" cities (e.g., "Other Germany")
-            if !city.isEmpty && city != "Unknown" && !city.starts(with: "Other ") {
+            if LocalGeocoder.isSpecificCityName(city) {
                 cityDistances[city, default: 0] += route.distanceKm
             }
         }
@@ -1328,7 +1754,7 @@ class AchievementsManager: ObservableObject {
         
         // Check daily running distance
         let maxDailyRunning = dailyRunningDistances.values.max() ?? 0
-        let (dailyRunningTier, dailyRunningNext) = getTierAndNext(for: maxDailyRunning, tiers: [10, 15, 20, 30])
+        let (dailyRunningTier, dailyRunningNext) = getTierAndNext(for: maxDailyRunning, tiers: [5, 10, 21, 42])
         
         // Get today's running distance (for progress message)
         let todayRunning = dailyRunningDistances[today] ?? 0
@@ -1341,7 +1767,8 @@ class AchievementsManager: ObservableObject {
         // Track previous districts before updating
         let previousDistricts = berlinDistrictsVisitedCached
 
-        if fingerprint != berlinVisitedFingerprint {
+        let didRecalculateDistricts = fingerprint != berlinVisitedFingerprint
+        if didRecalculateDistricts {
             var visited = Set<String>()
             // Phase 1: quick pass on start/end points for all routes
             for route in routes {
@@ -1398,8 +1825,9 @@ class AchievementsManager: ObservableObject {
 
         // Generate contextual message for new districts
         var districtsContext: String? = nil
-        if fingerprint != berlinVisitedFingerprint { // Only if we just recalculated
+        if didRecalculateDistricts {
             let newDistricts = berlinDistrictsVisitedCached.subtracting(previousDistricts)
+            newlyVisitedDistrictNames = newDistricts.sorted()
             if !newDistricts.isEmpty {
                 let sortedNew = newDistricts.sorted()
                 if sortedNew.count == 1 {
@@ -1424,6 +1852,8 @@ class AchievementsManager: ObservableObject {
                     districtsContext! += "\nOnly \(remaining) more districts to reach \(tierName)!"
                 }
             }
+        } else {
+            newlyVisitedDistrictNames = []
         }
 
         updateAchievementTier(id: "berlin_districts", tier: berlinTier, currentProgress: Double(berlinDistrictsCount), nextGoal: berlinNext, extraContext: districtsContext)
@@ -1450,6 +1880,7 @@ class AchievementsManager: ObservableObject {
         // Generate contextual message for new stadtteile
         var stadtteileContext: String? = nil
         let newStadtteile = visitedStadtteile.subtracting(previousStadtteile)
+        newlyVisitedStadtteilNames = newStadtteile.sorted()
         if !newStadtteile.isEmpty {
             let sortedNew = newStadtteile.sorted()
             if sortedNew.count == 1 {
@@ -1480,6 +1911,11 @@ class AchievementsManager: ObservableObject {
         updateAchievementTier(id: "berlin_stadtteile", tier: stadtteilTier, currentProgress: Double(stadtteilCount), nextGoal: stadtteilNext, extraContext: stadtteileContext)
 
         print("🏘️ Berlin Stadtteile visited: \(stadtteilCount)")
+
+        let mauerwegCoverage = calculateMauerwegCoverage(routes: routes)
+        let (mauerwegTier, mauerwegNext) = getMauerwegTierAndNext(for: mauerwegCoverage)
+        updateAchievementTier(id: "mauerweg", tier: mauerwegTier, currentProgress: mauerwegCoverage, nextGoal: mauerwegNext)
+        print("🧱 Mauerweg coverage: \(String(format: "%.2f", mauerwegCoverage))%")
         
         // Reset berlin_streets achievement if no coverage
         if streetSegmentsCovered.isEmpty && streetCoverageByID.isEmpty {
@@ -1492,7 +1928,8 @@ class AchievementsManager: ObservableObject {
             return processedRoutes[routeID] == nil
         }
 
-        let shouldProcessStreets = !newRoutes.isEmpty || streetCoverageByID.isEmpty
+        streetCoverageStateStoreHasProcessedRoutes = hasIncrementalStreetCoverageState()
+        let shouldProcessStreets = !newRoutes.isEmpty || streetCoverageByID.isEmpty || !streetCoverageStateStoreHasProcessedRoutes
 
         if shouldProcessStreets {
             Task.detached(priority: .background) {
@@ -1614,8 +2051,11 @@ class AchievementsManager: ObservableObject {
             self.streetsByDistrict = byDistrict
             self.streetsByStadtteil = byStadtteil
 
+            let previousStadtteile = self.berlinStadtteileVisitedCached
             let visitedStadtteile = Set(output.stadtteilStats.filter { $0.coveredStreets > 0 }.map { $0.stadtteil })
             self.berlinStadtteileVisitedCached = visitedStadtteile
+            self.newlyVisitedStadtteilNames = visitedStadtteile.subtracting(previousStadtteile).sorted()
+            self.newlyCoveredStreetNames = newlyCoveredStreetNames(from: output)
 
             for route in routes {
                 let legacyRouteID = "\(route.date.timeIntervalSince1970)"
@@ -1636,6 +2076,26 @@ class AchievementsManager: ObservableObject {
 
         let elapsed = Date().timeIntervalSince(startedAt)
         print("✅ Incremental street coverage complete: \(result.processedRouteCount) new routes, \(String(format: "%.2f", output.overallCoveragePercentage))% coverage, \(String(format: "%.2f", elapsed))s")
+    }
+
+    func newlyCoveredStreetNames(from output: StreetProcessingOutput) -> [String] {
+        let visitedStreetIDs = Set(output.coverageByStreetID.compactMap { streetID, coverage in
+            (coverage.coveredPoints > 0 || coverage.percentage > 0) ? streetID : nil
+        })
+
+        let previousStreetIDs = Set(UserDefaults.standard.stringArray(forKey: visitedBerlinStreetIDsKey) ?? [])
+        UserDefaults.standard.set(Array(visitedStreetIDs), forKey: visitedBerlinStreetIDsKey)
+
+        guard !previousStreetIDs.isEmpty else {
+            return []
+        }
+
+        let streetsByID = Dictionary(uniqueKeysWithValues: output.consolidatedStreets.map { ($0.id, $0.name) })
+        let newNames = visitedStreetIDs
+            .subtracting(previousStreetIDs)
+            .compactMap { streetsByID[$0] }
+
+        return Array(Set(newNames)).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
     private func loadStreetSegments(forDistricts districts: [String]) async -> [BerlinStreets.Street] {
@@ -1727,7 +2187,7 @@ class AchievementsManager: ObservableObject {
                 )
             }
             .sorted { $0.coveragePercentage > $1.coveragePercentage }
-        let overallPercentage = totalPoints > 0 ? Double(totalCoveredPoints) / Double(totalPoints) * 100.0 : 0.0
+        let overallPercentage = consolidatedStreets.isEmpty ? 0.0 : Double(coveredStreetCount) / Double(consolidatedStreets.count) * 100.0
 
         return StreetProcessingOutput(
             consolidatedStreets: consolidatedStreets,
@@ -1789,6 +2249,7 @@ struct AchievementDetailView: View {
     let routes: [Route]
     var onDistrictSelected: ((String, Double, Double) -> Void)? = nil
     var onShowAllDistricts: (() -> Void)? = nil
+    var onShowAllStadtteile: (() -> Void)? = nil
     var onLocationSelected: ((String, String) -> Void)? = nil
     var visitedBerlinDistricts: Set<String>? = nil
     var achievementsManager: AchievementsManager? = nil
@@ -1832,7 +2293,9 @@ struct AchievementDetailView: View {
                 .padding()
                 
                 // Content based on achievement type
-                if achievement.id == "berlin_districts" {
+                if achievement.id == "mauerweg" {
+                    mauerwegView()
+                } else if achievement.id == "berlin_districts" {
                     // Show Berlin districts list (uses cached set if available)
                     berlinDistrictsView()
                 } else if achievement.id == "berlin_stadtteile" {
@@ -1890,12 +2353,28 @@ struct AchievementDetailView: View {
                 .padding(.horizontal)
             
             let locations = getQualifiedLocations(achievement: achievement)
+            let isCity = achievement.category == .city
+
+            if !isCity {
+                CountryWorldMapView(
+                    countryDistances: getLocationDistances(isCity: false),
+                    threshold: locationThreshold(for: achievement)
+                )
+                .frame(height: 260)
+                .padding(.horizontal)
+            } else {
+                CityWorldMapView(
+                    cities: getQualifiedCityLocations(achievement: achievement),
+                    threshold: locationThreshold(for: achievement)
+                )
+                .frame(height: 260)
+                .padding(.horizontal)
+            }
             
             if !locations.isEmpty {
                 ForEach(locations, id: \.name) { location in
                     Button(action: {
                         // Determine if this is a city or country achievement
-                        let isCity = achievement.category == .city
                         if isCity {
                             onLocationSelected?("", location.name) // City only
                         } else {
@@ -1931,6 +2410,196 @@ struct AchievementDetailView: View {
             }
         }
     }
+
+    private struct QualifiedCityLocation {
+        let name: String
+        let distance: Double
+        let coordinate: CLLocationCoordinate2D
+    }
+
+    private struct CountryWorldMapView: View {
+        let countryDistances: [String: Double]
+        let threshold: Double
+
+        private let boundaries = LocalGeocoder.worldMapBoundaries()
+
+        private var qualifiedCountries: Set<String> {
+            Set(countryDistances.filter { $0.value >= threshold }.map(\.key))
+        }
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 10) {
+                ZStack(alignment: .bottomLeading) {
+                    Canvas { context, size in
+                        let mapRect = CGRect(origin: .zero, size: size)
+
+                        for country in boundaries {
+                            var path = Path()
+                            for polygon in country.polygons {
+                                guard let first = polygon.first else { continue }
+                                path.move(to: Self.project(first, in: mapRect))
+                                for coordinate in polygon.dropFirst() {
+                                    path.addLine(to: Self.project(coordinate, in: mapRect))
+                                }
+                                path.closeSubpath()
+                            }
+
+                            let isQualified = qualifiedCountries.contains(country.name)
+                            let fill = isQualified
+                                ? Color.green.opacity(0.72)
+                                : Color.red.opacity(0.30)
+                            context.fill(path, with: .color(fill))
+                            context.stroke(path, with: .color(Color.white.opacity(0.55)), lineWidth: 0.35)
+                        }
+                    }
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                    HStack(spacing: 14) {
+                        legendItem(color: .green, title: "Visited")
+                        legendItem(color: .red, title: "Not yet")
+                    }
+                    .padding(10)
+                    .background(.regularMaterial)
+                    .cornerRadius(8)
+                    .padding(10)
+                }
+
+                Text("\(qualifiedCountries.count) countries at \(Self.thresholdLabel(threshold))")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 4)
+            }
+        }
+
+        private static func project(_ coordinate: CLLocationCoordinate2D, in rect: CGRect) -> CGPoint {
+            let clampedLatitude = min(84.0, max(-60.0, coordinate.latitude))
+            let x = (coordinate.longitude + 180.0) / 360.0 * rect.width
+            let y = (84.0 - clampedLatitude) / 144.0 * rect.height
+            return CGPoint(x: x, y: y)
+        }
+
+        private static func thresholdLabel(_ threshold: Double) -> String {
+            if threshold >= 1000 {
+                return "1000 km+"
+            } else if threshold >= 100 {
+                return "100 km+"
+            } else {
+                return "1 km+"
+            }
+        }
+
+        private func legendItem(color: Color, title: String) -> some View {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(color)
+                    .frame(width: 8, height: 8)
+                Text(title)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private struct CityWorldMapView: View {
+        let cities: [QualifiedCityLocation]
+        let threshold: Double
+
+        private let boundaries = LocalGeocoder.worldMapBoundaries()
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 10) {
+                ZStack(alignment: .bottomLeading) {
+                    Canvas { context, size in
+                        let mapRect = CGRect(origin: .zero, size: size)
+
+                        for country in boundaries {
+                            var path = Path()
+                            for polygon in country.polygons {
+                                guard let first = polygon.first else { continue }
+                                path.move(to: Self.project(first, in: mapRect))
+                                for coordinate in polygon.dropFirst() {
+                                    path.addLine(to: Self.project(coordinate, in: mapRect))
+                                }
+                                path.closeSubpath()
+                            }
+
+                            context.fill(path, with: .color(Color.gray.opacity(0.26)))
+                            context.stroke(path, with: .color(Color.white.opacity(0.55)), lineWidth: 0.35)
+                        }
+
+                        for city in cities {
+                            let point = Self.project(city.coordinate, in: mapRect)
+                            let radius = Self.pinRadius(for: city.distance)
+                            let pinRect = CGRect(
+                                x: point.x - radius,
+                                y: point.y - radius,
+                                width: radius * 2,
+                                height: radius * 2
+                            )
+
+                            context.fill(Path(ellipseIn: pinRect), with: .color(Color.blue.opacity(0.86)))
+                            context.stroke(Path(ellipseIn: pinRect), with: .color(.white), lineWidth: 1.2)
+                        }
+                    }
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                    HStack(spacing: 14) {
+                        legendItem(color: .blue, title: "City")
+                        Spacer()
+                    }
+                    .padding(10)
+                    .background(.regularMaterial)
+                    .cornerRadius(8)
+                    .padding(10)
+                }
+
+                Text("\(cities.count) cities at \(Self.thresholdLabel(threshold))")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 4)
+            }
+        }
+
+        private static func project(_ coordinate: CLLocationCoordinate2D, in rect: CGRect) -> CGPoint {
+            let clampedLatitude = min(84.0, max(-60.0, coordinate.latitude))
+            let x = (coordinate.longitude + 180.0) / 360.0 * rect.width
+            let y = (84.0 - clampedLatitude) / 144.0 * rect.height
+            return CGPoint(x: x, y: y)
+        }
+
+        private static func pinRadius(for distance: Double) -> CGFloat {
+            if distance >= 1000 {
+                return 5.8
+            } else if distance >= 100 {
+                return 4.9
+            } else {
+                return 4.0
+            }
+        }
+
+        private static func thresholdLabel(_ threshold: Double) -> String {
+            if threshold >= 1000 {
+                return "1000 km+"
+            } else if threshold >= 100 {
+                return "100 km+"
+            } else {
+                return "1 km+"
+            }
+        }
+
+        private func legendItem(color: Color, title: String) -> some View {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(color)
+                    .frame(width: 8, height: 8)
+                Text(title)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
     
     @ViewBuilder
     private func berlinDistrictsView() -> some View {
@@ -1948,10 +2617,311 @@ struct AchievementDetailView: View {
         if let achievementsManager = achievementsManager {
             BerlinStadtteileListView(
                 visitedStadtteile: achievementsManager.berlinStadtteileVisitedCached,
-                streetSegments: achievementsManager.streetSegmentsCovered)
+                streetSegments: achievementsManager.streetSegmentsCovered,
+                onShowAllStadtteile: onShowAllStadtteile,
+                dismiss: dismiss)
         } else {
             Text("Loading Stadtteile...")
                 .foregroundColor(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private func mauerwegView() -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            let completedStickers = BerlinMauerweg.completedLandmarkStickers(routes: routes)
+
+            Text("Mauerweg Progress")
+                .font(.headline)
+                .padding(.horizontal)
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text(String(format: "%.1f%% covered", achievement.currentProgress))
+                    .font(.title2)
+                    .fontWeight(.bold)
+
+                ProgressView(value: min(achievement.currentProgress, 100), total: 100)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Bronze: start the Mauerweg", systemImage: achievement.currentProgress > 0 ? "checkmark.circle.fill" : "circle")
+                    Label("Silver: 10%", systemImage: achievement.currentProgress >= 10 ? "checkmark.circle.fill" : "circle")
+                    Label("Gold: 50%", systemImage: achievement.currentProgress >= 50 ? "checkmark.circle.fill" : "circle")
+                    Label("Platinum: 100%", systemImage: achievement.currentProgress >= 99.9 ? "checkmark.circle.fill" : "circle")
+                }
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+            }
+            .padding()
+            .background(Color.gray.opacity(0.1))
+            .cornerRadius(12)
+            .padding(.horizontal)
+
+            MauerwegCoverageMap(routes: routes)
+                .frame(height: 280)
+                .cornerRadius(12)
+                .padding(.horizontal)
+
+            if !completedStickers.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Stickers")
+                        .font(.headline)
+
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 135), spacing: 10)], spacing: 10) {
+                        ForEach(completedStickers) { sticker in
+                            VStack(spacing: 8) {
+                                Image(systemName: sticker.iconName)
+                                    .font(.title2)
+                                    .foregroundColor(.white)
+                                    .frame(width: 44, height: 44)
+                                    .background(Color.orange)
+                                    .clipShape(Circle())
+
+                                Text(sticker.title)
+                                    .font(.caption)
+                                    .fontWeight(.semibold)
+                                    .multilineTextAlignment(.center)
+                                    .lineLimit(2)
+                                    .minimumScaleFactor(0.85)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .padding(.horizontal, 8)
+                            .background(Color.orange.opacity(0.12))
+                            .cornerRadius(12)
+                        }
+                    }
+                }
+                .padding()
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(12)
+                .padding(.horizontal)
+            }
+        }
+    }
+
+    private struct MauerwegCoverageMap: View {
+        let routes: [Route]
+
+        @State private var isRendering = true
+
+        var body: some View {
+            ZStack(alignment: .bottom) {
+                MauerwegCoverageMapRepresentable(
+                    routes: routes,
+                    onRenderComplete: {
+                        isRendering = false
+                    }
+                )
+
+                HStack(spacing: 14) {
+                    legendItem(color: .green, title: "Covered")
+                    legendItem(color: .red, title: "Open")
+                    Spacer()
+                    if isRendering {
+                        ProgressView()
+                    }
+                }
+                .padding(10)
+                .background(.regularMaterial)
+                .cornerRadius(8)
+                .padding(10)
+            }
+            .overlay(alignment: .topLeading) {
+                Text("Mauerweg Map")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.regularMaterial)
+                    .cornerRadius(8)
+                    .padding(10)
+            }
+        }
+
+        private func legendItem(color: Color, title: String) -> some View {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(color)
+                    .frame(width: 8, height: 8)
+                Text(title)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private struct MauerwegCoverageMapRepresentable: UIViewRepresentable {
+        let routes: [Route]
+        let onRenderComplete: () -> Void
+
+        func makeUIView(context: Context) -> MKMapView {
+            let mapView = MKMapView()
+            mapView.delegate = context.coordinator
+            mapView.pointOfInterestFilter = .excludingAll
+            mapView.isPitchEnabled = false
+            mapView.showsUserLocation = false
+            mapView.setRegion(Self.defaultRegion, animated: false)
+            context.coordinator.render(routes: routes, on: mapView, onRenderComplete: onRenderComplete)
+            return mapView
+        }
+
+        func updateUIView(_ mapView: MKMapView, context: Context) {
+            context.coordinator.render(routes: routes, on: mapView, onRenderComplete: onRenderComplete)
+        }
+
+        func makeCoordinator() -> Coordinator {
+            Coordinator()
+        }
+
+        private static let defaultRegion = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: 52.52, longitude: 13.405),
+            span: MKCoordinateSpan(latitudeDelta: 0.42, longitudeDelta: 0.56)
+        )
+
+        final class Coordinator: NSObject, MKMapViewDelegate {
+            private var renderedSignature: String?
+            private var renderGeneration = 0
+            private weak var coveredOverlay: MKMultiPolyline?
+            private weak var uncoveredOverlay: MKMultiPolyline?
+
+            func render(
+                routes: [Route],
+                on mapView: MKMapView,
+                onRenderComplete: @escaping () -> Void
+            ) {
+                let signature = Self.signature(for: routes)
+                guard signature != renderedSignature else { return }
+
+                renderedSignature = signature
+                renderGeneration += 1
+                let generation = renderGeneration
+
+                let existing = mapView.overlays
+                if !existing.isEmpty {
+                    mapView.removeOverlays(existing)
+                }
+
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let result = Self.makeCoveragePolylines(routes: routes)
+
+                    DispatchQueue.main.async {
+                        guard generation == self.renderGeneration else { return }
+
+                        if !result.uncovered.isEmpty {
+                            let overlay = MKMultiPolyline(result.uncovered)
+                            self.uncoveredOverlay = overlay
+                            mapView.addOverlay(overlay, level: .aboveRoads)
+                        }
+
+                        if !result.covered.isEmpty {
+                            let overlay = MKMultiPolyline(result.covered)
+                            self.coveredOverlay = overlay
+                            mapView.addOverlay(overlay, level: .aboveRoads)
+                        }
+
+                        if !result.allCoordinates.isEmpty {
+                            mapView.setRegion(coordinateRegion(for: result.allCoordinates), animated: false)
+                        }
+
+                        onRenderComplete()
+                    }
+                }
+            }
+
+            func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+                guard let multiPolyline = overlay as? MKMultiPolyline else {
+                    return MKOverlayRenderer(overlay: overlay)
+                }
+
+                let renderer = MKMultiPolylineRenderer(multiPolyline: multiPolyline)
+                if multiPolyline === coveredOverlay {
+                    renderer.strokeColor = UIColor.systemGreen.withAlphaComponent(0.9)
+                    renderer.lineWidth = 4.0
+                    renderer.alpha = 0.95
+                } else if multiPolyline === uncoveredOverlay {
+                    renderer.strokeColor = UIColor.systemRed.withAlphaComponent(0.55)
+                    renderer.lineWidth = 3.0
+                    renderer.alpha = 0.9
+                } else {
+                    renderer.strokeColor = UIColor.systemGray
+                    renderer.lineWidth = 3.0
+                }
+                return renderer
+            }
+
+            private static func signature(for routes: [Route]) -> String {
+                routes
+                    .map { "\($0.id.uuidString):\($0.coordinates.count)" }
+                    .sorted()
+                    .joined(separator: "|")
+            }
+
+            private static func makeCoveragePolylines(
+                routes: [Route]
+            ) -> (covered: [MKPolyline], uncovered: [MKPolyline], allCoordinates: [CLLocationCoordinate2D]) {
+                let mauerwegSegments = BerlinMauerweg.coordinateSegments()
+                let allCoordinates = mauerwegSegments.flatMap { segment in
+                    segment.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
+                }
+                var coveredPolylines: [MKPolyline] = []
+                var uncoveredPolylines: [MKPolyline] = []
+
+                let checker = routes.isEmpty ? nil : FastStreetChecker(routes: routes)
+                for segment in mauerwegSegments {
+                    guard segment.count >= 2 else { continue }
+
+                    let segmentCoordinates = segment.map {
+                        CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
+                    }
+                    let coveredPoints = checker?.checkStreetCoverage(streetCoords: segment)
+                        ?? Array(repeating: false, count: segment.count)
+
+                    var currentCoordinates: [CLLocationCoordinate2D] = [segmentCoordinates[0]]
+                    var currentCovered = coveredPoints[0]
+
+                    for index in 1..<segmentCoordinates.count {
+                        let point = segmentCoordinates[index]
+                        let isCovered = coveredPoints[index]
+
+                        if isCovered == currentCovered {
+                            currentCoordinates.append(point)
+                        } else {
+                            appendPolyline(
+                                coordinates: currentCoordinates,
+                                isCovered: currentCovered,
+                                covered: &coveredPolylines,
+                                uncovered: &uncoveredPolylines
+                            )
+                            currentCoordinates = [segmentCoordinates[index - 1], point]
+                            currentCovered = isCovered
+                        }
+                    }
+
+                    appendPolyline(
+                        coordinates: currentCoordinates,
+                        isCovered: currentCovered,
+                        covered: &coveredPolylines,
+                        uncovered: &uncoveredPolylines
+                    )
+                }
+
+                return (coveredPolylines, uncoveredPolylines, allCoordinates)
+            }
+
+            private static func appendPolyline(
+                coordinates: [CLLocationCoordinate2D],
+                isCovered: Bool,
+                covered: inout [MKPolyline],
+                uncovered: inout [MKPolyline]
+            ) {
+                guard coordinates.count >= 2 else { return }
+                let polyline = MKPolyline(coordinates: coordinates, count: coordinates.count)
+                if isCovered {
+                    covered.append(polyline)
+                } else {
+                    uncovered.append(polyline)
+                }
+            }
         }
     }
     
@@ -2182,12 +3152,15 @@ struct AchievementDetailView: View {
             // Determine if this is running-only or all workouts
             let isRunningOnly = achievement.id == "daily_running"
             let dailyDistances = calculateDailyDistances(runningOnly: isRunningOnly)
+            let thresholds: (bronze: Double, silver: Double, gold: Double, platinum: Double) = isRunningOnly
+                ? (5.0, 10.0, 21.0, 42.0)
+                : (10.0, 15.0, 20.0, 30.0)
             
             // Count achievements by tier
-            let bronzeCount = dailyDistances.filter { $0.value >= 10.0 && $0.value < 15.0 }.count
-            let silverCount = dailyDistances.filter { $0.value >= 15.0 && $0.value < 20.0 }.count
-            let goldCount = dailyDistances.filter { $0.value >= 20.0 && $0.value < 30.0 }.count
-            let platinumCount = dailyDistances.filter { $0.value >= 30.0 }.count
+            let bronzeCount = dailyDistances.filter { $0.value >= thresholds.bronze && $0.value < thresholds.silver }.count
+            let silverCount = dailyDistances.filter { $0.value >= thresholds.silver && $0.value < thresholds.gold }.count
+            let goldCount = dailyDistances.filter { $0.value >= thresholds.gold && $0.value < thresholds.platinum }.count
+            let platinumCount = dailyDistances.filter { $0.value >= thresholds.platinum }.count
             
             // Tier summary
             HStack(spacing: 20) {
@@ -2241,7 +3214,7 @@ struct AchievementDetailView: View {
                 .font(.headline)
                 .padding(.horizontal)
             
-            let sortedDays = dailyDistances.filter { $0.value >= 10.0 }.sorted { $0.value > $1.value }
+            let sortedDays = dailyDistances.filter { $0.value >= thresholds.bronze }.sorted { $0.value > $1.value }
             
             if !sortedDays.isEmpty {
                 ForEach(sortedDays, id: \.key) { date, distance in
@@ -2255,16 +3228,16 @@ struct AchievementDetailView: View {
                                 .foregroundColor(.secondary)
                         }
                         Spacer()
-                        if distance >= 30.0 {
+                        if distance >= thresholds.platinum {
                             Image(systemName: "star.fill")
                                 .foregroundColor(AchievementTier.platinum.color)
-                        } else if distance >= 20.0 {
+                        } else if distance >= thresholds.gold {
                             Image(systemName: "star.fill")
                                 .foregroundColor(AchievementTier.gold.color)
-                        } else if distance >= 15.0 {
+                        } else if distance >= thresholds.silver {
                             Image(systemName: "star.fill")
                                 .foregroundColor(AchievementTier.silver.color)
-                        } else if distance >= 10.0 {
+                        } else if distance >= thresholds.bronze {
                             Image(systemName: "star.fill")
                                 .foregroundColor(AchievementTier.bronze.color)
                         }
@@ -2284,39 +3257,70 @@ struct AchievementDetailView: View {
     }
     
     private func getQualifiedLocations(achievement: Achievement) -> [(name: String, distance: Double)] {
-        var locationDistances: [String: Double] = [:]
         let isCity = achievement.category == .city
-        
+        let locationDistances = getLocationDistances(isCity: isCity)
+
+        return locationDistances
+            .filter { $0.value >= locationThreshold(for: achievement) }
+            .map { (name: $0.key, distance: $0.value) }
+            .sorted { $0.distance > $1.distance }
+    }
+
+    private func getQualifiedCityLocations(achievement: Achievement) -> [QualifiedCityLocation] {
+        let threshold = locationThreshold(for: achievement)
+        var cityDistances: [String: Double] = [:]
+        var cityCoordinates: [String: CLLocationCoordinate2D] = [:]
+
+        for route in routes {
+            guard let firstCoord = route.coordinates.first else { continue }
+            let geocodeResult = LocalGeocoder.geocode(latitude: firstCoord.latitude, longitude: firstCoord.longitude)
+            let cityName = geocodeResult.city
+
+            guard LocalGeocoder.isSpecificCityName(cityName) else { continue }
+
+            cityDistances[cityName, default: 0] += route.distanceKm
+            if cityCoordinates[cityName] == nil {
+                cityCoordinates[cityName] = firstCoord
+            }
+        }
+
+        return cityDistances
+            .compactMap { name, distance in
+                guard distance >= threshold, let coordinate = cityCoordinates[name] else { return nil }
+                return QualifiedCityLocation(name: name, distance: distance, coordinate: coordinate)
+            }
+            .sorted { $0.distance > $1.distance }
+    }
+
+    private func getLocationDistances(isCity: Bool) -> [String: Double] {
+        var locationDistances: [String: Double] = [:]
+
         for route in routes {
             guard let firstCoord = route.coordinates.first else { continue }
             let geocodeResult = LocalGeocoder.geocode(latitude: firstCoord.latitude, longitude: firstCoord.longitude)
             let locationName = isCity ? geocodeResult.city : geocodeResult.country
-            
-            // Filter out "Other" cities and unknown locations
+
             if !locationName.isEmpty && locationName != "Unknown" {
-                if isCity && locationName.starts(with: "Other ") {
+                if isCity && !LocalGeocoder.isSpecificCityName(locationName) {
                     continue
                 }
                 locationDistances[locationName, default: 0] += route.distanceKm
             }
         }
-        
-        // Filter based on achievement type
-        let threshold: Double
-        if achievement.id.contains("visited") {
-            threshold = 1.0
-        } else if achievement.id.contains("explored") {
-            threshold = 100.0
-        } else if achievement.id.contains("mastered") {
-            threshold = 1000.0
-        } else {
-            threshold = 0.0
-        }
-        
+
         return locationDistances
-            .filter { $0.value >= threshold }
-            .map { (name: $0.key, distance: $0.value) }
-            .sorted { $0.distance > $1.distance }
+    }
+
+    private func locationThreshold(for achievement: Achievement) -> Double {
+        if achievement.id.contains("visited") {
+            return 1.0
+        } else if achievement.id.contains("explored") {
+            return 100.0
+        } else if achievement.id.contains("mastered") {
+            return 1000.0
+        }
+
+        return 0.0
     }
     
     private func calculateDailyDistances(runningOnly: Bool = false) -> [String: Double] {
@@ -2349,6 +3353,8 @@ struct AchievementDetailView: View {
     private struct BerlinStadtteileListView: View {
         let visitedStadtteile: Set<String>
         let streetSegments: Set<StreetSegment>
+        let onShowAllStadtteile: (() -> Void)?
+        let dismiss: DismissAction
         
         @State private var allStadtteile: Set<String> = []
         @State private var isLoading = true
@@ -2358,6 +3364,29 @@ struct AchievementDetailView: View {
                 let missingStadtteile = allStadtteile.subtracting(visitedStadtteile)
                 
                 if !allStadtteile.isEmpty {
+                    Button(action: {
+                        onShowAllStadtteile?()
+                        dismiss()
+                    }) {
+                        HStack {
+                            Image(systemName: "map.circle.fill")
+                                .font(.title2)
+                            VStack(alignment: .leading) {
+                                Text("Show Stadtteile Map")
+                                    .font(.headline)
+                                Text("Green visited, gray not yet visited")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                        }
+                        .padding()
+                        .background(Color.green.opacity(0.1))
+                        .cornerRadius(12)
+                    }
+                    .padding(.horizontal)
+
                     // Summary
                     VStack(spacing: 8) {
                         Text("\(visitedStadtteile.count)/\(allStadtteile.count)")
@@ -2614,15 +3643,31 @@ struct AchievementsView: View {
     let routes: [Route]
     var onDistrictSelected: ((String, Double, Double) -> Void)? = nil
     var onShowAllDistricts: (() -> Void)? = nil
+    var onShowAllStadtteile: (() -> Void)? = nil
     var onLocationSelected: ((String, String) -> Void)? = nil  // (country, city)
     @Environment(\.dismiss) var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    private var contentMaxWidth: CGFloat {
+        horizontalSizeClass == .regular ? 1120 : .infinity
+    }
+
+    private var achievementGridColumns: [GridItem] {
+        if horizontalSizeClass == .regular {
+            return [GridItem(.adaptive(minimum: 190, maximum: 240), spacing: 18)]
+        }
+        return [
+            GridItem(.flexible(), spacing: 12),
+            GridItem(.flexible(), spacing: 12)
+        ]
+    }
     
     var body: some View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 20) {
                     // Header stats - tier breakdown
-                    HStack(spacing: 15) {
+                    HStack(spacing: horizontalSizeClass == .regular ? 28 : 15) {
                         VStack(spacing: 4) {
                             Text("\(achievementsManager.achievements.filter { $0.currentTier == .bronze }.count)")
                                 .font(.system(size: 24, weight: .bold))
@@ -2671,6 +3716,17 @@ struct AchievementsView: View {
                         }
                     }
                     .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(Color(.secondarySystemGroupedBackground))
+                    .cornerRadius(12)
+                    .padding(.horizontal)
+
+                    MonthlyGoalProgressSection(
+                        routes: routes,
+                        achievements: achievementsManager.achievements,
+                        consolidatedStreets: achievementsManager.consolidatedStreets,
+                        streetCoverageByID: achievementsManager.streetCoverageByID
+                    )
                     
                     // Achievements grouped by category
                     ForEach(Achievement.AchievementCategory.allCases, id: \.self) { category in
@@ -2682,13 +3738,9 @@ struct AchievementsView: View {
                                     .bold()
                                     .padding(.horizontal)
                                 
-                                LazyVGrid(columns: [
-                                    GridItem(.flexible()),
-                                    GridItem(.flexible()),
-                                    GridItem(.flexible())
-                                ], spacing: 16) {
+                                LazyVGrid(columns: achievementGridColumns, spacing: horizontalSizeClass == .regular ? 18 : 12) {
                                     ForEach(categoryAchievements) { achievement in
-                                        NavigationLink(destination: AchievementDetailView(achievement: achievement, routes: routes, onDistrictSelected: onDistrictSelected, onShowAllDistricts: onShowAllDistricts, onLocationSelected: onLocationSelected, visitedBerlinDistricts: achievementsManager.berlinDistrictsVisitedCached, achievementsManager: achievementsManager)) {
+                                        NavigationLink(destination: AchievementDetailView(achievement: achievement, routes: routes, onDistrictSelected: onDistrictSelected, onShowAllDistricts: onShowAllDistricts, onShowAllStadtteile: onShowAllStadtteile, onLocationSelected: onLocationSelected, visitedBerlinDistricts: achievementsManager.berlinDistrictsVisitedCached, achievementsManager: achievementsManager)) {
                                             AchievementCard(achievement: achievement)
                                         }
                                         .buttonStyle(PlainButtonStyle())
@@ -2700,6 +3752,8 @@ struct AchievementsView: View {
                     }
                 }
                 .padding(.vertical)
+                .frame(maxWidth: contentMaxWidth)
+                .frame(maxWidth: .infinity)
             }
             .navigationTitle("Achievements")
             .navigationBarTitleDisplayMode(.large)
@@ -2717,9 +3771,10 @@ struct AchievementsView: View {
                 }
             }
         }
+        .navigationViewStyle(.stack)
         .onAppear {
-            print("🎯 AchievementsView appeared, triggering checkAndUnlockAchievements")
-            achievementsManager.checkAndUnlockAchievements(routes: routes)
+            print("🎯 AchievementsView appeared, triggering background achievement check")
+            achievementsManager.checkAndUnlockAchievementsInBackground(routes: routes)
         }
         .alert(isPresented: $achievementsManager.showAchievementAlert) {
             Alert(
@@ -2803,6 +3858,8 @@ struct AchievementCard: View {
                 .frame(height: 28)
         }
         .padding()
+        .frame(maxWidth: .infinity)
+        .frame(minHeight: 235)
         .background(achievement.isUnlocked ? achievement.currentTier.color.opacity(0.15) : Color.gray.opacity(0.05))
         .cornerRadius(12)
         .opacity(achievement.isUnlocked ? 1.0 : 0.5)
@@ -2813,6 +3870,6 @@ struct AchievementCard: View {
 
 extension Achievement.AchievementCategory: CaseIterable {
     static var allCases: [Achievement.AchievementCategory] {
-        return [.distance, .country, .city, .daily, .exploration, .specials]
+        return [.specials, .distance, .country, .city, .daily, .exploration]
     }
 }

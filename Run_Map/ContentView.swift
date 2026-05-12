@@ -1137,6 +1137,7 @@ struct ContentView: View {
     @State private var showStats = false
     @State private var showAchievementsPage = false
     @State private var showRoutePlanner = false
+    @State private var showMonthlyRecap = false
     @StateObject private var achievementsManager = AchievementsManager()
     @State private var fakeLoadingPercent = 0
     @State private var fakeLoadingTask: Task<Void, Never>?
@@ -1440,6 +1441,12 @@ struct ContentView: View {
                                 showStats = true
                             }
 
+                        // Monthly recap button
+                        circleButton(icon: "calendar.badge.clock")
+                            .onTapGesture {
+                                showMonthlyRecap = true
+                            }
+
                         // Achievements button
                         circleButton(icon: "trophy.fill")
                             .onTapGesture {
@@ -1554,6 +1561,15 @@ struct ContentView: View {
         .sheet(isPresented: $showRoutePlanner) {
             RoutePlannerView(
                 initialRegion: region,
+                consolidatedStreets: achievementsManager.consolidatedStreets,
+                streetCoverageByID: achievementsManager.streetCoverageByID
+            )
+            .presentationDetents([.large])
+        }
+        .sheet(isPresented: $showMonthlyRecap) {
+            MonthlyRecapView(
+                routes: viewModel.routes,
+                achievements: achievementsManager.achievements,
                 consolidatedStreets: achievementsManager.consolidatedStreets,
                 streetCoverageByID: achievementsManager.streetCoverageByID
             )

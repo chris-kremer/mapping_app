@@ -11,6 +11,7 @@ import SwiftUI
 struct Run_MapApp: App {
     init() {
         RunMapHealthKitBackgroundService.shared.start()
+        MonthlyRecapNotificationScheduler.configure()
     }
 
     var body: some Scene {
