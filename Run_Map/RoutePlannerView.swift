@@ -357,6 +357,9 @@ private struct PlannerMapView: UIViewRepresentable {
         private var handledFocusRequestID: UUID?
         private var overlays: [MKOverlay] = []
         private var coverageOverlays: [MKOverlay] = []
+        private weak var coveredStreetOverlay: MKMultiPolyline?
+        private weak var uncoveredStreetOverlay: MKMultiPolyline?
+        private var coverageRenderGeneration = 0
         private var annotations: [MKAnnotation] = []
 
         init(parent: PlannerMapView) {
@@ -376,37 +379,90 @@ private struct PlannerMapView: UIViewRepresentable {
             streetCoverageByID: [String: ConsolidatedStreet.CoverageResult],
             on mapView: MKMapView
         ) {
-            let coveredStreetCount = streetCoverageByID.values.filter { $0.coveredPoints > 0 }.count
+            let coveredStreetCount = streetCoverageByID.values.filter { $0.coveredPoints > 0 || $0.percentage > 0 }.count
             let signature = showCurrentStreetCoverage
                 ? "on:\(consolidatedStreets.count):\(streetCoverageByID.count):\(coveredStreetCount)"
                 : "off"
             guard signature != renderedCoverageSignature else { return }
             renderedCoverageSignature = signature
+            coverageRenderGeneration += 1
+            let generation = coverageRenderGeneration
 
             if !coverageOverlays.isEmpty {
                 mapView.removeOverlays(coverageOverlays)
                 coverageOverlays.removeAll(keepingCapacity: true)
             }
+            coveredStreetOverlay = nil
+            uncoveredStreetOverlay = nil
 
             guard showCurrentStreetCoverage else { return }
 
-            var coveredPolylines: [MKPolyline] = []
-            coveredPolylines.reserveCapacity(coveredStreetCount)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let streets = consolidatedStreets.isEmpty
+                    ? Self.loadFallbackConsolidatedStreets()
+                    : consolidatedStreets
+                let groups = Self.makeStreetCoveragePolylineGroups(
+                    streets: streets,
+                    coverageByID: streetCoverageByID
+                )
 
-            for street in consolidatedStreets {
-                guard (streetCoverageByID[street.id]?.coveredPoints ?? 0) > 0 else { continue }
+                DispatchQueue.main.async {
+                    guard generation == self.coverageRenderGeneration else { return }
+
+                    var newOverlays: [MKOverlay] = []
+                    if !groups.uncovered.isEmpty {
+                        let overlay = MKMultiPolyline(groups.uncovered)
+                        self.uncoveredStreetOverlay = overlay
+                        newOverlays.append(overlay)
+                    }
+
+                    if !groups.covered.isEmpty {
+                        let overlay = MKMultiPolyline(groups.covered)
+                        self.coveredStreetOverlay = overlay
+                        newOverlays.append(overlay)
+                    }
+
+                    guard !newOverlays.isEmpty else { return }
+                    self.coverageOverlays = newOverlays
+                    for overlay in newOverlays {
+                        mapView.addOverlay(overlay, level: .aboveRoads)
+                    }
+                }
+            }
+        }
+
+        private static func loadFallbackConsolidatedStreets() -> [ConsolidatedStreet] {
+            let streets = BerlinStreets.getStreets(forDistricts: BerlinDistricts.districts.map(\.name))
+            guard !streets.isEmpty else { return [] }
+            return StreetConsolidator.consolidate(streets: streets)
+        }
+
+        private static func makeStreetCoveragePolylineGroups(
+            streets: [ConsolidatedStreet],
+            coverageByID: [String: ConsolidatedStreet.CoverageResult]
+        ) -> (covered: [MKPolyline], uncovered: [MKPolyline]) {
+            var covered: [MKPolyline] = []
+            var uncovered: [MKPolyline] = []
+            covered.reserveCapacity(coverageByID.count)
+
+            for street in streets {
+                let coverage = coverageByID[street.id]
+                let hasAnyHit = (coverage?.coveredPoints ?? 0) > 0 || (coverage?.percentage ?? 0) > 0
 
                 for segment in street.segments {
                     let coordinates = segment.clCoordinates
                     guard coordinates.count >= 2 else { continue }
-                    coveredPolylines.append(MKPolyline(coordinates: coordinates, count: coordinates.count))
+
+                    let polyline = MKPolyline(coordinates: coordinates, count: coordinates.count)
+                    if hasAnyHit {
+                        covered.append(polyline)
+                    } else {
+                        uncovered.append(polyline)
+                    }
                 }
             }
 
-            guard !coveredPolylines.isEmpty else { return }
-            let overlay = MKMultiPolyline(coveredPolylines)
-            coverageOverlays = [overlay]
-            mapView.addOverlay(overlay, level: .aboveRoads)
+            return (covered, uncovered)
         }
 
         func render(waypoints: [CLLocationCoordinate2D], on mapView: MKMapView) {
@@ -464,8 +520,18 @@ private struct PlannerMapView: UIViewRepresentable {
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let multiPolyline = overlay as? MKMultiPolyline {
                 let renderer = MKMultiPolylineRenderer(multiPolyline: multiPolyline)
-                renderer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.35)
-                renderer.lineWidth = 2
+                if multiPolyline === coveredStreetOverlay {
+                    renderer.strokeColor = UIColor.systemGreen.withAlphaComponent(0.82)
+                    renderer.lineWidth = 2.7
+                    renderer.alpha = 0.95
+                } else if multiPolyline === uncoveredStreetOverlay {
+                    renderer.strokeColor = UIColor.systemRed.withAlphaComponent(0.58)
+                    renderer.lineWidth = 2.1
+                    renderer.alpha = 0.95
+                } else {
+                    renderer.strokeColor = UIColor.systemGray.withAlphaComponent(0.45)
+                    renderer.lineWidth = 2
+                }
                 renderer.lineCap = .round
                 renderer.lineJoin = .round
                 return renderer
