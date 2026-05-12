@@ -607,25 +607,32 @@ struct StatsView: View {
             },
             ranges: [
                 (0, 4, "<4"),
-                (4, 5, "4-5"),
-                (5, 6, "5-6"),
-                (6, 7, "6-7"),
-                (7, 8, "7-8"),
+                (4, 6, "4-6"),
+                (6, 8, "6-8"),
                 (8, 10, "8-10"),
-                (10, .infinity, "10+")
+                (10, 12, "10-12"),
+                (12, 14, "12-14"),
+                (14, 16, "14-16"),
+                (16, .infinity, "16+")
             ]
         )
 
         distanceBins = makeFrequencyBins(
             values: validRoutes.map(\.distanceKm),
             ranges: [
-                (0, 2, "<2"),
-                (2, 5, "2-5"),
-                (5, 10, "5-10"),
-                (10, 15, "10-15"),
-                (15, 21.1, "15-21"),
-                (21.1, 30, "21-30"),
-                (30, .infinity, "30+")
+                (0, 0.5, "<0.5"),
+                (0.5, 1.0, "0.5-.99"),
+                (1.0, 1.5, "1-1.49"),
+                (1.5, 2.0, "1.5-1.99"),
+                (2.0, 2.5, "2-2.49"),
+                (2.5, 3.0, "2.5-2.99"),
+                (3.0, 4.0, "3-3.99"),
+                (4.0, 5.0, "4-4.99"),
+                (5.0, 7.0, "5-6.99"),
+                (7.0, 9.0, "7-8.99"),
+                (9.0, 12.0, "9-11.99"),
+                (12.0, 18.0, "12-17.99"),
+                (18.0, .infinity, ">18")
             ]
         )
 
@@ -644,7 +651,9 @@ struct StatsView: View {
         values: [Double],
         ranges: [(lower: Double, upper: Double, label: String)]
     ) -> [StatsFrequencyBin] {
-        ranges.map { range in
+        guard !values.isEmpty else { return [] }
+
+        return ranges.map { range in
             StatsFrequencyBin(
                 label: range.label,
                 count: values.filter { value in
@@ -652,7 +661,6 @@ struct StatsView: View {
                 }.count
             )
         }
-        .filter { $0.count > 0 }
     }
 
     private func makeDailyDistanceWeeks(dailyTotals: [Date: Double]) -> [[DailyDistanceCell?]] {
