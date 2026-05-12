@@ -208,6 +208,12 @@ struct StatsView: View {
                                 RoundedRectangle(cornerRadius: 3)
                                     .fill(dailyDistanceColor(for: cell?.distanceKm ?? 0))
                                     .frame(width: 12, height: 12)
+                                    .overlay {
+                                        if isToday(cell) {
+                                            RoundedRectangle(cornerRadius: 3)
+                                                .stroke(Color.accentColor, lineWidth: 2)
+                                        }
+                                    }
                                     .accessibilityLabel(dailyDistanceAccessibilityLabel(for: cell))
                             }
                         }
@@ -226,6 +232,17 @@ struct StatsView: View {
                         .frame(width: 12, height: 12)
                 }
                 Text("More")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Spacer()
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color(.systemGray5))
+                    .frame(width: 12, height: 12)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 3)
+                            .stroke(Color.accentColor, lineWidth: 2)
+                    }
+                Text("Today")
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
@@ -749,6 +766,11 @@ struct StatsView: View {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         return "\(formatter.string(from: cell.date)): \(String(format: "%.1f", cell.distanceKm)) km"
+    }
+
+    private func isToday(_ cell: DailyDistanceCell?) -> Bool {
+        guard let cell else { return false }
+        return Calendar.current.isDateInToday(cell.date)
     }
     
     private func cleanupCountryCache(_ cache: [String: String]) -> [String: String] {
