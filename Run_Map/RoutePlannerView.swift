@@ -17,11 +17,21 @@ struct RoutePlannerView: View {
     @State private var planTitle = ""
     @State private var showCurrentStreetCoverage = false
     @State private var focusRequestID = UUID()
+    @State private var fallbackConsolidatedStreets: [ConsolidatedStreet] = []
+    @State private var savedPlanPreviews: [UUID: SavedPlanPreview] = [:]
 
     private var waypointSignature: String {
         waypoints
             .map { "\(String(format: "%.5f", $0.latitude)),\(String(format: "%.5f", $0.longitude))" }
             .joined(separator: "|")
+    }
+
+    private var plannerConsolidatedStreets: [ConsolidatedStreet] {
+        consolidatedStreets.isEmpty ? fallbackConsolidatedStreets : consolidatedStreets
+    }
+
+    private var plannerDataSignature: String {
+        "\(plannerConsolidatedStreets.count):\(streetCoverageByID.count)"
     }
 
     var body: some View {
@@ -31,7 +41,7 @@ struct RoutePlannerView: View {
                     waypoints: waypoints,
                     initialRegion: initialRegion,
                     showCurrentStreetCoverage: showCurrentStreetCoverage,
-                    consolidatedStreets: consolidatedStreets,
+                    consolidatedStreets: plannerConsolidatedStreets,
                     streetCoverageByID: streetCoverageByID,
                     focusRequestID: focusRequestID,
                     onAddWaypoint: { coordinate in
@@ -87,10 +97,16 @@ struct RoutePlannerView: View {
         .navigationViewStyle(.stack)
         .onAppear {
             savedPlans = SavedRoutePlanStore.load()
+            loadFallbackStreetDataIfNeeded()
             recalculateStats()
+            recalculateSavedPlanPreviews()
         }
         .onChange(of: waypointSignature) { _ in
             recalculateStats()
+        }
+        .onChange(of: plannerDataSignature) { _ in
+            recalculateStats()
+            recalculateSavedPlanPreviews()
         }
         .alert("Save Plan", isPresented: $showSavePlanDialog) {
             TextField("Title", text: $planTitle)
@@ -173,7 +189,7 @@ struct RoutePlannerView: View {
                                 Text(plan.title)
                                     .font(.subheadline)
                                     .fontWeight(.semibold)
-                                Text("\(plan.coordinates.count) points")
+                                Text(savedPlanPreviewText(for: plan))
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -199,8 +215,8 @@ struct RoutePlannerView: View {
             Text("Projected Street Coverage")
                 .font(.headline)
 
-            if consolidatedStreets.isEmpty {
-                Text("Street coverage data is still loading. Open Achievements once to build the street cache, then this planner can estimate new Berlin streets.")
+            if plannerConsolidatedStreets.isEmpty {
+                Text("Street coverage data is still loading.")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
             } else if stats.newStreetNames.isEmpty {
@@ -264,7 +280,7 @@ struct RoutePlannerView: View {
 
     private func recalculateStats() {
         let plannedCoordinates = waypoints
-        let streets = consolidatedStreets
+        let streets = plannerConsolidatedStreets
         let existingCoverage = streetCoverageByID
 
         guard !plannedCoordinates.isEmpty else {
@@ -302,11 +318,59 @@ struct RoutePlannerView: View {
         let plan = SavedRoutePlan(title: trimmedTitle, createdAt: Date(), coordinates: waypoints)
         savedPlans.insert(plan, at: 0)
         SavedRoutePlanStore.save(savedPlans)
+        recalculateSavedPlanPreviews()
     }
 
     private func deletePlan(_ plan: SavedRoutePlan) {
         savedPlans.removeAll { $0.id == plan.id }
         SavedRoutePlanStore.save(savedPlans)
+        savedPlanPreviews[plan.id] = nil
+        recalculateSavedPlanPreviews()
+    }
+
+    private func savedPlanPreviewText(for plan: SavedRoutePlan) -> String {
+        guard let preview = savedPlanPreviews[plan.id] else {
+            return String(format: "%.1f km", PlannedRouteStats.totalDistanceKm(for: plan.coordinates))
+        }
+        let streetLabel = preview.newStreetCount == 1 ? "new street" : "new streets"
+        return String(format: "%.1f km, %d %@", preview.distanceKm, preview.newStreetCount, streetLabel)
+    }
+
+    private func loadFallbackStreetDataIfNeeded() {
+        guard consolidatedStreets.isEmpty, fallbackConsolidatedStreets.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let streets = RoutePlannerStreetData.loadFallbackConsolidatedStreets()
+            DispatchQueue.main.async {
+                guard fallbackConsolidatedStreets.isEmpty else { return }
+                fallbackConsolidatedStreets = streets
+            }
+        }
+    }
+
+    private func recalculateSavedPlanPreviews() {
+        let plans = savedPlans
+        let streets = plannerConsolidatedStreets
+        let existingCoverage = streetCoverageByID
+
+        guard !plans.isEmpty else {
+            savedPlanPreviews = [:]
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let previews = Dictionary(uniqueKeysWithValues: plans.map { plan in
+                let stats = PlannedRouteStats.calculate(
+                    coordinates: plan.coordinates,
+                    consolidatedStreets: streets,
+                    existingCoverage: existingCoverage
+                )
+                return (plan.id, SavedPlanPreview(distanceKm: stats.distanceKm, newStreetCount: stats.newStreetNames.count))
+            })
+
+            DispatchQueue.main.async {
+                savedPlanPreviews = previews
+            }
+        }
     }
 }
 
@@ -443,9 +507,7 @@ private struct PlannerMapView: UIViewRepresentable {
         }
 
         private static func loadFallbackConsolidatedStreets() -> [ConsolidatedStreet] {
-            let streets = BerlinStreets.getStreets(forDistricts: BerlinDistricts.districts.map(\.name))
-            guard !streets.isEmpty else { return [] }
-            return StreetConsolidator.consolidate(streets: streets)
+            RoutePlannerStreetData.loadFallbackConsolidatedStreets()
         }
 
         private static func makeStreetCoveragePolylineGroups(
@@ -565,6 +627,19 @@ private struct PlannerMapView: UIViewRepresentable {
 }
 
 private final class PlannedRoutePolyline: MKPolyline {}
+
+private struct SavedPlanPreview {
+    let distanceKm: Double
+    let newStreetCount: Int
+}
+
+private enum RoutePlannerStreetData {
+    static func loadFallbackConsolidatedStreets() -> [ConsolidatedStreet] {
+        let streets = BerlinStreets.getStreets(forDistricts: BerlinDistricts.districts.map(\.name))
+        guard !streets.isEmpty else { return [] }
+        return StreetConsolidator.consolidate(streets: streets)
+    }
+}
 
 private struct SavedRoutePlan: Identifiable, Codable {
     let id: UUID
@@ -749,7 +824,7 @@ private struct PlannedRouteStats {
         return samples
     }
 
-    private static func totalDistanceKm(for coordinates: [CLLocationCoordinate2D]) -> Double {
+    static func totalDistanceKm(for coordinates: [CLLocationCoordinate2D]) -> Double {
         guard coordinates.count >= 2 else { return 0 }
         var totalMeters = 0.0
         for index in 0..<(coordinates.count - 1) {
