@@ -24,6 +24,7 @@ struct RoutePlannerView: View {
     @State private var simulatedPlanIDs: Set<UUID> = []
     @State private var simulationStats = PlanSimulationStats.empty
     @State private var isComputingSimulation = false
+    @State private var savedPlanSort: SavedPlanSortMode = .distance
 
     private var waypointSignature: String {
         waypoints
@@ -57,6 +58,12 @@ struct RoutePlannerView: View {
 
     private var simulatedPlans: [SavedRoutePlan] {
         savedPlans.filter { simulatedPlanIDs.contains($0.id) }
+    }
+
+    private var rankedSavedPlans: [SavedRoutePlan] {
+        savedPlans.sorted { lhs, rhs in
+            savedPlanSort.compare(lhs, rhs, previews: savedPlanPreviews)
+        }
     }
 
     var body: some View {
@@ -300,7 +307,7 @@ struct RoutePlannerView: View {
                 } else {
                     simulationStatsRow
 
-                    ForEach(savedPlans) { plan in
+                    ForEach(rankedSavedPlans) { plan in
                         Button {
                             toggleSimulatedPlan(plan)
                         } label: {
@@ -394,7 +401,14 @@ struct RoutePlannerView: View {
                 Text("Saved Plans")
                     .font(.headline)
 
-                ForEach(savedPlans.prefix(5)) { plan in
+                Picker("Rank plans", selection: $savedPlanSort) {
+                    ForEach(SavedPlanSortMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                ForEach(rankedSavedPlans.prefix(5)) { plan in
                     HStack(spacing: 10) {
                         Button {
                             viewSavedPlan(plan)
@@ -615,7 +629,16 @@ struct RoutePlannerView: View {
             return String(format: "%.1f km", PlannedRouteStats.totalDistanceKm(for: plan.coordinates))
         }
         let streetLabel = preview.newStreetCount == 1 ? "new street" : "new streets"
-        return String(format: "%.1f km, %d %@", preview.distanceKm, preview.newStreetCount, streetLabel)
+        let districtLabel = preview.newDistrictCount == 1 ? "district" : "districts"
+        return String(
+            format: "%.1f km, %d %@, %.2f streets/km, %d new %@",
+            preview.distanceKm,
+            preview.newStreetCount,
+            streetLabel,
+            preview.newStreetsPerKm,
+            preview.newDistrictCount,
+            districtLabel
+        )
     }
 
     private func loadFallbackStreetDataIfNeeded() {
@@ -646,13 +669,54 @@ struct RoutePlannerView: View {
                     consolidatedStreets: streets,
                     existingCoverage: existingCoverage
                 )
-                return (plan.id, SavedPlanPreview(distanceKm: stats.distanceKm, newStreetCount: stats.newStreetNames.count))
+                let newDistrictCount = Self.projectedNewDistrictCount(
+                    coordinates: plan.coordinates,
+                    consolidatedStreets: streets,
+                    existingCoverage: existingCoverage
+                )
+                return (
+                    plan.id,
+                    SavedPlanPreview(
+                        distanceKm: stats.distanceKm,
+                        newStreetCount: stats.newStreetNames.count,
+                        newDistrictCount: newDistrictCount
+                    )
+                )
             })
 
             DispatchQueue.main.async {
                 savedPlanPreviews = previews
             }
         }
+    }
+
+    private static func projectedNewDistrictCount(
+        coordinates: [CLLocationCoordinate2D],
+        consolidatedStreets: [ConsolidatedStreet],
+        existingCoverage: [String: ConsolidatedStreet.CoverageResult]
+    ) -> Int {
+        guard coordinates.count >= 2, !consolidatedStreets.isEmpty else { return 0 }
+        let plannedRoute = Route(
+            coordinates: PlannedRouteStats.sampledPath(from: coordinates, maxStepMeters: 25),
+            date: Date(),
+            workoutType: .walking,
+            durationSec: 0
+        )
+        let checker = FastStreetChecker(routes: [plannedRoute])
+        var districts = Set<String>()
+
+        for street in consolidatedStreets {
+            let wasCovered = (existingCoverage[street.id]?.coveredPoints ?? 0) > 0 ||
+                (existingCoverage[street.id]?.percentage ?? 0) > 0
+            guard !wasCovered else { continue }
+
+            let plannedCoverage = street.calculateCoverage(using: checker, densify: false)
+            if plannedCoverage.coveredPoints > 0 {
+                districts.insert(street.district)
+            }
+        }
+
+        return districts.count
     }
 
     private func recalculateSimulationStats() {
@@ -1003,9 +1067,60 @@ private enum PlannerMode: Equatable {
     }
 }
 
+private enum SavedPlanSortMode: String, CaseIterable, Identifiable {
+    case distance
+    case streetsPerKm
+    case newDistricts
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .distance:
+            return "Distance"
+        case .streetsPerKm:
+            return "Streets/km"
+        case .newDistricts:
+            return "Districts"
+        }
+    }
+
+    func compare(
+        _ lhs: SavedRoutePlan,
+        _ rhs: SavedRoutePlan,
+        previews: [UUID: SavedPlanPreview]
+    ) -> Bool {
+        let lhsPreview = previews[lhs.id]
+        let rhsPreview = previews[rhs.id]
+
+        switch self {
+        case .distance:
+            return value(lhsPreview?.distanceKm, fallback: PlannedRouteStats.totalDistanceKm(for: lhs.coordinates)) >
+                value(rhsPreview?.distanceKm, fallback: PlannedRouteStats.totalDistanceKm(for: rhs.coordinates))
+        case .streetsPerKm:
+            return value(lhsPreview?.newStreetsPerKm, fallback: 0) >
+                value(rhsPreview?.newStreetsPerKm, fallback: 0)
+        case .newDistricts:
+            return value(Double(lhsPreview?.newDistrictCount ?? 0), fallback: 0) >
+                value(Double(rhsPreview?.newDistrictCount ?? 0), fallback: 0)
+        }
+    }
+
+    private func value(_ value: Double?, fallback: Double) -> Double {
+        guard let value, value.isFinite else { return fallback }
+        return value
+    }
+}
+
 private struct SavedPlanPreview {
     let distanceKm: Double
     let newStreetCount: Int
+    let newDistrictCount: Int
+
+    var newStreetsPerKm: Double {
+        guard distanceKm > 0 else { return 0 }
+        return Double(newStreetCount) / distanceKm
+    }
 }
 
 private struct PlanSimulationStats {
