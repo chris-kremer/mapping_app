@@ -1,0 +1,5 @@
+City gazetteer derived from GeoNames cities5000.
+Source: https://download.geonames.org/export/dump/cities5000.zip
+GeoNames data is licensed under Creative Commons Attribution 4.0.
+Generated fields: name, latitude, longitude, countryCode, population, featureCode.
+Feature code PPLX was excluded so city districts/neighborhoods do not fragment city-level achievements.

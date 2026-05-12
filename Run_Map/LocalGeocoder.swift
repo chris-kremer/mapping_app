@@ -8,7 +8,11 @@ struct LocalGeocoder {
     // MARK: - Country Boundaries from GeoJSON
 
     private static var countryPolygons: [CountryPolygon] = []
+    private static var cachedWorldMapBoundaries: [CountryBoundary]?
     private static var isLoaded = false
+    private static var cityGrid: [String: [CityInfo]] = [:]
+    private static var isCityGazetteerLoaded = false
+    private static let cityGridCellSize = 2.0
 
     // Load GeoJSON data once
     private static func loadCountryBoundaries() {
@@ -81,6 +85,7 @@ struct LocalGeocoder {
 
                 countryPolygons.append(CountryPolygon(
                     name: name,
+                    alpha2Code: properties["iso_3166_1_alpha_2_codes"] as? String,
                     polygons: polygons,
                     bounds: bounds,
                     majorCities: getMajorCities(for: name)
@@ -96,6 +101,7 @@ struct LocalGeocoder {
 
     private struct CountryPolygon {
         let name: String
+        let alpha2Code: String?
         let polygons: [[CLLocationCoordinate2D]]
         let bounds: BoundingBox
         let majorCities: [CityInfo]
@@ -116,6 +122,18 @@ struct LocalGeocoder {
         let name: String
         let lat: Double
         let lon: Double
+        let countryCode: String?
+        let population: Int
+        let featureCode: String
+
+        init(name: String, lat: Double, lon: Double, countryCode: String? = nil, population: Int = 0, featureCode: String = "") {
+            self.name = name
+            self.lat = lat
+            self.lon = lon
+            self.countryCode = countryCode
+            self.population = population
+            self.featureCode = featureCode
+        }
     }
 
     // MARK: - Public Interface
@@ -124,6 +142,36 @@ struct LocalGeocoder {
         let country: String
         let city: String
         let confidence: Double // 0.0 to 1.0
+    }
+
+    struct CountryBoundary {
+        let name: String
+        let polygons: [[CLLocationCoordinate2D]]
+    }
+
+    static func isSpecificCityName(_ city: String) -> Bool {
+        let trimmed = city.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty
+            && trimmed != "Unknown"
+            && !trimmed.starts(with: "Other ")
+            && !trimmed.starts(with: "Rural ")
+    }
+
+    static func worldMapBoundaries() -> [CountryBoundary] {
+        loadCountryBoundaries()
+
+        if let cachedWorldMapBoundaries {
+            return cachedWorldMapBoundaries
+        }
+
+        let boundaries = countryPolygons.map { country in
+            CountryBoundary(
+                name: country.name,
+                polygons: country.polygons.map(simplifiedForWorldMap)
+            )
+        }
+        cachedWorldMapBoundaries = boundaries
+        return boundaries
     }
 
     /// Fast offline geocoding using GeoJSON boundaries
@@ -158,11 +206,11 @@ struct LocalGeocoder {
             )
         }
 
-        // Find closest city within the country
         let closestCity = findClosestCity(
             lat: latitude,
             lon: longitude,
-            in: country.majorCities
+            countryCode: country.alpha2Code,
+            fallbackCities: country.majorCities
         )
 
         // Assign city based on distance
@@ -190,6 +238,25 @@ struct LocalGeocoder {
         )
     }
 
+    private static func simplifiedForWorldMap(_ coordinates: [CLLocationCoordinate2D]) -> [CLLocationCoordinate2D] {
+        guard coordinates.count > 160 else { return coordinates }
+
+        let step = max(1, coordinates.count / 140)
+        var simplified: [CLLocationCoordinate2D] = []
+        simplified.reserveCapacity((coordinates.count / step) + 2)
+
+        for index in stride(from: 0, to: coordinates.count, by: step) {
+            simplified.append(coordinates[index])
+        }
+
+        if let last = coordinates.last,
+           simplified.last?.latitude != last.latitude || simplified.last?.longitude != last.longitude {
+            simplified.append(last)
+        }
+
+        return simplified
+    }
+
     // MARK: - Point in Polygon Algorithm
 
     /// Ray casting algorithm for point-in-polygon test
@@ -215,7 +282,7 @@ struct LocalGeocoder {
 
     /// Get a region name for locations far from major cities
     private static func getRegionName(country: String, closestCity: String) -> String {
-        return "Rural \(country)"
+        return "Other \(country)"
     }
 
     // MARK: - Private Helpers
@@ -223,6 +290,83 @@ struct LocalGeocoder {
     private struct CityDistance {
         let city: String
         let distance: Double // in km
+    }
+
+    private static func loadCityGazetteer() {
+        guard !isCityGazetteerLoaded else { return }
+        isCityGazetteerLoaded = true
+
+        guard let url = Bundle.main.url(forResource: "geonames_cities5000", withExtension: "tsv"),
+              let contents = try? String(contentsOf: url, encoding: .utf8) else {
+            print("⚠️ Failed to load geonames_cities5000.tsv; falling back to built-in major city list")
+            return
+        }
+
+        var loadedCities = 0
+        contents.enumerateLines { line, _ in
+            guard !line.hasPrefix("name\t") else { return }
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard fields.count >= 6,
+                  let lat = Double(fields[1]),
+                  let lon = Double(fields[2]) else {
+                return
+            }
+
+            let city = CityInfo(
+                name: String(fields[0]),
+                lat: lat,
+                lon: lon,
+                countryCode: String(fields[3]).uppercased(),
+                population: Int(fields[4]) ?? 0,
+                featureCode: String(fields[5])
+            )
+            cityGrid[gridKey(lat: lat, lon: lon), default: []].append(city)
+            loadedCities += 1
+        }
+
+        print("🏙️ Loaded \(loadedCities) cities into \(cityGrid.count) spatial cells")
+    }
+
+    private static func findClosestCity(lat: Double, lon: Double, countryCode: String?, fallbackCities: [CityInfo]) -> CityDistance {
+        loadCityGazetteer()
+
+        if let indexedMatch = findClosestIndexedCity(lat: lat, lon: lon, countryCode: countryCode) {
+            return indexedMatch
+        }
+
+        return findClosestCity(lat: lat, lon: lon, in: fallbackCities)
+    }
+
+    private static func findClosestIndexedCity(lat: Double, lon: Double, countryCode: String?) -> CityDistance? {
+        guard !cityGrid.isEmpty else { return nil }
+
+        let normalizedCountryCode = countryCode?.uppercased()
+        let latCell = cellIndex(for: lat, offset: 90)
+        let lonCell = cellIndex(for: lon, offset: 180)
+        var closestCity: CityInfo?
+        var minDistance = Double.infinity
+
+        for latOffset in -1...1 {
+            for lonOffset in -1...1 {
+                let key = "\(latCell + latOffset):\(lonCell + lonOffset)"
+                guard let cities = cityGrid[key] else { continue }
+
+                for city in cities {
+                    if let normalizedCountryCode, city.countryCode != normalizedCountryCode {
+                        continue
+                    }
+
+                    let dist = distance(from: (lat, lon), to: (city.lat, city.lon))
+                    if dist < minDistance {
+                        minDistance = dist
+                        closestCity = city
+                    }
+                }
+            }
+        }
+
+        guard let closestCity else { return nil }
+        return CityDistance(city: closestCity.name, distance: minDistance)
     }
 
     private static func findClosestCity(lat: Double, lon: Double, in cities: [CityInfo]) -> CityDistance {
@@ -242,6 +386,14 @@ struct LocalGeocoder {
         }
 
         return CityDistance(city: closest.name, distance: minDistance)
+    }
+
+    private static func gridKey(lat: Double, lon: Double) -> String {
+        "\(cellIndex(for: lat, offset: 90)):\(cellIndex(for: lon, offset: 180))"
+    }
+
+    private static func cellIndex(for value: Double, offset: Double) -> Int {
+        Int(floor((value + offset) / cityGridCellSize))
     }
 
     /// Calculate distance between two coordinates using Haversine formula
