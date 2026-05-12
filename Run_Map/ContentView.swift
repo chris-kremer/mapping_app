@@ -1128,6 +1128,10 @@ struct ContentView: View {
     @StateObject private var achievementsManager = AchievementsManager()
     @State private var fakeLoadingPercent = 0
     @State private var fakeLoadingTask: Task<Void, Never>?
+    @State private var loadingStatusMessage: String?
+    @State private var isLoadingInBackground = false
+    @State private var showUpdatedMessage = false
+    @State private var longLoadingMessageShownAt: Date?
     
     // District overlay state
     @State private var selectedDistrictOverlay: (name: String, lat: Double, lon: Double)? = nil
@@ -1171,6 +1175,10 @@ struct ContentView: View {
     private func startFakeLoading() {
         fakeLoadingTask?.cancel()
         isLoading = true
+        isLoadingInBackground = false
+        showUpdatedMessage = false
+        loadingStatusMessage = nil
+        longLoadingMessageShownAt = nil
         fakeLoadingPercent = 0
         hasQueuedLaunchAchievementCheck = false
 
@@ -1182,20 +1190,71 @@ struct ContentView: View {
                 }
                 try? await Task.sleep(nanoseconds: 50_000_000)
             }
+
+            await MainActor.run {
+                loadingStatusMessage = "This is taking a bit longer than expected. We'll load in the background."
+                longLoadingMessageShownAt = Date()
+            }
+
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+
+            await MainActor.run {
+                guard viewModel.loadProgress < 1 else { return }
+                isLoading = false
+                isLoadingInBackground = true
+                loadingStatusMessage = nil
+                longLoadingMessageShownAt = nil
+            }
         }
     }
 
     private func finishFakeLoading() {
         fakeLoadingTask?.cancel()
         fakeLoadingTask = nil
+        let remainingLongMessageSeconds: TimeInterval
+        if let longLoadingMessageShownAt, isLoading {
+            remainingLongMessageSeconds = max(0, 3 - Date().timeIntervalSince(longLoadingMessageShownAt))
+        } else {
+            remainingLongMessageSeconds = 0
+        }
+
+        if remainingLongMessageSeconds > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + remainingLongMessageSeconds) {
+                completeVisibleLoading()
+            }
+            return
+        }
+
+        completeVisibleLoading()
+    }
+
+    private func completeVisibleLoading() {
+        loadingStatusMessage = nil
+        longLoadingMessageShownAt = nil
+
+        if isLoadingInBackground || !isLoading {
+            isLoading = false
+            isLoadingInBackground = false
+            fakeLoadingPercent = 0
+            showUpdatedToast()
+            return
+        }
+
         fakeLoadingPercent = 100
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             isLoading = false
             fakeLoadingPercent = 0
+            showUpdatedToast()
         }
     }
 
+    private func showUpdatedToast() {
+        showUpdatedMessage = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            showUpdatedMessage = false
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -1265,11 +1324,32 @@ struct ContentView: View {
             }
             
             if isLoading {
-                Text("Loading \(fakeLoadingPercent)%")
+                VStack(spacing: 8) {
+                    Text("Loading \(fakeLoadingPercent)%")
+                        .fontWeight(.semibold)
+                    if let loadingStatusMessage {
+                        Text(loadingStatusMessage)
+                            .font(.subheadline)
+                            .multilineTextAlignment(.center)
+                    }
+                }
                     .padding()
                     .background(Color.black.opacity(0.6))
                     .foregroundColor(.white)
                     .cornerRadius(8)
+                    .padding(.horizontal, 28)
+            }
+
+            if showUpdatedMessage {
+                Text("Updated!")
+                    .font(.headline)
+                    .fontWeight(.semibold)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .background(Color.black.opacity(0.75))
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
+                    .transition(.opacity)
             }
             
             VStack {
@@ -1419,7 +1499,7 @@ struct ContentView: View {
                     hasLaunchedBefore = true
                 }
             } else {
-                if !isLoading {
+                if !isLoading && !isLoadingInBackground {
                     startFakeLoading()
                 }
             }
