@@ -1307,6 +1307,39 @@ private struct SmartRouteSuggestion {
     let newStreetCount: Int
 }
 
+private struct CoordinateBounds {
+    let minLat: Double
+    let maxLat: Double
+    let minLon: Double
+    let maxLon: Double
+
+    func contains(_ coordinate: CLLocationCoordinate2D) -> Bool {
+        coordinate.latitude >= minLat &&
+            coordinate.latitude <= maxLat &&
+            coordinate.longitude >= minLon &&
+            coordinate.longitude <= maxLon
+    }
+
+    func intersects(_ other: CoordinateBounds) -> Bool {
+        minLat <= other.maxLat &&
+            maxLat >= other.minLat &&
+            minLon <= other.maxLon &&
+            maxLon >= other.minLon
+    }
+
+    func expanded(byMeters meters: CLLocationDistance) -> CoordinateBounds {
+        let centerLat = (minLat + maxLat) / 2
+        let latDelta = meters / 111_000
+        let lonDelta = meters / max(1, 111_000 * cos(centerLat * .pi / 180))
+        return CoordinateBounds(
+            minLat: minLat - latDelta,
+            maxLat: maxLat + latDelta,
+            minLon: minLon - lonDelta,
+            maxLon: maxLon + lonDelta
+        )
+    }
+}
+
 private struct RouteAchievementPreviewItem: Identifiable {
     enum Kind {
         case unlock
@@ -1598,6 +1631,9 @@ private enum SmartRouteSuggestionEngine {
         let district: String
         let coordinate: CLLocationCoordinate2D
         let distanceFromStart: CLLocationDistance
+        let bearingSector: Int
+        let distanceBand: Int
+        let localOpportunityScore: Int
     }
 
     static func generate(
@@ -1609,6 +1645,8 @@ private enum SmartRouteSuggestionEngine {
     ) -> SmartRouteSuggestion? {
         let candidates = uncoveredCandidates(
             start: start,
+            targetDistanceKm: targetDistanceKm,
+            shape: shape,
             consolidatedStreets: consolidatedStreets,
             existingCoverage: existingCoverage
         )
@@ -1619,13 +1657,15 @@ private enum SmartRouteSuggestionEngine {
         var waypoints = [start]
         var current = start
         var usedStreetIDs = Set<String>()
+        let routeCandidates = focusedCandidates(candidates, shape: shape)
 
-        for candidate in candidates {
+        for candidate in routeCandidates {
             guard !usedStreetIDs.contains(candidate.streetID) else { continue }
 
             let addedMeters = distanceMeters(from: current, to: candidate.coordinate)
             let returnMeters = shape == .loop ? distanceMeters(from: candidate.coordinate, to: start) : 0
             let currentMeters = routeDistanceMeters(waypoints)
+            guard addedMeters >= 80 || waypoints.count == 1 else { continue }
 
             if currentMeters + addedMeters + returnMeters > maxMeters {
                 continue
@@ -1654,35 +1694,114 @@ private enum SmartRouteSuggestionEngine {
 
     private static func uncoveredCandidates(
         start: CLLocationCoordinate2D,
+        targetDistanceKm: Double,
+        shape: SmartRouteShape,
         consolidatedStreets: [ConsolidatedStreet],
         existingCoverage: [String: ConsolidatedStreet.CoverageResult]
     ) -> [Candidate] {
         let startLocation = CLLocation(latitude: start.latitude, longitude: start.longitude)
+        let targetMeters = targetDistanceKm * 1_000
+        let searchRadius = shape == .loop
+            ? max(2_200, min(5_200, targetMeters * 0.55))
+            : max(3_000, min(10_000, targetMeters * 1.05))
+        let bounds = coordinateBounds(around: start, radiusMeters: searchRadius)
 
-        return consolidatedStreets.compactMap { street in
+        let rawCandidates = consolidatedStreets.compactMap { street -> Candidate? in
             let wasCovered = (existingCoverage[street.id]?.coveredPoints ?? 0) > 0 ||
                 (existingCoverage[street.id]?.percentage ?? 0) > 0
             guard !wasCovered, let coordinate = representativeCoordinate(for: street) else { return nil }
+            guard bounds.contains(coordinate) else { return nil }
 
             let distance = startLocation.distance(from: CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude))
-            guard distance <= 7_500 else { return nil }
+            guard distance <= searchRadius else { return nil }
+            let bearingSector = bearingSector(from: start, to: coordinate)
+            let distanceBand = Int(distance / 650)
 
             return Candidate(
                 streetID: street.id,
                 streetName: street.name,
                 district: street.district,
                 coordinate: coordinate,
-                distanceFromStart: distance
+                distanceFromStart: distance,
+                bearingSector: bearingSector,
+                distanceBand: distanceBand,
+                localOpportunityScore: 0
+            )
+        }
+
+        let opportunityByBucket = Dictionary(grouping: rawCandidates) { candidate in
+            "\(candidate.bearingSector):\(candidate.distanceBand)"
+        }
+        .mapValues { $0.count }
+
+        return rawCandidates.map { candidate in
+            let neighboringScore = (-1...1).reduce(0) { total, sectorOffset in
+                let sector = (candidate.bearingSector + sectorOffset + 12) % 12
+                return total + (-1...1).reduce(0) { bandTotal, bandOffset in
+                    bandTotal + opportunityByBucket["\(sector):\(candidate.distanceBand + bandOffset)", default: 0]
+                }
+            }
+
+            return Candidate(
+                streetID: candidate.streetID,
+                streetName: candidate.streetName,
+                district: candidate.district,
+                coordinate: candidate.coordinate,
+                distanceFromStart: candidate.distanceFromStart,
+                bearingSector: candidate.bearingSector,
+                distanceBand: candidate.distanceBand,
+                localOpportunityScore: neighboringScore
             )
         }
         .sorted {
-            if abs($0.distanceFromStart - $1.distanceFromStart) > 250 {
-                return $0.distanceFromStart < $1.distanceFromStart
+            if $0.localOpportunityScore != $1.localOpportunityScore {
+                return $0.localOpportunityScore > $1.localOpportunityScore
+            }
+            if abs($0.distanceFromStart - $1.distanceFromStart) > 180 {
+                return $0.distanceFromStart > $1.distanceFromStart
             }
             return $0.streetName.localizedCaseInsensitiveCompare($1.streetName) == .orderedAscending
         }
-        .prefix(360)
+        .prefix(180)
         .map { $0 }
+    }
+
+    private static func focusedCandidates(_ candidates: [Candidate], shape: SmartRouteShape) -> [Candidate] {
+        guard shape == .loop else {
+            return candidates.sorted {
+                if $0.localOpportunityScore != $1.localOpportunityScore {
+                    return $0.localOpportunityScore > $1.localOpportunityScore
+                }
+                return $0.distanceFromStart < $1.distanceFromStart
+            }
+        }
+
+        let bestSector = Dictionary(grouping: candidates, by: { $0.bearingSector })
+            .map { sector, values in
+                (sector: sector, score: values.prefix(18).reduce(0) { $0 + $1.localOpportunityScore })
+            }
+            .max { $0.score < $1.score }?
+            .sector
+
+        guard let bestSector else { return candidates }
+
+        let focused = candidates
+            .filter { candidate in
+                let clockwiseDistance = abs(candidate.bearingSector - bestSector)
+                let wrappedDistance = min(clockwiseDistance, 12 - clockwiseDistance)
+                return wrappedDistance <= 1
+            }
+            .sorted {
+                if $0.distanceBand != $1.distanceBand {
+                    return $0.distanceBand < $1.distanceBand
+                }
+                if $0.localOpportunityScore != $1.localOpportunityScore {
+                    return $0.localOpportunityScore > $1.localOpportunityScore
+                }
+                return $0.streetName.localizedCaseInsensitiveCompare($1.streetName) == .orderedAscending
+            }
+
+        return focused.isEmpty ? candidates : focused
     }
 
     private static func representativeCoordinate(for street: ConsolidatedStreet) -> CLLocationCoordinate2D? {
@@ -1707,6 +1826,31 @@ private enum SmartRouteSuggestionEngine {
     ) -> CLLocationDistance {
         CLLocation(latitude: from.latitude, longitude: from.longitude)
             .distance(from: CLLocation(latitude: to.latitude, longitude: to.longitude))
+    }
+
+    private static func bearingSector(from start: CLLocationCoordinate2D, to end: CLLocationCoordinate2D) -> Int {
+        let lat1 = start.latitude * .pi / 180
+        let lat2 = end.latitude * .pi / 180
+        let deltaLon = (end.longitude - start.longitude) * .pi / 180
+        let y = sin(deltaLon) * cos(lat2)
+        let x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(deltaLon)
+        let bearing = atan2(y, x) * 180 / .pi
+        let normalized = bearing >= 0 ? bearing : bearing + 360
+        return min(11, Int(normalized / 30))
+    }
+
+    private static func coordinateBounds(
+        around coordinate: CLLocationCoordinate2D,
+        radiusMeters: CLLocationDistance
+    ) -> CoordinateBounds {
+        let latDelta = radiusMeters / 111_000
+        let lonDelta = radiusMeters / max(1, 111_000 * cos(coordinate.latitude * .pi / 180))
+        return CoordinateBounds(
+            minLat: coordinate.latitude - latDelta,
+            maxLat: coordinate.latitude + latDelta,
+            minLon: coordinate.longitude - lonDelta,
+            maxLon: coordinate.longitude + lonDelta
+        )
     }
 }
 
@@ -1936,6 +2080,7 @@ private struct PlannedRouteStats {
         existingCoverage: [String: ConsolidatedStreet.CoverageResult]
     ) -> [String] {
         guard coordinates.count >= 2, !consolidatedStreets.isEmpty else { return [] }
+        guard let bounds = coordinateBounds(for: coordinates)?.expanded(byMeters: 90) else { return [] }
 
         let plannedRoute = Route(
             coordinates: sampledPath(from: coordinates, maxStepMeters: 25),
@@ -1949,6 +2094,8 @@ private struct PlannedRouteStats {
         for street in consolidatedStreets {
             let wasCovered = (existingCoverage[street.id]?.coveredPoints ?? 0) > 0
             guard !wasCovered else { continue }
+            guard let streetBounds = coordinateBounds(for: street.allCoordinates),
+                  bounds.intersects(streetBounds) else { continue }
 
             let plannedCoverage = street.calculateCoverage(using: checker, densify: false)
             if plannedCoverage.coveredPoints > 0 {
@@ -1957,6 +2104,40 @@ private struct PlannedRouteStats {
         }
 
         return sorted(names)
+    }
+
+    private static func coordinateBounds(for coordinates: [CLLocationCoordinate2D]) -> CoordinateBounds? {
+        guard let first = coordinates.first else { return nil }
+        var minLat = first.latitude
+        var maxLat = first.latitude
+        var minLon = first.longitude
+        var maxLon = first.longitude
+
+        for coordinate in coordinates.dropFirst() {
+            minLat = min(minLat, coordinate.latitude)
+            maxLat = max(maxLat, coordinate.latitude)
+            minLon = min(minLon, coordinate.longitude)
+            maxLon = max(maxLon, coordinate.longitude)
+        }
+
+        return CoordinateBounds(minLat: minLat, maxLat: maxLat, minLon: minLon, maxLon: maxLon)
+    }
+
+    private static func coordinateBounds(for coordinates: [BerlinStreets.SimpleCoordinate]) -> CoordinateBounds? {
+        guard let first = coordinates.first else { return nil }
+        var minLat = first.lat
+        var maxLat = first.lat
+        var minLon = first.lon
+        var maxLon = first.lon
+
+        for coordinate in coordinates.dropFirst() {
+            minLat = min(minLat, coordinate.lat)
+            maxLat = max(maxLat, coordinate.lat)
+            minLon = min(minLon, coordinate.lon)
+            maxLon = max(maxLon, coordinate.lon)
+        }
+
+        return CoordinateBounds(minLat: minLat, maxLat: maxLat, minLon: minLon, maxLon: maxLon)
     }
 
     static func sampledPath(from coordinates: [CLLocationCoordinate2D], maxStepMeters: Double) -> [CLLocationCoordinate2D] {
