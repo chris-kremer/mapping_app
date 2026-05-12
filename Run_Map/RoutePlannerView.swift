@@ -26,11 +26,6 @@ struct RoutePlannerView: View {
     @State private var simulationStats = PlanSimulationStats.empty
     @State private var isComputingSimulation = false
     @State private var savedPlanSort: SavedPlanSortMode = .distance
-    @State private var suggestionDistance: SmartRouteDistance = .fiveK
-    @State private var suggestionShape: SmartRouteShape = .loop
-    @State private var isGeneratingSuggestion = false
-    @State private var suggestionMessage: String?
-
     private var waypointSignature: String {
         waypoints
             .map { "\(String(format: "%.5f", $0.latitude)),\(String(format: "%.5f", $0.longitude))" }
@@ -230,7 +225,6 @@ struct RoutePlannerView: View {
                 }
 
                 simulationSection
-                smartRouteSuggestionSection
 
                 if isSimulationMode {
                     EmptyView()
@@ -302,52 +296,6 @@ struct RoutePlannerView: View {
             }
             .buttonStyle(.bordered)
             .accessibilityLabel("New Plan")
-        }
-        .padding(10)
-        .background(Color(.secondarySystemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var smartRouteSuggestionSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label("Smart Suggestion", systemImage: "sparkles")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                Spacer()
-                if isGeneratingSuggestion {
-                    ProgressView()
-                        .scaleEffect(0.85)
-                }
-            }
-
-            Picker("Distance", selection: $suggestionDistance) {
-                ForEach(SmartRouteDistance.allCases) { distance in
-                    Text(distance.title).tag(distance)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            Picker("Shape", selection: $suggestionShape) {
-                ForEach(SmartRouteShape.allCases) { shape in
-                    Text(shape.title).tag(shape)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            Button {
-                generateSmartRouteSuggestion()
-            } label: {
-                Label("Find Route", systemImage: "wand.and.stars")
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(isGeneratingSuggestion || plannerConsolidatedStreets.isEmpty)
-
-            if let suggestionMessage {
-                Text(suggestionMessage)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
         }
         .padding(10)
         .background(Color(.secondarySystemBackground))
@@ -647,45 +595,6 @@ struct RoutePlannerView: View {
             DispatchQueue.main.async {
                 stats = calculated
                 isComputingStats = false
-            }
-        }
-    }
-
-    private func generateSmartRouteSuggestion() {
-        let streets = plannerConsolidatedStreets
-        let existingCoverage = streetCoverageByID
-        let start = initialRegion.center
-        let distanceKm = suggestionDistance.kilometers
-        let shape = suggestionShape
-
-        guard !streets.isEmpty else {
-            suggestionMessage = "Street coverage data is still loading."
-            return
-        }
-
-        isGeneratingSuggestion = true
-        suggestionMessage = nil
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let suggestion = SmartRouteSuggestionEngine.generate(
-                start: start,
-                targetDistanceKm: distanceKm,
-                shape: shape,
-                consolidatedStreets: streets,
-                existingCoverage: existingCoverage
-            )
-
-            DispatchQueue.main.async {
-                isGeneratingSuggestion = false
-                guard let suggestion else {
-                    suggestionMessage = "No useful uncovered streets found nearby."
-                    return
-                }
-
-                plannerMode = .new
-                waypoints = suggestion.coordinates
-                focusRequestID = UUID()
-                suggestionMessage = "\(suggestion.newStreetCount) likely new streets over \(String(format: "%.1f", suggestion.distanceKm)) km"
             }
         }
     }
@@ -1260,53 +1169,6 @@ private enum SavedPlanSortMode: String, CaseIterable, Identifiable {
     }
 }
 
-private enum SmartRouteDistance: String, CaseIterable, Identifiable {
-    case fiveK
-    case tenK
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .fiveK:
-            return "5k"
-        case .tenK:
-            return "10k"
-        }
-    }
-
-    var kilometers: Double {
-        switch self {
-        case .fiveK:
-            return 5
-        case .tenK:
-            return 10
-        }
-    }
-}
-
-private enum SmartRouteShape: String, CaseIterable, Identifiable {
-    case loop
-    case oneWay
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .loop:
-            return "Loop"
-        case .oneWay:
-            return "One-way"
-        }
-    }
-}
-
-private struct SmartRouteSuggestion {
-    let coordinates: [CLLocationCoordinate2D]
-    let distanceKm: Double
-    let newStreetCount: Int
-}
-
 private struct CoordinateBounds {
     let minLat: Double
     let maxLat: Double
@@ -1621,236 +1483,6 @@ private enum RouteAchievementPreviewBuilder {
         let checker = FastStreetChecker(routes: routes)
         let coveredPointCount = checker.checkStreetCoverage(streetCoords: mauerwegCoordinates).filter { $0 }.count
         return (Double(coveredPointCount) / Double(mauerwegCoordinates.count)) * 100.0
-    }
-}
-
-private enum SmartRouteSuggestionEngine {
-    private struct Candidate {
-        let streetID: String
-        let streetName: String
-        let district: String
-        let coordinate: CLLocationCoordinate2D
-        let distanceFromStart: CLLocationDistance
-        let bearingSector: Int
-        let distanceBand: Int
-        let localOpportunityScore: Int
-    }
-
-    static func generate(
-        start: CLLocationCoordinate2D,
-        targetDistanceKm: Double,
-        shape: SmartRouteShape,
-        consolidatedStreets: [ConsolidatedStreet],
-        existingCoverage: [String: ConsolidatedStreet.CoverageResult]
-    ) -> SmartRouteSuggestion? {
-        let candidates = uncoveredCandidates(
-            start: start,
-            targetDistanceKm: targetDistanceKm,
-            shape: shape,
-            consolidatedStreets: consolidatedStreets,
-            existingCoverage: existingCoverage
-        )
-        guard !candidates.isEmpty else { return nil }
-
-        let targetMeters = targetDistanceKm * 1_000
-        let maxMeters = targetMeters * 1.22
-        var waypoints = [start]
-        var current = start
-        var usedStreetIDs = Set<String>()
-        let routeCandidates = focusedCandidates(candidates, shape: shape)
-
-        for candidate in routeCandidates {
-            guard !usedStreetIDs.contains(candidate.streetID) else { continue }
-
-            let addedMeters = distanceMeters(from: current, to: candidate.coordinate)
-            let returnMeters = shape == .loop ? distanceMeters(from: candidate.coordinate, to: start) : 0
-            let currentMeters = routeDistanceMeters(waypoints)
-            guard addedMeters >= 80 || waypoints.count == 1 else { continue }
-
-            if currentMeters + addedMeters + returnMeters > maxMeters {
-                continue
-            }
-
-            waypoints.append(candidate.coordinate)
-            usedStreetIDs.insert(candidate.streetID)
-            current = candidate.coordinate
-
-            if currentMeters + addedMeters + returnMeters >= targetMeters * 0.86 {
-                break
-            }
-        }
-
-        if shape == .loop, waypoints.count > 1 {
-            waypoints.append(start)
-        }
-
-        guard waypoints.count >= 2, !usedStreetIDs.isEmpty else { return nil }
-        return SmartRouteSuggestion(
-            coordinates: waypoints,
-            distanceKm: PlannedRouteStats.totalDistanceKm(for: waypoints),
-            newStreetCount: usedStreetIDs.count
-        )
-    }
-
-    private static func uncoveredCandidates(
-        start: CLLocationCoordinate2D,
-        targetDistanceKm: Double,
-        shape: SmartRouteShape,
-        consolidatedStreets: [ConsolidatedStreet],
-        existingCoverage: [String: ConsolidatedStreet.CoverageResult]
-    ) -> [Candidate] {
-        let startLocation = CLLocation(latitude: start.latitude, longitude: start.longitude)
-        let targetMeters = targetDistanceKm * 1_000
-        let searchRadius = shape == .loop
-            ? max(2_200, min(5_200, targetMeters * 0.55))
-            : max(3_000, min(10_000, targetMeters * 1.05))
-        let bounds = coordinateBounds(around: start, radiusMeters: searchRadius)
-
-        let rawCandidates = consolidatedStreets.compactMap { street -> Candidate? in
-            let wasCovered = (existingCoverage[street.id]?.coveredPoints ?? 0) > 0 ||
-                (existingCoverage[street.id]?.percentage ?? 0) > 0
-            guard !wasCovered, let coordinate = representativeCoordinate(for: street) else { return nil }
-            guard bounds.contains(coordinate) else { return nil }
-
-            let distance = startLocation.distance(from: CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude))
-            guard distance <= searchRadius else { return nil }
-            let bearingSector = bearingSector(from: start, to: coordinate)
-            let distanceBand = Int(distance / 650)
-
-            return Candidate(
-                streetID: street.id,
-                streetName: street.name,
-                district: street.district,
-                coordinate: coordinate,
-                distanceFromStart: distance,
-                bearingSector: bearingSector,
-                distanceBand: distanceBand,
-                localOpportunityScore: 0
-            )
-        }
-
-        let opportunityByBucket = Dictionary(grouping: rawCandidates) { candidate in
-            "\(candidate.bearingSector):\(candidate.distanceBand)"
-        }
-        .mapValues { $0.count }
-
-        return rawCandidates.map { candidate in
-            let neighboringScore = (-1...1).reduce(0) { total, sectorOffset in
-                let sector = (candidate.bearingSector + sectorOffset + 12) % 12
-                return total + (-1...1).reduce(0) { bandTotal, bandOffset in
-                    bandTotal + opportunityByBucket["\(sector):\(candidate.distanceBand + bandOffset)", default: 0]
-                }
-            }
-
-            return Candidate(
-                streetID: candidate.streetID,
-                streetName: candidate.streetName,
-                district: candidate.district,
-                coordinate: candidate.coordinate,
-                distanceFromStart: candidate.distanceFromStart,
-                bearingSector: candidate.bearingSector,
-                distanceBand: candidate.distanceBand,
-                localOpportunityScore: neighboringScore
-            )
-        }
-        .sorted {
-            if $0.localOpportunityScore != $1.localOpportunityScore {
-                return $0.localOpportunityScore > $1.localOpportunityScore
-            }
-            if abs($0.distanceFromStart - $1.distanceFromStart) > 180 {
-                return $0.distanceFromStart > $1.distanceFromStart
-            }
-            return $0.streetName.localizedCaseInsensitiveCompare($1.streetName) == .orderedAscending
-        }
-        .prefix(180)
-        .map { $0 }
-    }
-
-    private static func focusedCandidates(_ candidates: [Candidate], shape: SmartRouteShape) -> [Candidate] {
-        guard shape == .loop else {
-            return candidates.sorted {
-                if $0.localOpportunityScore != $1.localOpportunityScore {
-                    return $0.localOpportunityScore > $1.localOpportunityScore
-                }
-                return $0.distanceFromStart < $1.distanceFromStart
-            }
-        }
-
-        let bestSector = Dictionary(grouping: candidates, by: { $0.bearingSector })
-            .map { sector, values in
-                (sector: sector, score: values.prefix(18).reduce(0) { $0 + $1.localOpportunityScore })
-            }
-            .max { $0.score < $1.score }?
-            .sector
-
-        guard let bestSector else { return candidates }
-
-        let focused = candidates
-            .filter { candidate in
-                let clockwiseDistance = abs(candidate.bearingSector - bestSector)
-                let wrappedDistance = min(clockwiseDistance, 12 - clockwiseDistance)
-                return wrappedDistance <= 1
-            }
-            .sorted {
-                if $0.distanceBand != $1.distanceBand {
-                    return $0.distanceBand < $1.distanceBand
-                }
-                if $0.localOpportunityScore != $1.localOpportunityScore {
-                    return $0.localOpportunityScore > $1.localOpportunityScore
-                }
-                return $0.streetName.localizedCaseInsensitiveCompare($1.streetName) == .orderedAscending
-            }
-
-        return focused.isEmpty ? candidates : focused
-    }
-
-    private static func representativeCoordinate(for street: ConsolidatedStreet) -> CLLocationCoordinate2D? {
-        let coordinates = street.allCoordinates
-        guard !coordinates.isEmpty else { return nil }
-        let coordinate = coordinates[coordinates.count / 2]
-        return CLLocationCoordinate2D(latitude: coordinate.lat, longitude: coordinate.lon)
-    }
-
-    private static func routeDistanceMeters(_ coordinates: [CLLocationCoordinate2D]) -> CLLocationDistance {
-        guard coordinates.count >= 2 else { return 0 }
-        var total: CLLocationDistance = 0
-        for index in 0..<(coordinates.count - 1) {
-            total += distanceMeters(from: coordinates[index], to: coordinates[index + 1])
-        }
-        return total
-    }
-
-    private static func distanceMeters(
-        from: CLLocationCoordinate2D,
-        to: CLLocationCoordinate2D
-    ) -> CLLocationDistance {
-        CLLocation(latitude: from.latitude, longitude: from.longitude)
-            .distance(from: CLLocation(latitude: to.latitude, longitude: to.longitude))
-    }
-
-    private static func bearingSector(from start: CLLocationCoordinate2D, to end: CLLocationCoordinate2D) -> Int {
-        let lat1 = start.latitude * .pi / 180
-        let lat2 = end.latitude * .pi / 180
-        let deltaLon = (end.longitude - start.longitude) * .pi / 180
-        let y = sin(deltaLon) * cos(lat2)
-        let x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(deltaLon)
-        let bearing = atan2(y, x) * 180 / .pi
-        let normalized = bearing >= 0 ? bearing : bearing + 360
-        return min(11, Int(normalized / 30))
-    }
-
-    private static func coordinateBounds(
-        around coordinate: CLLocationCoordinate2D,
-        radiusMeters: CLLocationDistance
-    ) -> CoordinateBounds {
-        let latDelta = radiusMeters / 111_000
-        let lonDelta = radiusMeters / max(1, 111_000 * cos(coordinate.latitude * .pi / 180))
-        return CoordinateBounds(
-            minLat: coordinate.latitude - latDelta,
-            maxLat: coordinate.latitude + latDelta,
-            minLon: coordinate.longitude - lonDelta,
-            maxLon: coordinate.longitude + lonDelta
-        )
     }
 }
 
