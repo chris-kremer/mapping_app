@@ -136,7 +136,6 @@ struct RoutePlannerView: View {
                     }
                     .toggleStyle(.switch)
                     .font(.subheadline)
-                    .disabled(consolidatedStreets.isEmpty || streetCoverageByID.isEmpty)
                 }
 
                 if waypoints.count < 2 {
@@ -426,10 +425,19 @@ private struct PlannerMapView: UIViewRepresentable {
                 mapView.addOverlay(polyline)
             }
 
-            for (index, coordinate) in waypoints.enumerated() {
+            if let first = waypoints.first {
                 let annotation = PlanWaypointAnnotation()
-                annotation.coordinate = coordinate
-                annotation.title = "\(index + 1)"
+                annotation.coordinate = first
+                annotation.title = "Start"
+                annotation.glyph = "S"
+                annotations.append(annotation)
+            }
+
+            if waypoints.count > 1, let last = waypoints.last {
+                let annotation = PlanWaypointAnnotation()
+                annotation.coordinate = last
+                annotation.title = "Finish"
+                annotation.glyph = "F"
                 annotations.append(annotation)
             }
 
@@ -467,14 +475,16 @@ private struct PlannerMapView: UIViewRepresentable {
                 ?? MKMarkerAnnotationView(annotation: annotation, reuseIdentifier: identifier)
             view.annotation = annotation
             view.markerTintColor = .systemPurple
-            view.glyphText = annotation.title ?? ""
+            view.glyphText = (annotation as? PlanWaypointAnnotation)?.glyph
             view.canShowCallout = false
             return view
         }
     }
 }
 
-private final class PlanWaypointAnnotation: MKPointAnnotation {}
+private final class PlanWaypointAnnotation: MKPointAnnotation {
+    var glyph: String?
+}
 private final class PlannedRoutePolyline: MKPolyline {}
 
 private struct SavedRoutePlan: Identifiable, Codable {
