@@ -552,15 +552,9 @@ struct MonthlyGoalProgressSection: View {
     let streetCoverageByID: [String: ConsolidatedStreet.CoverageResult]
 
     @State private var goals = MonthlyGoalStore.load()
-
-    private var report: MonthlyRecapReport {
-        MonthlyRecapGenerator.currentMonthReport(
-            routes: routes,
-            achievements: achievements,
-            consolidatedStreets: consolidatedStreets,
-            streetCoverageByID: streetCoverageByID
-        )
-    }
+    @State private var report: MonthlyRecapReport?
+    @State private var distanceOnlyProgress: Double?
+    @State private var isLoadingReport = false
 
     var body: some View {
         if goals.hasAnyGoal {
@@ -569,14 +563,26 @@ struct MonthlyGoalProgressSection: View {
                     .font(.title2)
                     .fontWeight(.bold)
 
-                if let target = goals.distanceKm {
-                    progressRow(title: "Distance", current: report.distanceKm, target: target, suffix: "km")
-                }
-                if let target = goals.newStreetCount {
-                    progressRow(title: "New streets", current: Double(report.newStreetNames.count), target: Double(target), suffix: "")
-                }
-                if let target = goals.newDistrictCount {
-                    progressRow(title: "New districts", current: Double(report.newDistrictNames.count), target: Double(target), suffix: "")
+                if let report {
+                    if let target = goals.distanceKm {
+                        progressRow(title: "Distance", current: report.distanceKm, target: target, suffix: "km")
+                    }
+                    if let target = goals.newStreetCount {
+                        progressRow(title: "New streets", current: Double(report.newStreetNames.count), target: Double(target), suffix: "")
+                    }
+                    if let target = goals.newDistrictCount {
+                        progressRow(title: "New districts", current: Double(report.newDistrictNames.count), target: Double(target), suffix: "")
+                    }
+                } else if let distanceOnlyProgress, let target = goals.distanceKm {
+                    progressRow(title: "Distance", current: distanceOnlyProgress, target: target, suffix: "km")
+                } else {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                        Text("Calculating goal progress")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
             .padding()
@@ -585,8 +591,52 @@ struct MonthlyGoalProgressSection: View {
             .padding(.horizontal)
             .onAppear {
                 goals = MonthlyGoalStore.load()
+                generateReportIfNeeded()
             }
         }
+    }
+
+    private func generateReportIfNeeded() {
+        guard goals.hasAnyGoal, !isLoadingReport, report == nil, distanceOnlyProgress == nil else { return }
+        isLoadingReport = true
+
+        let routes = routes
+        let achievements = achievements
+        let consolidatedStreets = consolidatedStreets
+        let streetCoverageByID = streetCoverageByID
+        let needsStreetProgress = goals.newStreetCount != nil || goals.newDistrictCount != nil
+
+        DispatchQueue.global(qos: .utility).async {
+            guard needsStreetProgress else {
+                let distanceKm = Self.currentMonthDistance(routes: routes)
+                DispatchQueue.main.async {
+                    self.distanceOnlyProgress = distanceKm
+                    self.isLoadingReport = false
+                }
+                return
+            }
+
+            let generatedReport = MonthlyRecapGenerator.currentMonthReport(
+                routes: routes,
+                achievements: achievements,
+                consolidatedStreets: consolidatedStreets,
+                streetCoverageByID: streetCoverageByID
+            )
+
+            DispatchQueue.main.async {
+                self.report = generatedReport
+                self.isLoadingReport = false
+            }
+        }
+    }
+
+    private static func currentMonthDistance(routes: [Route]) -> Double {
+        let calendar = Calendar.current
+        guard let interval = calendar.dateInterval(of: .month, for: Date()) else { return 0 }
+        return routes
+            .filter { interval.contains($0.date) }
+            .map(\.distanceKm)
+            .reduce(0, +)
     }
 
     private func progressRow(title: String, current: Double, target: Double, suffix: String) -> some View {
