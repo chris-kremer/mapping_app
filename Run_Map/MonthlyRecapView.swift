@@ -300,45 +300,17 @@ struct MonthlyRecapView: View {
     @State private var draftDistance = ""
     @State private var draftStreets = ""
     @State private var draftDistricts = ""
-
-    private var report: MonthlyRecapReport {
-        MonthlyRecapGenerator.previousMonthReport(
-            routes: routes,
-            achievements: achievements,
-            consolidatedStreets: consolidatedStreets,
-            streetCoverageByID: streetCoverageByID
-        )
-    }
+    @State private var report: MonthlyRecapReport?
+    @State private var isGeneratingReport = false
 
     var body: some View {
         NavigationView {
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    header
-
-                    if !report.routes.isEmpty {
-                        MonthlyRecapRouteMap(routes: report.routes)
-                            .frame(height: 240)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-
-                    if report.workoutCount > 0 {
-                        workoutSummary
-                    } else {
-                        Text("No workouts recorded for this month.")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                    }
-                    comparisonSection
-                    locationSection(title: "New Countries", values: report.newCountries)
-                    locationSection(title: "New Cities", values: report.newCities)
-                    locationSection(title: "New Berlin Districts", values: report.newDistrictNames)
-                    locationSection(title: "New Berlin Stadtteile", values: report.newStadtteilNames)
-                    locationSection(title: "New Berlin Streets", values: report.newStreetNames, limit: 10)
-                    achievementSection
-                    goalsEditor
+                if let report {
+                    reportContent(report)
+                } else {
+                    loadingReportView
                 }
-                .padding()
             }
             .navigationTitle("Monthly Recap")
             .navigationBarTitleDisplayMode(.inline)
@@ -351,12 +323,80 @@ struct MonthlyRecapView: View {
                 draftDistance = goals.distanceKm.map { String(format: "%.0f", $0) } ?? ""
                 draftStreets = goals.newStreetCount.map(String.init) ?? ""
                 draftDistricts = goals.newDistrictCount.map(String.init) ?? ""
+                generateReportIfNeeded()
             }
         }
         .navigationViewStyle(.stack)
     }
 
-    private var header: some View {
+    private func reportContent(_ report: MonthlyRecapReport) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header(report)
+
+            if !report.routes.isEmpty {
+                MonthlyRecapRouteMap(routes: report.routes)
+                    .frame(height: 240)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+
+            if report.workoutCount > 0 {
+                workoutSummary(report)
+            } else {
+                Text("No workouts recorded for this month.")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            }
+            comparisonSection(report)
+            locationSection(title: "New Countries", values: report.newCountries)
+            locationSection(title: "New Cities", values: report.newCities)
+            locationSection(title: "New Berlin Districts", values: report.newDistrictNames)
+            locationSection(title: "New Berlin Stadtteile", values: report.newStadtteilNames)
+            locationSection(title: "New Berlin Streets", values: report.newStreetNames, limit: 10)
+            achievementSection(report)
+            goalsEditor
+        }
+        .padding()
+    }
+
+    private var loadingReportView: some View {
+        VStack(spacing: 14) {
+            ProgressView()
+            Text("Building monthly report")
+                .font(.headline)
+            Text("This can take a moment with street coverage enabled.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 60)
+        .padding(.horizontal)
+    }
+
+    private func generateReportIfNeeded() {
+        guard !isGeneratingReport, report == nil else { return }
+        isGeneratingReport = true
+
+        let routes = routes
+        let achievements = achievements
+        let consolidatedStreets = consolidatedStreets
+        let streetCoverageByID = streetCoverageByID
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let generatedReport = MonthlyRecapGenerator.previousMonthReport(
+                routes: routes,
+                achievements: achievements,
+                consolidatedStreets: consolidatedStreets,
+                streetCoverageByID: streetCoverageByID
+            )
+
+            DispatchQueue.main.async {
+                self.report = generatedReport
+                self.isGeneratingReport = false
+            }
+        }
+    }
+
+    private func header(_ report: MonthlyRecapReport) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(report.title)
                 .font(.largeTitle)
@@ -367,7 +407,7 @@ struct MonthlyRecapView: View {
         }
     }
 
-    private var workoutSummary: some View {
+    private func workoutSummary(_ report: MonthlyRecapReport) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Workouts")
                 .font(.headline)
@@ -387,7 +427,7 @@ struct MonthlyRecapView: View {
     }
 
     @ViewBuilder
-    private var comparisonSection: some View {
+    private func comparisonSection(_ report: MonthlyRecapReport) -> some View {
         if let text = report.distanceComparisonText {
             Text(text)
                 .font(.subheadline)
@@ -421,7 +461,7 @@ struct MonthlyRecapView: View {
     }
 
     @ViewBuilder
-    private var achievementSection: some View {
+    private func achievementSection(_ report: MonthlyRecapReport) -> some View {
         if !report.achievementsUnlocked.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Achievements")
