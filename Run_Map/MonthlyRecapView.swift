@@ -303,6 +303,7 @@ struct MonthlyRecapView: View {
     @State private var report: MonthlyRecapReport?
     @State private var isGeneratingReport = false
     @State private var didSaveGoals = false
+    @State private var skeletonPulse = false
 
     var body: some View {
         NavigationView {
@@ -363,17 +364,43 @@ struct MonthlyRecapView: View {
     }
 
     private var loadingReportView: some View {
-        VStack(spacing: 14) {
-            ProgressView()
-            Text("Building monthly report")
-                .font(.headline)
-            Text("This can take a moment with street coverage enabled.")
-                .font(.caption)
-                .foregroundColor(.secondary)
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(loadingReportTitle)
+                    .font(.largeTitle)
+                    .fontWeight(.bold)
+                Text("Full monthly report")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            }
+
+            skeletonBox(height: 240, cornerRadius: 10)
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Workouts")
+                    .font(.headline)
+                HStack(spacing: 10) {
+                    skeletonMetric(title: "Total", color: .blue)
+                    skeletonMetric(title: "Runs", color: .green)
+                    skeletonMetric(title: "Walks", color: .cyan)
+                    skeletonMetric(title: "Distance", color: .purple)
+                }
+            }
+
+            skeletonBox(height: 42, cornerRadius: 8)
+
+            skeletonListSection(title: "New Countries", lineCount: 2)
+            skeletonListSection(title: "New Cities", lineCount: 2)
+            skeletonListSection(title: "New Berlin Streets", lineCount: 4)
+
+            goalsEditor
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 60)
-        .padding(.horizontal)
+        .padding()
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                skeletonPulse = true
+            }
+        }
     }
 
     private func generateReportIfNeeded() {
@@ -529,6 +556,45 @@ struct MonthlyRecapView: View {
         .padding(10)
         .background(color.opacity(0.12))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var loadingReportTitle: String {
+        let calendar = Calendar.current
+        let currentStart = calendar.dateInterval(of: .month, for: Date())?.start ?? Date()
+        let previousStart = calendar.date(byAdding: .month, value: -1, to: currentStart) ?? currentStart
+        let formatter = DateFormatter()
+        formatter.dateFormat = "LLLL yyyy"
+        return formatter.string(from: previousStart)
+    }
+
+    private func skeletonMetric(title: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            skeletonBox(width: 54, height: 14, cornerRadius: 4)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(color.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func skeletonListSection(title: String, lineCount: Int) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.headline)
+            ForEach(0..<lineCount, id: \.self) { index in
+                skeletonBox(width: index.isMultiple(of: 2) ? 170 : 220, height: 12, cornerRadius: 4)
+            }
+        }
+    }
+
+    private func skeletonBox(width: CGFloat? = nil, height: CGFloat, cornerRadius: CGFloat) -> some View {
+        RoundedRectangle(cornerRadius: cornerRadius)
+            .fill(Color(.systemGray4).opacity(skeletonPulse ? 0.55 : 0.28))
+            .frame(width: width, height: height)
+            .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
     }
 
     private func goalField(title: String, text: Binding<String>, keyboard: UIKeyboardType) -> some View {
