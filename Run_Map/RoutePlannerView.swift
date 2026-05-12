@@ -20,6 +20,10 @@ struct RoutePlannerView: View {
     @State private var fallbackConsolidatedStreets: [ConsolidatedStreet] = []
     @State private var savedPlanPreviews: [UUID: SavedPlanPreview] = [:]
     @State private var plannerMode: PlannerMode = .new
+    @State private var isSimulationMode = false
+    @State private var simulatedPlanIDs: Set<UUID> = []
+    @State private var simulationStats = PlanSimulationStats.empty
+    @State private var isComputingSimulation = false
 
     private var waypointSignature: String {
         waypoints
@@ -41,11 +45,18 @@ struct RoutePlannerView: View {
     }
 
     private var canEditWaypoints: Bool {
-        plannerMode.canEditWaypoints
+        plannerMode.canEditWaypoints && !isSimulationMode
     }
 
     private var mapHintText: String {
-        canEditWaypoints ? "Tap the map to add waypoints" : "Viewing saved plan"
+        if isSimulationMode {
+            return "Simulation mode"
+        }
+        return canEditWaypoints ? "Tap the map to add waypoints" : "Viewing saved plan"
+    }
+
+    private var simulatedPlans: [SavedRoutePlan] {
+        savedPlans.filter { simulatedPlanIDs.contains($0.id) }
     }
 
     var body: some View {
@@ -58,6 +69,8 @@ struct RoutePlannerView: View {
                     consolidatedStreets: plannerConsolidatedStreets,
                     streetCoverageByID: streetCoverageByID,
                     focusRequestID: focusRequestID,
+                    isSimulationMode: isSimulationMode,
+                    simulationPlans: simulatedPlans.map(\.coordinates),
                     onAddWaypoint: { coordinate in
                         guard canEditWaypoints else { return }
                         waypoints.append(coordinate)
@@ -131,9 +144,11 @@ struct RoutePlannerView: View {
         .navigationViewStyle(.stack)
         .onAppear {
             savedPlans = SavedRoutePlanStore.load()
+            simulatedPlanIDs.formIntersection(Set(savedPlans.map(\.id)))
             loadFallbackStreetDataIfNeeded()
             recalculateStats()
             recalculateSavedPlanPreviews()
+            recalculateSimulationStats()
         }
         .onChange(of: waypointSignature) { _ in
             recalculateStats()
@@ -141,6 +156,15 @@ struct RoutePlannerView: View {
         .onChange(of: plannerDataSignature) { _ in
             recalculateStats()
             recalculateSavedPlanPreviews()
+            recalculateSimulationStats()
+        }
+        .onChange(of: isSimulationMode) { _ in
+            focusRequestID = UUID()
+            recalculateSimulationStats()
+        }
+        .onChange(of: simulatedPlanIDs) { _ in
+            focusRequestID = UUID()
+            recalculateSimulationStats()
         }
         .alert("Save Plan", isPresented: $showSavePlanDialog) {
             TextField("Title", text: $planTitle)
@@ -183,7 +207,11 @@ struct RoutePlannerView: View {
                     .font(.subheadline)
                 }
 
-                if waypoints.count < 2 {
+                simulationSection
+
+                if isSimulationMode {
+                    EmptyView()
+                } else if waypoints.count < 2 {
                     Text("Add at least two waypoints to preview route stats.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
@@ -254,6 +282,88 @@ struct RoutePlannerView: View {
         .padding(10)
         .background(Color(.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var simulationSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(isOn: $isSimulationMode) {
+                Label("Simulation Mode", systemImage: "point.3.connected.trianglepath.dotted")
+            }
+            .toggleStyle(.switch)
+            .font(.subheadline)
+
+            if isSimulationMode {
+                if savedPlans.isEmpty {
+                    Text("Save plans first to simulate route combinations.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    simulationStatsRow
+
+                    ForEach(savedPlans) { plan in
+                        Button {
+                            toggleSimulatedPlan(plan)
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: simulatedPlanIDs.contains(plan.id) ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(simulatedPlanIDs.contains(plan.id) ? .blue : .secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(plan.title)
+                                        .font(.subheadline)
+                                        .fontWeight(.medium)
+                                    Text(savedPlanPreviewText(for: plan))
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var simulationStatsRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("\(simulationStats.selectedPlanCount) selected")
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                Spacer()
+                if isComputingSimulation {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                }
+            }
+
+            HStack(spacing: 10) {
+                metricPill(
+                    title: "Distance",
+                    value: String(format: "%.1f km", simulationStats.distanceKm),
+                    color: .purple
+                )
+                metricPill(
+                    title: "Before",
+                    value: String(format: "%.1f%%", simulationStats.coverageBeforePercent),
+                    color: .orange
+                )
+                metricPill(
+                    title: "After",
+                    value: String(format: "%.1f%%", simulationStats.coverageAfterPercent),
+                    color: .green
+                )
+            }
+
+            Text("\(simulationStats.newStreetCount) projected new streets")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
     }
 
     private var modeTitle: String {
@@ -434,16 +544,19 @@ struct RoutePlannerView: View {
         plannerMode = .viewing(plan.id)
         SavedRoutePlanStore.save(savedPlans)
         recalculateSavedPlanPreviews()
+        recalculateSimulationStats()
     }
 
     private func deletePlan(_ plan: SavedRoutePlan) {
         savedPlans.removeAll { $0.id == plan.id }
+        simulatedPlanIDs.remove(plan.id)
         if plannerMode.selectedPlanID == plan.id {
             startNewPlan()
         }
         SavedRoutePlanStore.save(savedPlans)
         savedPlanPreviews[plan.id] = nil
         recalculateSavedPlanPreviews()
+        recalculateSimulationStats()
     }
 
     private func startNewPlan() {
@@ -482,6 +595,15 @@ struct RoutePlannerView: View {
         SavedRoutePlanStore.save(savedPlans)
         plannerMode = .viewing(planID)
         recalculateSavedPlanPreviews()
+        recalculateSimulationStats()
+    }
+
+    private func toggleSimulatedPlan(_ plan: SavedRoutePlan) {
+        if simulatedPlanIDs.contains(plan.id) {
+            simulatedPlanIDs.remove(plan.id)
+        } else {
+            simulatedPlanIDs.insert(plan.id)
+        }
     }
 
     private func savedPlanRowBackground(for plan: SavedRoutePlan) -> Color {
@@ -532,6 +654,32 @@ struct RoutePlannerView: View {
             }
         }
     }
+
+    private func recalculateSimulationStats() {
+        let plans = simulatedPlans
+        let streets = plannerConsolidatedStreets
+        let existingCoverage = streetCoverageByID
+
+        guard isSimulationMode, !plans.isEmpty else {
+            simulationStats = .empty
+            isComputingSimulation = false
+            return
+        }
+
+        isComputingSimulation = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let stats = PlanSimulationStats.calculate(
+                plans: plans,
+                consolidatedStreets: streets,
+                existingCoverage: existingCoverage
+            )
+
+            DispatchQueue.main.async {
+                simulationStats = stats
+                isComputingSimulation = false
+            }
+        }
+    }
 }
 
 private struct PlannerMapView: UIViewRepresentable {
@@ -541,6 +689,8 @@ private struct PlannerMapView: UIViewRepresentable {
     let consolidatedStreets: [ConsolidatedStreet]
     let streetCoverageByID: [String: ConsolidatedStreet.CoverageResult]
     let focusRequestID: UUID
+    let isSimulationMode: Bool
+    let simulationPlans: [[CLLocationCoordinate2D]]
     let onAddWaypoint: (CLLocationCoordinate2D) -> Void
 
     func makeUIView(context: Context) -> MKMapView {
@@ -563,11 +713,20 @@ private struct PlannerMapView: UIViewRepresentable {
             showCurrentStreetCoverage: showCurrentStreetCoverage,
             consolidatedStreets: consolidatedStreets,
             streetCoverageByID: streetCoverageByID,
-            waypoints: waypoints,
+            projectedPlans: isSimulationMode ? simulationPlans : [waypoints],
             on: mapView
         )
-        context.coordinator.render(waypoints: waypoints, on: mapView)
-        context.coordinator.focusIfNeeded(waypoints: waypoints, focusRequestID: focusRequestID, on: mapView)
+        context.coordinator.render(
+            waypoints: waypoints,
+            isSimulationMode: isSimulationMode,
+            simulationPlans: simulationPlans,
+            on: mapView
+        )
+        context.coordinator.focusIfNeeded(
+            waypoints: isSimulationMode ? simulationPlans.flatMap { $0 } : waypoints,
+            focusRequestID: focusRequestID,
+            on: mapView
+        )
     }
 
     func makeCoordinator() -> Coordinator {
@@ -585,6 +744,7 @@ private struct PlannerMapView: UIViewRepresentable {
         private weak var coveredStreetOverlay: MKMultiPolyline?
         private weak var uncoveredStreetOverlay: MKMultiPolyline?
         private weak var plannedStreetOverlay: MKMultiPolyline?
+        private weak var simulationPlanOverlay: MKMultiPolyline?
         private var coverageRenderGeneration = 0
 
         init(parent: PlannerMapView) {
@@ -602,11 +762,13 @@ private struct PlannerMapView: UIViewRepresentable {
             showCurrentStreetCoverage: Bool,
             consolidatedStreets: [ConsolidatedStreet],
             streetCoverageByID: [String: ConsolidatedStreet.CoverageResult],
-            waypoints: [CLLocationCoordinate2D],
+            projectedPlans: [[CLLocationCoordinate2D]],
             on mapView: MKMapView
         ) {
             let coveredStreetCount = streetCoverageByID.values.filter { $0.coveredPoints > 0 || $0.percentage > 0 }.count
-            let waypointSignature = Self.coordinateSignature(for: waypoints)
+            let waypointSignature = projectedPlans
+                .map { Self.coordinateSignature(for: $0) }
+                .joined(separator: "||")
             let signature = showCurrentStreetCoverage
                 ? "on:\(consolidatedStreets.count):\(streetCoverageByID.count):\(coveredStreetCount):\(waypointSignature)"
                 : "off"
@@ -632,7 +794,7 @@ private struct PlannerMapView: UIViewRepresentable {
                 let groups = Self.makeStreetCoveragePolylineGroups(
                     streets: streets,
                     coverageByID: streetCoverageByID,
-                    waypoints: waypoints
+                    projectedPlans: projectedPlans
                 )
 
                 DispatchQueue.main.async {
@@ -673,14 +835,14 @@ private struct PlannerMapView: UIViewRepresentable {
         private static func makeStreetCoveragePolylineGroups(
             streets: [ConsolidatedStreet],
             coverageByID: [String: ConsolidatedStreet.CoverageResult],
-            waypoints: [CLLocationCoordinate2D]
+            projectedPlans: [[CLLocationCoordinate2D]]
         ) -> (covered: [MKPolyline], uncovered: [MKPolyline], planned: [MKPolyline]) {
             var covered: [MKPolyline] = []
             var uncovered: [MKPolyline] = []
             var planned: [MKPolyline] = []
             covered.reserveCapacity(coverageByID.count)
 
-            let checker = makeRouteChecker(for: waypoints)
+            let checker = makeRouteChecker(for: projectedPlans)
 
             for street in streets {
                 let coverage = coverageByID[street.id]
@@ -705,15 +867,18 @@ private struct PlannerMapView: UIViewRepresentable {
             return (covered, uncovered, planned)
         }
 
-        private static func makeRouteChecker(for waypoints: [CLLocationCoordinate2D]) -> FastStreetChecker? {
-            guard waypoints.count >= 2 else { return nil }
-            let route = Route(
-                coordinates: PlannedRouteStats.sampledPath(from: waypoints, maxStepMeters: 25),
-                date: Date(),
-                workoutType: .walking,
-                durationSec: 0
-            )
-            return FastStreetChecker(routes: [route])
+        private static func makeRouteChecker(for plans: [[CLLocationCoordinate2D]]) -> FastStreetChecker? {
+            let routes = plans.compactMap { waypoints -> Route? in
+                guard waypoints.count >= 2 else { return nil }
+                return Route(
+                    coordinates: PlannedRouteStats.sampledPath(from: waypoints, maxStepMeters: 25),
+                    date: Date(),
+                    workoutType: .walking,
+                    durationSec: 0
+                )
+            }
+            guard !routes.isEmpty else { return nil }
+            return FastStreetChecker(routes: routes)
         }
 
         private static func coordinateSignature(for coordinates: [CLLocationCoordinate2D]) -> String {
@@ -722,14 +887,36 @@ private struct PlannerMapView: UIViewRepresentable {
                 .joined(separator: "|")
         }
 
-        func render(waypoints: [CLLocationCoordinate2D], on mapView: MKMapView) {
-            let signature = Self.coordinateSignature(for: waypoints)
+        func render(
+            waypoints: [CLLocationCoordinate2D],
+            isSimulationMode: Bool,
+            simulationPlans: [[CLLocationCoordinate2D]],
+            on mapView: MKMapView
+        ) {
+            let signature = isSimulationMode
+                ? "sim:" + simulationPlans.map { Self.coordinateSignature(for: $0) }.joined(separator: "||")
+                : "plan:" + Self.coordinateSignature(for: waypoints)
             guard signature != renderedSignature else { return }
             renderedSignature = signature
 
             if !overlays.isEmpty {
                 mapView.removeOverlays(overlays)
                 overlays.removeAll(keepingCapacity: true)
+            }
+            simulationPlanOverlay = nil
+
+            if isSimulationMode {
+                let polylines = simulationPlans.compactMap { coordinates -> MKPolyline? in
+                    guard coordinates.count >= 2 else { return nil }
+                    return MKPolyline(coordinates: coordinates, count: coordinates.count)
+                }
+                guard !polylines.isEmpty else { return }
+
+                let overlay = MKMultiPolyline(polylines)
+                simulationPlanOverlay = overlay
+                overlays.append(overlay)
+                mapView.addOverlay(overlay)
+                return
             }
 
             if waypoints.count >= 2 {
@@ -763,6 +950,10 @@ private struct PlannerMapView: UIViewRepresentable {
                     renderer.strokeColor = UIColor.systemYellow.withAlphaComponent(0.9)
                     renderer.lineWidth = 3.5
                     renderer.alpha = 0.98
+                } else if multiPolyline === simulationPlanOverlay {
+                    renderer.strokeColor = UIColor.systemPurple.withAlphaComponent(0.9)
+                    renderer.lineWidth = 5
+                    renderer.alpha = 0.95
                 } else {
                     renderer.strokeColor = UIColor.systemGray.withAlphaComponent(0.45)
                     renderer.lineWidth = 2
@@ -815,6 +1006,85 @@ private enum PlannerMode: Equatable {
 private struct SavedPlanPreview {
     let distanceKm: Double
     let newStreetCount: Int
+}
+
+private struct PlanSimulationStats {
+    let selectedPlanCount: Int
+    let distanceKm: Double
+    let coverageBeforePercent: Double
+    let coverageAfterPercent: Double
+    let newStreetCount: Int
+
+    static let empty = PlanSimulationStats(
+        selectedPlanCount: 0,
+        distanceKm: 0,
+        coverageBeforePercent: 0,
+        coverageAfterPercent: 0,
+        newStreetCount: 0
+    )
+
+    static func calculate(
+        plans: [SavedRoutePlan],
+        consolidatedStreets: [ConsolidatedStreet],
+        existingCoverage: [String: ConsolidatedStreet.CoverageResult]
+    ) -> PlanSimulationStats {
+        let totalStreets = consolidatedStreets.count
+        let currentlyCoveredIDs = Set(existingCoverage.compactMap { streetID, coverage in
+            (coverage.coveredPoints > 0 || coverage.percentage > 0) ? streetID : nil
+        })
+        let distanceKm = plans
+            .map { PlannedRouteStats.totalDistanceKm(for: $0.coordinates) }
+            .reduce(0, +)
+
+        guard totalStreets > 0, !plans.isEmpty else {
+            return PlanSimulationStats(
+                selectedPlanCount: plans.count,
+                distanceKm: distanceKm,
+                coverageBeforePercent: totalStreets > 0 ? Double(currentlyCoveredIDs.count) / Double(totalStreets) * 100 : 0,
+                coverageAfterPercent: totalStreets > 0 ? Double(currentlyCoveredIDs.count) / Double(totalStreets) * 100 : 0,
+                newStreetCount: 0
+            )
+        }
+
+        let routes = plans.compactMap { plan -> Route? in
+            let coordinates = plan.coordinates
+            guard coordinates.count >= 2 else { return nil }
+            return Route(
+                coordinates: PlannedRouteStats.sampledPath(from: coordinates, maxStepMeters: 25),
+                date: Date(),
+                workoutType: .walking,
+                durationSec: 0
+            )
+        }
+        guard !routes.isEmpty else {
+            let percent = Double(currentlyCoveredIDs.count) / Double(totalStreets) * 100
+            return PlanSimulationStats(
+                selectedPlanCount: plans.count,
+                distanceKm: distanceKm,
+                coverageBeforePercent: percent,
+                coverageAfterPercent: percent,
+                newStreetCount: 0
+            )
+        }
+
+        let checker = FastStreetChecker(routes: routes)
+        var projectedCoveredIDs = currentlyCoveredIDs
+
+        for street in consolidatedStreets where !currentlyCoveredIDs.contains(street.id) {
+            let plannedCoverage = street.calculateCoverage(using: checker, densify: false)
+            if plannedCoverage.coveredPoints > 0 {
+                projectedCoveredIDs.insert(street.id)
+            }
+        }
+
+        return PlanSimulationStats(
+            selectedPlanCount: plans.count,
+            distanceKm: distanceKm,
+            coverageBeforePercent: Double(currentlyCoveredIDs.count) / Double(totalStreets) * 100,
+            coverageAfterPercent: Double(projectedCoveredIDs.count) / Double(totalStreets) * 100,
+            newStreetCount: projectedCoveredIDs.count - currentlyCoveredIDs.count
+        )
+    }
 }
 
 private enum RoutePlannerStreetData {
