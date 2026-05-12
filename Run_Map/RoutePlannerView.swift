@@ -162,7 +162,6 @@ struct RoutePlannerView: View {
         .onAppear {
             savedPlans = SavedRoutePlanStore.load()
             simulatedPlanIDs.formIntersection(Set(savedPlans.map(\.id)))
-            loadFallbackStreetDataIfNeeded()
             recalculateStats()
             recalculateSavedPlanPreviews()
             recalculateSimulationStats()
@@ -178,6 +177,11 @@ struct RoutePlannerView: View {
         .onChange(of: isSimulationMode) { _ in
             focusRequestID = UUID()
             recalculateSimulationStats()
+        }
+        .onChange(of: showCurrentStreetCoverage) { enabled in
+            if enabled {
+                loadFallbackStreetDataIfNeeded()
+            }
         }
         .onChange(of: simulatedPlanIDs) { _ in
             focusRequestID = UUID()
@@ -685,15 +689,20 @@ struct RoutePlannerView: View {
         guard let preview = savedPlanPreviews[plan.id] else {
             return String(format: "%.1f km", PlannedRouteStats.totalDistanceKm(for: plan.coordinates))
         }
-        let streetLabel = preview.newStreetCount == 1 ? "new street" : "new streets"
-        let districtLabel = preview.newDistrictCount == 1 ? "district" : "districts"
+        guard let newStreetCount = preview.newStreetCount,
+              let newDistrictCount = preview.newDistrictCount,
+              let newStreetsPerKm = preview.newStreetsPerKm else {
+            return String(format: "%.1f km", preview.distanceKm)
+        }
+        let streetLabel = newStreetCount == 1 ? "new street" : "new streets"
+        let districtLabel = newDistrictCount == 1 ? "district" : "districts"
         return String(
             format: "%.1f km, %d %@, %.2f streets/km, %d new %@",
             preview.distanceKm,
-            preview.newStreetCount,
+            newStreetCount,
             streetLabel,
-            preview.newStreetsPerKm,
-            preview.newDistrictCount,
+            newStreetsPerKm,
+            newDistrictCount,
             districtLabel
         )
     }
@@ -711,32 +720,20 @@ struct RoutePlannerView: View {
 
     private func recalculateSavedPlanPreviews() {
         let plans = savedPlans
-        let streets = plannerConsolidatedStreets
-        let existingCoverage = streetCoverageByID
 
         guard !plans.isEmpty else {
             savedPlanPreviews = [:]
             return
         }
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.global(qos: .utility).async {
             let previews = Dictionary(uniqueKeysWithValues: plans.map { plan in
-                let stats = PlannedRouteStats.calculate(
-                    coordinates: plan.coordinates,
-                    consolidatedStreets: streets,
-                    existingCoverage: existingCoverage
-                )
-                let newDistrictCount = Self.projectedNewDistrictCount(
-                    coordinates: plan.coordinates,
-                    consolidatedStreets: streets,
-                    existingCoverage: existingCoverage
-                )
                 return (
                     plan.id,
                     SavedPlanPreview(
-                        distanceKm: stats.distanceKm,
-                        newStreetCount: stats.newStreetNames.count,
-                        newDistrictCount: newDistrictCount
+                        distanceKm: PlannedRouteStats.totalDistanceKm(for: plan.coordinates),
+                        newStreetCount: nil,
+                        newDistrictCount: nil
                     )
                 )
             })
@@ -1158,8 +1155,8 @@ private enum SavedPlanSortMode: String, CaseIterable, Identifiable {
             return value(lhsPreview?.newStreetsPerKm, fallback: 0) >
                 value(rhsPreview?.newStreetsPerKm, fallback: 0)
         case .newDistricts:
-            return value(Double(lhsPreview?.newDistrictCount ?? 0), fallback: 0) >
-                value(Double(rhsPreview?.newDistrictCount ?? 0), fallback: 0)
+            return value(lhsPreview?.newDistrictCount.map(Double.init), fallback: 0) >
+                value(rhsPreview?.newDistrictCount.map(Double.init), fallback: 0)
         }
     }
 
@@ -1488,11 +1485,11 @@ private enum RouteAchievementPreviewBuilder {
 
 private struct SavedPlanPreview {
     let distanceKm: Double
-    let newStreetCount: Int
-    let newDistrictCount: Int
+    let newStreetCount: Int?
+    let newDistrictCount: Int?
 
-    var newStreetsPerKm: Double {
-        guard distanceKm > 0 else { return 0 }
+    var newStreetsPerKm: Double? {
+        guard let newStreetCount, distanceKm > 0 else { return nil }
         return Double(newStreetCount) / distanceKm
     }
 }
