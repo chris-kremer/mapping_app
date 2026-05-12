@@ -302,6 +302,7 @@ struct MonthlyRecapView: View {
     @State private var draftDistricts = ""
     @State private var report: MonthlyRecapReport?
     @State private var isGeneratingReport = false
+    @State private var didSaveGoals = false
 
     var body: some View {
         NavigationView {
@@ -325,6 +326,9 @@ struct MonthlyRecapView: View {
                 draftDistricts = goals.newDistrictCount.map(String.init) ?? ""
                 generateReportIfNeeded()
             }
+            .onChange(of: draftDistance) { _ in didSaveGoals = false }
+            .onChange(of: draftStreets) { _ in didSaveGoals = false }
+            .onChange(of: draftDistricts) { _ in didSaveGoals = false }
         }
         .navigationViewStyle(.stack)
     }
@@ -491,10 +495,19 @@ struct MonthlyRecapView: View {
                     newDistrictCount: Int(draftDistricts.trimmingCharacters(in: .whitespacesAndNewlines))
                 )
                 MonthlyGoalStore.save(goals)
+                didSaveGoals = true
             } label: {
                 Label("Save Goals", systemImage: "checkmark")
             }
             .buttonStyle(.borderedProminent)
+
+            if didSaveGoals {
+                Label(goals.hasAnyGoal ? "Monthly goals saved" : "Monthly goals cleared", systemImage: "checkmark.circle.fill")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.green)
+                    .padding(.top, 2)
+            }
         }
         .padding()
         .background(Color(.secondarySystemBackground))
