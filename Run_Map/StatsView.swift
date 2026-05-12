@@ -190,7 +190,7 @@ struct StatsView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Daily Distance")
                         .font(.headline)
-                    Text("Last 26 weeks")
+                    Text("Trailing 52 weeks")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -643,8 +643,11 @@ struct StatsView: View {
             routes.map(\.distanceKm).reduce(0, +)
         }
 
-        maxDailyDistance = dailyTotals.values.max() ?? 0
         dailyDistanceWeeks = makeDailyDistanceWeeks(dailyTotals: dailyTotals)
+        maxDailyDistance = dailyDistanceWeeks
+            .flatMap { $0 }
+            .compactMap { $0?.distanceKm }
+            .max() ?? 0
     }
 
     private func makeFrequencyBins(
@@ -669,7 +672,7 @@ struct StatsView: View {
 
         let today = calendar.startOfDay(for: Date())
         let endWeek = calendar.dateInterval(of: .weekOfYear, for: today)?.start ?? today
-        let startWeek = calendar.date(byAdding: .day, value: -25 * 7, to: endWeek) ?? endWeek
+        let startWeek = calendar.date(byAdding: .day, value: -51 * 7, to: endWeek) ?? endWeek
 
         var weeks: [[DailyDistanceCell?]] = []
         var weekStart = startWeek
