@@ -30,6 +30,39 @@ enum MonthlyGoalStore {
     }
 }
 
+struct MonthlyGoalProgressSnapshot: Codable {
+    let monthKey: String
+    let routeSignature: String
+    let distanceKm: Double
+    let newStreetCount: Int?
+    let newDistrictCount: Int?
+
+    func includesStreetProgressIfNeeded(for goals: MonthlyGoals) -> Bool {
+        (goals.newStreetCount == nil || newStreetCount != nil) &&
+            (goals.newDistrictCount == nil || newDistrictCount != nil)
+    }
+}
+
+enum MonthlyGoalProgressCache {
+    private static let key = "monthlyGoalProgress.v1"
+
+    static func load(monthKey: String, routeSignature: String, goals: MonthlyGoals) -> MonthlyGoalProgressSnapshot? {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let snapshot = try? JSONDecoder().decode(MonthlyGoalProgressSnapshot.self, from: data),
+              snapshot.monthKey == monthKey,
+              snapshot.routeSignature == routeSignature,
+              snapshot.includesStreetProgressIfNeeded(for: goals) else {
+            return nil
+        }
+        return snapshot
+    }
+
+    static func save(_ snapshot: MonthlyGoalProgressSnapshot) {
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+}
+
 enum MonthlyRecapNotificationScheduler {
     static func configure() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
@@ -618,8 +651,7 @@ struct MonthlyGoalProgressSection: View {
     let streetCoverageByID: [String: ConsolidatedStreet.CoverageResult]
 
     @State private var goals = MonthlyGoalStore.load()
-    @State private var report: MonthlyRecapReport?
-    @State private var distanceOnlyProgress: Double?
+    @State private var progress: MonthlyGoalProgressSnapshot?
     @State private var isLoadingReport = false
 
     var body: some View {
@@ -629,18 +661,16 @@ struct MonthlyGoalProgressSection: View {
                     .font(.title2)
                     .fontWeight(.bold)
 
-                if let report {
+                if let progress {
                     if let target = goals.distanceKm {
-                        progressRow(title: "Distance", current: report.distanceKm, target: target, suffix: "km")
+                        progressRow(title: "Distance", current: progress.distanceKm, target: target, suffix: "km")
                     }
-                    if let target = goals.newStreetCount {
-                        progressRow(title: "New streets", current: Double(report.newStreetNames.count), target: Double(target), suffix: "")
+                    if let target = goals.newStreetCount, let newStreetCount = progress.newStreetCount {
+                        progressRow(title: "New streets", current: Double(newStreetCount), target: Double(target), suffix: "")
                     }
-                    if let target = goals.newDistrictCount {
-                        progressRow(title: "New districts", current: Double(report.newDistrictNames.count), target: Double(target), suffix: "")
+                    if let target = goals.newDistrictCount, let newDistrictCount = progress.newDistrictCount {
+                        progressRow(title: "New districts", current: Double(newDistrictCount), target: Double(target), suffix: "")
                     }
-                } else if let distanceOnlyProgress, let target = goals.distanceKm {
-                    progressRow(title: "Distance", current: distanceOnlyProgress, target: target, suffix: "km")
                 } else {
                     HStack(spacing: 8) {
                         ProgressView()
@@ -663,7 +693,15 @@ struct MonthlyGoalProgressSection: View {
     }
 
     private func generateReportIfNeeded() {
-        guard goals.hasAnyGoal, !isLoadingReport, report == nil, distanceOnlyProgress == nil else { return }
+        guard goals.hasAnyGoal, !isLoadingReport, progress == nil else { return }
+        let monthKey = Self.currentMonthKey()
+        let routeSignature = Self.routeSignature(for: routes)
+
+        if let cachedProgress = MonthlyGoalProgressCache.load(monthKey: monthKey, routeSignature: routeSignature, goals: goals) {
+            progress = cachedProgress
+            return
+        }
+
         isLoadingReport = true
 
         let routes = routes
@@ -675,8 +713,16 @@ struct MonthlyGoalProgressSection: View {
         DispatchQueue.global(qos: .utility).async {
             guard needsStreetProgress else {
                 let distanceKm = Self.currentMonthDistance(routes: routes)
+                let snapshot = MonthlyGoalProgressSnapshot(
+                    monthKey: monthKey,
+                    routeSignature: routeSignature,
+                    distanceKm: distanceKm,
+                    newStreetCount: nil,
+                    newDistrictCount: nil
+                )
+                MonthlyGoalProgressCache.save(snapshot)
                 DispatchQueue.main.async {
-                    self.distanceOnlyProgress = distanceKm
+                    self.progress = snapshot
                     self.isLoadingReport = false
                 }
                 return
@@ -688,12 +734,33 @@ struct MonthlyGoalProgressSection: View {
                 consolidatedStreets: consolidatedStreets,
                 streetCoverageByID: streetCoverageByID
             )
+            let snapshot = MonthlyGoalProgressSnapshot(
+                monthKey: monthKey,
+                routeSignature: routeSignature,
+                distanceKm: generatedReport.distanceKm,
+                newStreetCount: generatedReport.newStreetNames.count,
+                newDistrictCount: generatedReport.newDistrictNames.count
+            )
+            MonthlyGoalProgressCache.save(snapshot)
 
             DispatchQueue.main.async {
-                self.report = generatedReport
+                self.progress = snapshot
                 self.isLoadingReport = false
             }
         }
+    }
+
+    private static func currentMonthKey() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM"
+        return formatter.string(from: Date())
+    }
+
+    private static func routeSignature(for routes: [Route]) -> String {
+        let count = routes.count
+        let latest = routes.map(\.date.timeIntervalSince1970).max() ?? 0
+        let totalMeters = routes.map(\.distanceKm).reduce(0, +) * 1_000
+        return "\(count):\(Int(latest)):\(Int(totalMeters.rounded()))"
     }
 
     private static func currentMonthDistance(routes: [Route]) -> Double {
