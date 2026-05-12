@@ -5,6 +5,7 @@ import HealthKit
 
 struct RoutePlannerView: View {
     let initialRegion: MKCoordinateRegion
+    let routes: [Route]
     let consolidatedStreets: [ConsolidatedStreet]
     let streetCoverageByID: [String: ConsolidatedStreet.CoverageResult]
 
@@ -68,6 +69,16 @@ struct RoutePlannerView: View {
         savedPlans.sorted { lhs, rhs in
             savedPlanSort.compare(lhs, rhs, previews: savedPlanPreviews)
         }
+    }
+
+    private var achievementPreviewItems: [RouteAchievementPreviewItem] {
+        RouteAchievementPreviewBuilder.makeItems(
+            plannedCoordinates: waypoints,
+            plannedStats: stats,
+            existingRoutes: routes,
+            consolidatedStreets: plannerConsolidatedStreets,
+            streetCoverageByID: streetCoverageByID
+        )
     }
 
     var body: some View {
@@ -231,6 +242,7 @@ struct RoutePlannerView: View {
                     statsSection(title: "Places", items: stats.placeLines)
                     statsSection(title: "Berlin", items: stats.berlinLines)
                     newStreetSection
+                    achievementPreviewSection
                 }
 
                 savedPlansSection
@@ -525,6 +537,52 @@ struct RoutePlannerView: View {
 
                 if stats.newStreetNames.count > 6 {
                     Text("and \(stats.newStreetNames.count - 6) others")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    private var achievementPreviewSection: some View {
+        let items = achievementPreviewItems
+
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Achievement Preview")
+                .font(.headline)
+
+            if items.isEmpty {
+                Text("No achievement progress detected for this plan yet.")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            } else {
+                ForEach(items.prefix(6)) { item in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: item.iconName)
+                            .foregroundColor(item.kind.color)
+                            .frame(width: 22)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.title)
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                            Text(item.detail)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Text(item.kind.label)
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                            .foregroundColor(item.kind.color)
+                    }
+                    .padding(10)
+                    .background(item.kind.color.opacity(0.10))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+
+                if items.count > 6 {
+                    Text("and \(items.count - 6) other progress updates")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -1247,6 +1305,290 @@ private struct SmartRouteSuggestion {
     let coordinates: [CLLocationCoordinate2D]
     let distanceKm: Double
     let newStreetCount: Int
+}
+
+private struct RouteAchievementPreviewItem: Identifiable {
+    enum Kind {
+        case unlock
+        case progress
+
+        var label: String {
+            switch self {
+            case .unlock:
+                return "Unlock"
+            case .progress:
+                return "Progress"
+            }
+        }
+
+        var color: Color {
+            switch self {
+            case .unlock:
+                return .green
+            case .progress:
+                return .blue
+            }
+        }
+    }
+
+    let id = UUID()
+    let title: String
+    let detail: String
+    let iconName: String
+    let kind: Kind
+}
+
+private enum RouteAchievementPreviewBuilder {
+    static func makeItems(
+        plannedCoordinates: [CLLocationCoordinate2D],
+        plannedStats: PlannedRouteStats,
+        existingRoutes: [Route],
+        consolidatedStreets: [ConsolidatedStreet],
+        streetCoverageByID: [String: ConsolidatedStreet.CoverageResult]
+    ) -> [RouteAchievementPreviewItem] {
+        guard plannedCoordinates.count >= 2, plannedStats.distanceKm > 0 else { return [] }
+
+        var items: [RouteAchievementPreviewItem] = []
+        appendDistanceItems(to: &items, plannedStats: plannedStats, existingRoutes: existingRoutes)
+        appendLocationItems(to: &items, plannedStats: plannedStats, existingRoutes: existingRoutes)
+        appendBerlinItems(
+            to: &items,
+            plannedStats: plannedStats,
+            existingRoutes: existingRoutes,
+            consolidatedStreets: consolidatedStreets,
+            streetCoverageByID: streetCoverageByID
+        )
+        appendMauerwegItem(to: &items, plannedCoordinates: plannedCoordinates, existingRoutes: existingRoutes)
+
+        return items
+    }
+
+    private static func appendDistanceItems(
+        to items: inout [RouteAchievementPreviewItem],
+        plannedStats: PlannedRouteStats,
+        existingRoutes: [Route]
+    ) {
+        let currentWalkingKm = existingRoutes
+            .filter { $0.workoutType == .walking }
+            .map(\.distanceKm)
+            .reduce(0, +)
+        let afterWalkingKm = currentWalkingKm + plannedStats.distanceKm
+        appendThresholdItem(
+            to: &items,
+            title: "Walking Distance",
+            iconName: "figure.walk",
+            before: currentWalkingKm,
+            after: afterWalkingKm,
+            thresholds: [500, 1000, 2500, 10000],
+            unit: "km"
+        )
+
+        let today = Calendar.current.startOfDay(for: Date())
+        let todayDistance = existingRoutes
+            .filter { Calendar.current.isDate($0.date, inSameDayAs: today) }
+            .map(\.distanceKm)
+            .reduce(0, +)
+        appendThresholdItem(
+            to: &items,
+            title: "Daily Distance",
+            iconName: "calendar",
+            before: todayDistance,
+            after: todayDistance + plannedStats.distanceKm,
+            thresholds: [10, 15, 20, 30],
+            unit: "km"
+        )
+    }
+
+    private static func appendLocationItems(
+        to items: inout [RouteAchievementPreviewItem],
+        plannedStats: PlannedRouteStats,
+        existingRoutes: [Route]
+    ) {
+        let existing = locationSets(for: existingRoutes)
+        let countryAfter = existing.countries.union(plannedStats.countries)
+        appendCountItem(
+            to: &items,
+            title: "Countries Visited",
+            iconName: "globe",
+            before: existing.countries.count,
+            after: countryAfter.count,
+            thresholds: [1, 10, 25, 50]
+        )
+
+        let cityAfter = existing.cities.union(plannedStats.cities)
+        appendCountItem(
+            to: &items,
+            title: "Cities Visited",
+            iconName: "building.2",
+            before: existing.cities.count,
+            after: cityAfter.count,
+            thresholds: [1, 10, 25, 50]
+        )
+    }
+
+    private static func appendBerlinItems(
+        to items: inout [RouteAchievementPreviewItem],
+        plannedStats: PlannedRouteStats,
+        existingRoutes: [Route],
+        consolidatedStreets: [ConsolidatedStreet],
+        streetCoverageByID: [String: ConsolidatedStreet.CoverageResult]
+    ) {
+        let existingDistricts = Set(existingRoutes.flatMap { route in
+            route.coordinates.compactMap { BerlinDistricts.getDistrict(lat: $0.latitude, lon: $0.longitude) }
+        })
+        appendCountItem(
+            to: &items,
+            title: "Berlin Districts",
+            iconName: "building.columns.fill",
+            before: existingDistricts.count,
+            after: existingDistricts.union(plannedStats.districts).count,
+            thresholds: [3, 6, 9, 12]
+        )
+
+        let existingStadtteile = Set(BerlinStreets.getStadtteileFromCoordinates(existingRoutes.flatMap(\.coordinates)))
+        appendCountItem(
+            to: &items,
+            title: "Berlin Stadtteile",
+            iconName: "house.fill",
+            before: existingStadtteile.count,
+            after: existingStadtteile.union(plannedStats.stadtteile).count,
+            thresholds: [10, 25, 50, 75]
+        )
+
+        let totalStreetCount = max(consolidatedStreets.count, 1)
+        let coveredStreetCount = streetCoverageByID.values.filter { $0.coveredPoints > 0 || $0.percentage > 0 }.count
+        let beforePercent = Double(coveredStreetCount) / Double(totalStreetCount) * 100
+        let afterPercent = Double(coveredStreetCount + plannedStats.newStreetNames.count) / Double(totalStreetCount) * 100
+        appendThresholdItem(
+            to: &items,
+            title: "Berlin Streets",
+            iconName: "map.fill",
+            before: beforePercent,
+            after: afterPercent,
+            thresholds: [10, 20, 40, 80],
+            unit: "%"
+        )
+    }
+
+    private static func appendMauerwegItem(
+        to items: inout [RouteAchievementPreviewItem],
+        plannedCoordinates: [CLLocationCoordinate2D],
+        existingRoutes: [Route]
+    ) {
+        let mauerwegCoordinates = BerlinMauerweg.coordinates()
+        guard !mauerwegCoordinates.isEmpty else { return }
+
+        let before = mauerwegCoverage(routes: existingRoutes, mauerwegCoordinates: mauerwegCoordinates)
+        let plannedRoute = Route(
+            coordinates: PlannedRouteStats.sampledPath(from: plannedCoordinates, maxStepMeters: 25),
+            date: Date(),
+            workoutType: .walking,
+            durationSec: 0
+        )
+        let after = mauerwegCoverage(routes: existingRoutes + [plannedRoute], mauerwegCoordinates: mauerwegCoordinates)
+
+        appendThresholdItem(
+            to: &items,
+            title: "Mauerweg",
+            iconName: "figure.walk.motion",
+            before: before,
+            after: after,
+            thresholds: [0.1, 10, 50, 100],
+            unit: "%"
+        )
+    }
+
+    private static func appendThresholdItem(
+        to items: inout [RouteAchievementPreviewItem],
+        title: String,
+        iconName: String,
+        before: Double,
+        after: Double,
+        thresholds: [Double],
+        unit: String
+    ) {
+        guard after > before else { return }
+        let beforeTier = tierIndex(for: before, thresholds: thresholds)
+        let afterTier = tierIndex(for: after, thresholds: thresholds)
+        let kind: RouteAchievementPreviewItem.Kind = afterTier > beforeTier ? .unlock : .progress
+        let detail = "\(format(before, unit: unit)) -> \(format(after, unit: unit))"
+
+        items.append(RouteAchievementPreviewItem(
+            title: title,
+            detail: detail,
+            iconName: iconName,
+            kind: kind
+        ))
+    }
+
+    private static func appendCountItem(
+        to items: inout [RouteAchievementPreviewItem],
+        title: String,
+        iconName: String,
+        before: Int,
+        after: Int,
+        thresholds: [Int]
+    ) {
+        guard after > before else { return }
+        let beforeTier = tierIndex(for: Double(before), thresholds: thresholds.map(Double.init))
+        let afterTier = tierIndex(for: Double(after), thresholds: thresholds.map(Double.init))
+        let kind: RouteAchievementPreviewItem.Kind = afterTier > beforeTier ? .unlock : .progress
+
+        items.append(RouteAchievementPreviewItem(
+            title: title,
+            detail: "\(before) -> \(after)",
+            iconName: iconName,
+            kind: kind
+        ))
+    }
+
+    private static func tierIndex(for value: Double, thresholds: [Double]) -> Int {
+        thresholds.reduce(0) { partialResult, threshold in
+            value >= threshold ? partialResult + 1 : partialResult
+        }
+    }
+
+    private static func format(_ value: Double, unit: String) -> String {
+        if unit == "%" {
+            return String(format: "%.1f%%", value)
+        }
+        return String(format: "%.1f %@", value, unit)
+    }
+
+    private static func locationSets(for routes: [Route]) -> (countries: Set<String>, cities: Set<String>) {
+        var countries = Set<String>()
+        var cities = Set<String>()
+
+        for route in routes {
+            for coordinate in sampledCoordinates(route.coordinates, maxCount: 10) {
+                let result = LocalGeocoder.geocode(latitude: coordinate.latitude, longitude: coordinate.longitude)
+                if !result.country.isEmpty, result.country != "Unknown" {
+                    countries.insert(result.country)
+                }
+                if LocalGeocoder.isSpecificCityName(result.city) {
+                    cities.insert(result.city)
+                }
+            }
+        }
+
+        return (countries, cities)
+    }
+
+    private static func sampledCoordinates(_ coordinates: [CLLocationCoordinate2D], maxCount: Int) -> [CLLocationCoordinate2D] {
+        guard coordinates.count > maxCount else { return coordinates }
+        let step = max(1, coordinates.count / maxCount)
+        return stride(from: 0, to: coordinates.count, by: step).map { coordinates[$0] }
+    }
+
+    private static func mauerwegCoverage(
+        routes: [Route],
+        mauerwegCoordinates: [BerlinStreets.SimpleCoordinate]
+    ) -> Double {
+        guard !routes.isEmpty else { return 0 }
+        let checker = FastStreetChecker(routes: routes)
+        let coveredPointCount = checker.checkStreetCoverage(streetCoords: mauerwegCoordinates).filter { $0 }.count
+        return (Double(coveredPointCount) / Double(mauerwegCoordinates.count)) * 100.0
+    }
 }
 
 private enum SmartRouteSuggestionEngine {

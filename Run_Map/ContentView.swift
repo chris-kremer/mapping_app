@@ -1561,6 +1561,7 @@ struct ContentView: View {
         .sheet(isPresented: $showRoutePlanner) {
             RoutePlannerView(
                 initialRegion: region,
+                routes: viewModel.routes,
                 consolidatedStreets: achievementsManager.consolidatedStreets,
                 streetCoverageByID: achievementsManager.streetCoverageByID
             )
