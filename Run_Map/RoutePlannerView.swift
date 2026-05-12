@@ -596,11 +596,11 @@ struct RoutePlannerView: View {
             isComputingStats = false
             return
         }
-        guard plannedCoordinates.count <= 30 else {
+        guard plannedCoordinates.count <= 80 else {
             isComputingStats = false
             return
         }
-        guard !streets.isEmpty, streets.count <= 18_000 else {
+        guard !streets.isEmpty else {
             isComputingStats = false
             return
         }
@@ -803,7 +803,7 @@ struct RoutePlannerView: View {
             isComputingSimulation = false
             return
         }
-        guard !streets.isEmpty, streets.count <= 18_000 else {
+        guard !streets.isEmpty else {
             let distanceKm = plans
                 .map { PlannedRouteStats.totalDistanceKm(for: $0.coordinates) }
                 .reduce(0, +)
@@ -989,11 +989,25 @@ private struct PlannerMapView: UIViewRepresentable {
             covered.reserveCapacity(coverageByID.count)
 
             let checker = makeRouteChecker(for: projectedPlans)
+            let plannedHitIDs: Set<String>
+            if let checker {
+                let projectionIndex = PlannerStreetProjectionIndexStore.index(for: streets)
+                let candidateIndexes = projectedPlans.reduce(into: Set<Int>()) { result, plan in
+                    result.formUnion(projectionIndex.candidateStreetIndexes(near: plan))
+                }
+                plannedHitIDs = Set(candidateIndexes.compactMap { streetIndex in
+                    guard streets.indices.contains(streetIndex) else { return nil }
+                    let street = streets[streetIndex]
+                    return street.calculateCoverage(using: checker, densify: false).coveredPoints > 0 ? street.id : nil
+                })
+            } else {
+                plannedHitIDs = []
+            }
 
             for street in streets {
                 let coverage = coverageByID[street.id]
                 let hasAnyHit = (coverage?.coveredPoints ?? 0) > 0 || (coverage?.percentage ?? 0) > 0
-                let wouldBeHit = checker.map { street.calculateCoverage(using: $0, densify: false).coveredPoints > 0 } ?? false
+                let wouldBeHit = plannedHitIDs.contains(street.id)
 
                 for segment in street.segments {
                     let coordinates = segment.clCoordinates
@@ -1224,6 +1238,94 @@ private struct CoordinateBounds {
             minLon: minLon - lonDelta,
             maxLon: maxLon + lonDelta
         )
+    }
+}
+
+private final class PlannerStreetProjectionIndex {
+    private struct Cell: Hashable {
+        let lat: Int
+        let lon: Int
+    }
+
+    private var grid: [Cell: Set<Int>] = [:]
+    private let metersPerCell: Double
+
+    init(streets: [ConsolidatedStreet], metersPerCell: Double = 55) {
+        self.metersPerCell = metersPerCell
+
+        for (streetIndex, street) in streets.enumerated() {
+            for coordinate in street.allCoordinates {
+                guard coordinate.lat.isFinite, coordinate.lon.isFinite else { continue }
+                grid[cell(latitude: coordinate.lat, longitude: coordinate.lon), default: []].insert(streetIndex)
+            }
+        }
+    }
+
+    func candidateStreetIndexes(near coordinates: [CLLocationCoordinate2D]) -> Set<Int> {
+        guard coordinates.count >= 2 else { return [] }
+        let samples = PlannedRouteStats.sampledPath(from: coordinates, maxStepMeters: metersPerCell)
+        var candidates = Set<Int>()
+
+        for coordinate in samples where coordinate.latitude.isFinite && coordinate.longitude.isFinite {
+            for cell in neighboringCells(latitude: coordinate.latitude, longitude: coordinate.longitude) {
+                if let streetIndexes = grid[cell] {
+                    candidates.formUnion(streetIndexes)
+                }
+            }
+        }
+
+        return candidates
+    }
+
+    private func neighboringCells(latitude: Double, longitude: Double) -> [Cell] {
+        let center = cell(latitude: latitude, longitude: longitude)
+        var cells: [Cell] = []
+        cells.reserveCapacity(9)
+
+        for latOffset in -1...1 {
+            for lonOffset in -1...1 {
+                cells.append(Cell(lat: center.lat + latOffset, lon: center.lon + lonOffset))
+            }
+        }
+
+        return cells
+    }
+
+    private func cell(latitude: Double, longitude: Double) -> Cell {
+        let latCellSize = metersPerCell / 111_000
+        let lonMeters = max(1, 111_000 * cos(latitude * .pi / 180))
+        let lonCellSize = metersPerCell / lonMeters
+        return Cell(
+            lat: Int(floor(latitude / latCellSize)),
+            lon: Int(floor(longitude / lonCellSize))
+        )
+    }
+}
+
+private enum PlannerStreetProjectionIndexStore {
+    private static var signature: String?
+    private static var cachedIndex: PlannerStreetProjectionIndex?
+    private static let lock = NSLock()
+
+    static func index(for streets: [ConsolidatedStreet]) -> PlannerStreetProjectionIndex {
+        let nextSignature = makeSignature(for: streets)
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        if signature == nextSignature, let cachedIndex {
+            return cachedIndex
+        }
+
+        let nextIndex = PlannerStreetProjectionIndex(streets: streets)
+        signature = nextSignature
+        cachedIndex = nextIndex
+        return nextIndex
+    }
+
+    private static func makeSignature(for streets: [ConsolidatedStreet]) -> String {
+        let coordinateCount = streets.reduce(0) { $0 + $1.totalPoints }
+        return "\(streets.count):\(coordinateCount)"
     }
 }
 
@@ -1583,8 +1685,15 @@ private struct PlanSimulationStats {
 
         let checker = FastStreetChecker(routes: routes)
         var projectedCoveredIDs = currentlyCoveredIDs
+        let projectionIndex = PlannerStreetProjectionIndexStore.index(for: consolidatedStreets)
+        let candidateIndexes = plans.reduce(into: Set<Int>()) { result, plan in
+            result.formUnion(projectionIndex.candidateStreetIndexes(near: plan.coordinates))
+        }
 
-        for street in consolidatedStreets where !currentlyCoveredIDs.contains(street.id) {
+        for streetIndex in candidateIndexes {
+            guard consolidatedStreets.indices.contains(streetIndex) else { continue }
+            let street = consolidatedStreets[streetIndex]
+            guard !currentlyCoveredIDs.contains(street.id) else { continue }
             let plannedCoverage = street.calculateCoverage(using: checker, densify: false)
             if plannedCoverage.coveredPoints > 0 {
                 projectedCoveredIDs.insert(street.id)
@@ -1757,9 +1866,13 @@ private struct PlannedRouteStats {
             durationSec: 0
         )
         let checker = FastStreetChecker(routes: [plannedRoute])
+        let projectionIndex = PlannerStreetProjectionIndexStore.index(for: consolidatedStreets)
+        let candidateIndexes = projectionIndex.candidateStreetIndexes(near: coordinates)
 
         var names = Set<String>()
-        for street in consolidatedStreets {
+        for streetIndex in candidateIndexes {
+            guard consolidatedStreets.indices.contains(streetIndex) else { continue }
+            let street = consolidatedStreets[streetIndex]
             let wasCovered = (existingCoverage[street.id]?.coveredPoints ?? 0) > 0
             guard !wasCovered else { continue }
             guard let streetBounds = coordinateBounds(for: street.allCoordinates),
