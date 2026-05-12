@@ -807,9 +807,12 @@ private struct LaunchSummaryData: Identifiable {
     let newWalkCount: Int
     let newDistanceKm: Double
     let newRoutes: [Route]
+    let runningKPI: LaunchWorkoutKPI
+    let walkingKPI: LaunchWorkoutKPI
     let newStreetNames: [String]
     let newDistrictNames: [String]
     let newStadtteilNames: [String]
+    let touchedAreaCount: Int
 
     var hasNewRoutes: Bool {
         newWalkCount > 0 || newDistanceKm > 0
@@ -818,16 +821,53 @@ private struct LaunchSummaryData: Identifiable {
     var newAreaNames: [String] {
         (newDistrictNames + newStadtteilNames).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
+
+    var newAreaPercentage: Double {
+        let denominator = max(touchedAreaCount, newAreaNames.count)
+        guard denominator > 0 else { return 0 }
+        return min(100, Double(newAreaNames.count) / Double(denominator) * 100)
+    }
+
+    var areaPercentageDetail: String {
+        let denominator = max(touchedAreaCount, newAreaNames.count)
+        return "\(newAreaNames.count) of \(denominator)"
+    }
 }
 
 private struct PendingLaunchSummary {
     let newWalkCount: Int
     let newDistanceKm: Double
     let newRoutes: [Route]
+    let runningKPI: LaunchWorkoutKPI
+    let walkingKPI: LaunchWorkoutKPI
+    let touchedAreaCount: Int
+}
+
+private struct LaunchWorkoutKPI {
+    let count: Int
+    let distanceKm: Double
+    let durationSec: Double
+
+    static let empty = LaunchWorkoutKPI(count: 0, distanceKm: 0, durationSec: 0)
+
+    var hasRoutes: Bool {
+        count > 0
+    }
+
+    var routeNoun: String {
+        count == 1 ? "route" : "routes"
+    }
+
+    var paceText: String {
+        guard distanceKm > 0, durationSec > 0 else { return "-" }
+        let secondsPerKm = Int((durationSec / distanceKm).rounded())
+        return "\(secondsPerKm / 60):\(String(format: "%02d", secondsPerKm % 60))/km"
+    }
 }
 
 private struct LaunchSummarySheet: View {
     let summary: LaunchSummaryData
+    let onShowRoutes: ([Route]) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var showAllStreets = false
 
@@ -840,14 +880,30 @@ private struct LaunchSummarySheet: View {
                             .font(.title2)
                             .fontWeight(.semibold)
                     } else {
-                        Text(String(format: "You added %d %@ for %.1f kilometers.", summary.newWalkCount, summary.walkNoun, summary.newDistanceKm))
+                        Text(String(format: "You added %d %@ for %.1f kilometers.", summary.newWalkCount, summary.workoutNoun, summary.newDistanceKm))
                             .font(.title3)
                             .fontWeight(.semibold)
 
+                        launchKPISection
+
                         if !summary.newRoutes.isEmpty {
-                            LaunchSummaryRouteMap(routes: summary.newRoutes)
-                                .frame(height: 220)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                            Button {
+                                onShowRoutes(summary.newRoutes)
+                                dismiss()
+                            } label: {
+                                LaunchSummaryRouteMap(routes: summary.newRoutes)
+                                    .frame(height: 220)
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                onShowRoutes(summary.newRoutes)
+                                dismiss()
+                            } label: {
+                                Label("Show on map", systemImage: "map")
+                            }
+                            .buttonStyle(.borderedProminent)
                         }
 
                         if !summary.newStreetNames.isEmpty {
@@ -879,6 +935,61 @@ private struct LaunchSummarySheet: View {
             }
         }
         .navigationViewStyle(.stack)
+    }
+
+    private var launchKPISection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                workoutKPICard(title: "Runs", kpi: summary.runningKPI, color: .green)
+                workoutKPICard(title: "Walks", kpi: summary.walkingKPI, color: .blue)
+            }
+
+            HStack(spacing: 10) {
+                metricCard(
+                    title: "New Areas",
+                    value: String(format: "%.0f%%", summary.newAreaPercentage),
+                    detail: summary.areaPercentageDetail,
+                    color: .orange
+                )
+                metricCard(
+                    title: "New Streets",
+                    value: "\(summary.newStreetNames.count)",
+                    detail: summary.newStreetNames.count == 1 ? "street" : "streets",
+                    color: .purple
+                )
+            }
+        }
+    }
+
+    private func workoutKPICard(title: String, kpi: LaunchWorkoutKPI, color: Color) -> some View {
+        metricCard(
+            title: title,
+            value: String(format: "%.1f km", kpi.distanceKm),
+            detail: kpi.hasRoutes ? "\(kpi.count) \(kpi.routeNoun) · \(kpi.paceText)" : "No routes",
+            color: color
+        )
+    }
+
+    private func metricCard(title: String, value: String, detail: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.headline)
+                .fontWeight(.semibold)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Text(detail)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(color.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     @ViewBuilder
@@ -916,8 +1027,8 @@ private struct LaunchSummarySheet: View {
 }
 
 private extension LaunchSummaryData {
-    var walkNoun: String {
-        newWalkCount == 1 ? "walk" : "walks"
+    var workoutNoun: String {
+        newWalkCount == 1 ? "workout" : "workouts"
     }
 }
 
@@ -1288,14 +1399,17 @@ struct ContentView: View {
                 }
                 if !hasShownSummary {
                     let newRuns = max(0, viewModel.routes.count - lastRunCount)
-                    let newDistance = max(0, viewModel.totalDistanceKm - lastDistanceKm)
                     let newlyAddedRoutes = Array(viewModel.routes.sorted { $0.date > $1.date }.prefix(newRuns))
+                    let newDistance = newlyAddedRoutes.map(\.distanceKm).reduce(0, +)
                     if hasLaunchedBefore {
                         if newRuns > 0 {
                             pendingLaunchSummary = PendingLaunchSummary(
                                 newWalkCount: newRuns,
                                 newDistanceKm: newDistance,
-                                newRoutes: newlyAddedRoutes
+                                newRoutes: newlyAddedRoutes,
+                                runningKPI: launchWorkoutKPI(for: newlyAddedRoutes, type: .running),
+                                walkingKPI: launchWorkoutKPI(for: newlyAddedRoutes, type: .walking),
+                                touchedAreaCount: touchedLaunchAreaCount(for: newlyAddedRoutes)
                             )
                         }
                     }
@@ -1396,7 +1510,9 @@ struct ContentView: View {
             .presentationDetents([.large])
         }
         .sheet(item: $launchSummary) { summary in
-            LaunchSummarySheet(summary: summary)
+            LaunchSummarySheet(summary: summary) { routes in
+                showLaunchRoutesOnMap(routes)
+            }
         }
         .alert(isPresented: $achievementsManager.showAchievementAlert) {
             Alert(
@@ -1471,10 +1587,54 @@ struct ContentView: View {
             newWalkCount: pending.newWalkCount,
             newDistanceKm: pending.newDistanceKm,
             newRoutes: pending.newRoutes,
+            runningKPI: pending.runningKPI,
+            walkingKPI: pending.walkingKPI,
             newStreetNames: achievementsManager.newlyCoveredStreetNames,
             newDistrictNames: achievementsManager.newlyVisitedDistrictNames,
-            newStadtteilNames: achievementsManager.newlyVisitedStadtteilNames
+            newStadtteilNames: achievementsManager.newlyVisitedStadtteilNames,
+            touchedAreaCount: pending.touchedAreaCount
         )
+    }
+
+    private func showLaunchRoutesOnMap(_ routes: [Route]) {
+        guard !routes.isEmpty else { return }
+        highlightedRouteIDs = Set(routes.map(\.id))
+        selectedDistrictOverlay = nil
+        showAllBerlinDistricts = false
+        showAllBerlinStadtteile = false
+
+        let allCoordinates = routes.flatMap(\.coordinates)
+        if !allCoordinates.isEmpty {
+            withAnimation(.easeInOut(duration: 0.8)) {
+                region = coordinateRegion(for: allCoordinates)
+            }
+        }
+    }
+
+    private func launchWorkoutKPI(for routes: [Route], type: HKWorkoutActivityType) -> LaunchWorkoutKPI {
+        let matchingRoutes = routes.filter { $0.workoutType == type }
+        return LaunchWorkoutKPI(
+            count: matchingRoutes.count,
+            distanceKm: matchingRoutes.map(\.distanceKm).reduce(0, +),
+            durationSec: matchingRoutes.map(\.durationSec).reduce(0, +)
+        )
+    }
+
+    private func touchedLaunchAreaCount(for routes: [Route]) -> Int {
+        var areaNames = Set<String>()
+        let coordinates = routes.flatMap(\.coordinates)
+
+        for coordinate in coordinates {
+            if let district = BerlinDistricts.getDistrict(lat: coordinate.latitude, lon: coordinate.longitude) {
+                areaNames.insert(district)
+            }
+        }
+
+        for stadtteil in BerlinStreets.getStadtteileFromCoordinates(coordinates) {
+            areaNames.insert(stadtteil)
+        }
+
+        return areaNames.count
     }
 
     private func startLaunchAchievementCheckAfterMapLoad() {
