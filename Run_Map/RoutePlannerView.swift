@@ -19,6 +19,7 @@ struct RoutePlannerView: View {
     @State private var focusRequestID = UUID()
     @State private var fallbackConsolidatedStreets: [ConsolidatedStreet] = []
     @State private var savedPlanPreviews: [UUID: SavedPlanPreview] = [:]
+    @State private var plannerMode: PlannerMode = .new
 
     private var waypointSignature: String {
         waypoints
@@ -34,6 +35,19 @@ struct RoutePlannerView: View {
         "\(plannerConsolidatedStreets.count):\(streetCoverageByID.count)"
     }
 
+    private var selectedSavedPlan: SavedRoutePlan? {
+        guard let selectedID = plannerMode.selectedPlanID else { return nil }
+        return savedPlans.first { $0.id == selectedID }
+    }
+
+    private var canEditWaypoints: Bool {
+        plannerMode.canEditWaypoints
+    }
+
+    private var mapHintText: String {
+        canEditWaypoints ? "Tap the map to add waypoints" : "Viewing saved plan"
+    }
+
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
@@ -45,12 +59,13 @@ struct RoutePlannerView: View {
                     streetCoverageByID: streetCoverageByID,
                     focusRequestID: focusRequestID,
                     onAddWaypoint: { coordinate in
+                        guard canEditWaypoints else { return }
                         waypoints.append(coordinate)
                     }
                 )
                 .frame(maxHeight: .infinity)
                 .overlay(alignment: .topLeading) {
-                    Text("Tap the map to add waypoints")
+                    Text(mapHintText)
                         .font(.caption)
                         .fontWeight(.semibold)
                         .padding(.horizontal, 10)
@@ -71,23 +86,42 @@ struct RoutePlannerView: View {
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Menu {
-                        Button("Save Plan", systemImage: "square.and.arrow.down") {
-                            planTitle = defaultPlanTitle
-                            showSavePlanDialog = true
+                        Button("New Plan", systemImage: "plus") {
+                            startNewPlan()
                         }
-                        .disabled(waypoints.count < 2)
+
+                        if case .editing = plannerMode {
+                            Button("Save Changes", systemImage: "checkmark") {
+                                saveEditingPlan()
+                            }
+                            .disabled(waypoints.count < 2)
+                        } else {
+                            Button("Save Plan", systemImage: "square.and.arrow.down") {
+                                planTitle = defaultPlanTitle
+                                showSavePlanDialog = true
+                            }
+                            .disabled(waypoints.count < 2 || !canEditWaypoints)
+                        }
+
+                        if case .viewing = plannerMode {
+                            Button("Edit Saved Plan", systemImage: "pencil") {
+                                if let selectedSavedPlan {
+                                    editSavedPlan(selectedSavedPlan)
+                                }
+                            }
+                        }
 
                         Button("Undo Last", systemImage: "arrow.uturn.backward") {
                             if !waypoints.isEmpty {
                                 waypoints.removeLast()
                             }
                         }
-                        .disabled(waypoints.isEmpty)
+                        .disabled(waypoints.isEmpty || !canEditWaypoints)
 
                         Button("Clear", systemImage: "trash", role: .destructive) {
                             waypoints.removeAll()
                         }
-                        .disabled(waypoints.isEmpty)
+                        .disabled(waypoints.isEmpty || !canEditWaypoints)
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -139,16 +173,9 @@ struct RoutePlannerView: View {
                     metricPill(title: "Points", value: "\(waypoints.count)", color: .orange)
                 }
 
-                HStack(spacing: 12) {
-                    Button {
-                        planTitle = defaultPlanTitle
-                        showSavePlanDialog = true
-                    } label: {
-                        Label("Save Plan", systemImage: "square.and.arrow.down")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(waypoints.count < 2)
+                modeControlSection
 
+                HStack(spacing: 12) {
                     Toggle(isOn: $showCurrentStreetCoverage) {
                         Label("Street Coverage", systemImage: "map")
                     }
@@ -173,6 +200,84 @@ struct RoutePlannerView: View {
         .frame(maxHeight: 340)
     }
 
+    private var modeControlSection: some View {
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(modeTitle)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                Text(modeSubtitle)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            switch plannerMode {
+            case .new:
+                Button {
+                    planTitle = defaultPlanTitle
+                    showSavePlanDialog = true
+                } label: {
+                    Label("Save", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(waypoints.count < 2)
+
+            case .viewing:
+                Button {
+                    if let selectedSavedPlan {
+                        editSavedPlan(selectedSavedPlan)
+                    }
+                } label: {
+                    Label("Edit", systemImage: "pencil")
+                }
+                .buttonStyle(.borderedProminent)
+
+            case .editing:
+                Button {
+                    saveEditingPlan()
+                } label: {
+                    Label("Save", systemImage: "checkmark")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(waypoints.count < 2)
+            }
+
+            Button {
+                startNewPlan()
+            } label: {
+                Image(systemName: "plus")
+            }
+            .buttonStyle(.bordered)
+            .accessibilityLabel("New Plan")
+        }
+        .padding(10)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var modeTitle: String {
+        switch plannerMode {
+        case .new:
+            return "New plan"
+        case .viewing:
+            return "Viewing saved plan"
+        case .editing:
+            return "Editing saved plan"
+        }
+    }
+
+    private var modeSubtitle: String {
+        switch plannerMode {
+        case .new:
+            return waypoints.isEmpty ? "Create a route from scratch" : "Unsaved route"
+        case .viewing:
+            return selectedSavedPlan?.title ?? "Saved route"
+        case .editing:
+            return selectedSavedPlan?.title ?? "Saved route"
+        }
+    }
+
     private var savedPlansSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             if !savedPlans.isEmpty {
@@ -182,8 +287,7 @@ struct RoutePlannerView: View {
                 ForEach(savedPlans.prefix(5)) { plan in
                     HStack(spacing: 10) {
                         Button {
-                            waypoints = plan.coordinates
-                            focusRequestID = UUID()
+                            viewSavedPlan(plan)
                         } label: {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(plan.title)
@@ -197,6 +301,13 @@ struct RoutePlannerView: View {
                         }
                         .buttonStyle(.plain)
 
+                        Button {
+                            editSavedPlan(plan)
+                        } label: {
+                            Image(systemName: "pencil")
+                        }
+                        .buttonStyle(.borderless)
+
                         Button(role: .destructive) {
                             deletePlan(plan)
                         } label: {
@@ -204,7 +315,10 @@ struct RoutePlannerView: View {
                         }
                         .buttonStyle(.borderless)
                     }
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 8)
+                    .background(savedPlanRowBackground(for: plan))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
             }
         }
@@ -317,15 +431,61 @@ struct RoutePlannerView: View {
 
         let plan = SavedRoutePlan(title: trimmedTitle, createdAt: Date(), coordinates: waypoints)
         savedPlans.insert(plan, at: 0)
+        plannerMode = .viewing(plan.id)
         SavedRoutePlanStore.save(savedPlans)
         recalculateSavedPlanPreviews()
     }
 
     private func deletePlan(_ plan: SavedRoutePlan) {
         savedPlans.removeAll { $0.id == plan.id }
+        if plannerMode.selectedPlanID == plan.id {
+            startNewPlan()
+        }
         SavedRoutePlanStore.save(savedPlans)
         savedPlanPreviews[plan.id] = nil
         recalculateSavedPlanPreviews()
+    }
+
+    private func startNewPlan() {
+        plannerMode = .new
+        waypoints.removeAll()
+        planTitle = ""
+        focusRequestID = UUID()
+    }
+
+    private func viewSavedPlan(_ plan: SavedRoutePlan) {
+        plannerMode = .viewing(plan.id)
+        waypoints = plan.coordinates
+        planTitle = plan.title
+        focusRequestID = UUID()
+    }
+
+    private func editSavedPlan(_ plan: SavedRoutePlan) {
+        plannerMode = .editing(plan.id)
+        waypoints = plan.coordinates
+        planTitle = plan.title
+        focusRequestID = UUID()
+    }
+
+    private func saveEditingPlan() {
+        guard case let .editing(planID) = plannerMode,
+              let index = savedPlans.firstIndex(where: { $0.id == planID }),
+              waypoints.count >= 2 else { return }
+
+        let existing = savedPlans[index]
+        savedPlans[index] = SavedRoutePlan(
+            id: existing.id,
+            title: existing.title,
+            createdAt: existing.createdAt,
+            coordinates: waypoints
+        )
+        SavedRoutePlanStore.save(savedPlans)
+        plannerMode = .viewing(planID)
+        recalculateSavedPlanPreviews()
+    }
+
+    private func savedPlanRowBackground(for plan: SavedRoutePlan) -> Color {
+        plannerMode.selectedPlanID == plan.id ? Color.blue.opacity(0.10) : Color.clear
     }
 
     private func savedPlanPreviewText(for plan: SavedRoutePlan) -> String {
@@ -627,6 +787,30 @@ private struct PlannerMapView: UIViewRepresentable {
 }
 
 private final class PlannedRoutePolyline: MKPolyline {}
+
+private enum PlannerMode: Equatable {
+    case new
+    case viewing(UUID)
+    case editing(UUID)
+
+    var selectedPlanID: UUID? {
+        switch self {
+        case .new:
+            return nil
+        case let .viewing(id), let .editing(id):
+            return id
+        }
+    }
+
+    var canEditWaypoints: Bool {
+        switch self {
+        case .new, .editing:
+            return true
+        case .viewing:
+            return false
+        }
+    }
+}
 
 private struct SavedPlanPreview {
     let distanceKm: Double
