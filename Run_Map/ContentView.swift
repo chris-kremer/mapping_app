@@ -1201,7 +1201,7 @@ struct ContentView: View {
                 await MainActor.run {
                     fakeLoadingPercent = percent
                 }
-                try? await Task.sleep(nanoseconds: 50_000_000)
+                try? await Task.sleep(nanoseconds: 60_000_000)
             }
 
             await MainActor.run {
