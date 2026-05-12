@@ -25,6 +25,10 @@ struct RoutePlannerView: View {
     @State private var simulationStats = PlanSimulationStats.empty
     @State private var isComputingSimulation = false
     @State private var savedPlanSort: SavedPlanSortMode = .distance
+    @State private var suggestionDistance: SmartRouteDistance = .fiveK
+    @State private var suggestionShape: SmartRouteShape = .loop
+    @State private var isGeneratingSuggestion = false
+    @State private var suggestionMessage: String?
 
     private var waypointSignature: String {
         waypoints
@@ -215,6 +219,7 @@ struct RoutePlannerView: View {
                 }
 
                 simulationSection
+                smartRouteSuggestionSection
 
                 if isSimulationMode {
                     EmptyView()
@@ -285,6 +290,52 @@ struct RoutePlannerView: View {
             }
             .buttonStyle(.bordered)
             .accessibilityLabel("New Plan")
+        }
+        .padding(10)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var smartRouteSuggestionSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Smart Suggestion", systemImage: "sparkles")
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                Spacer()
+                if isGeneratingSuggestion {
+                    ProgressView()
+                        .scaleEffect(0.85)
+                }
+            }
+
+            Picker("Distance", selection: $suggestionDistance) {
+                ForEach(SmartRouteDistance.allCases) { distance in
+                    Text(distance.title).tag(distance)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Picker("Shape", selection: $suggestionShape) {
+                ForEach(SmartRouteShape.allCases) { shape in
+                    Text(shape.title).tag(shape)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Button {
+                generateSmartRouteSuggestion()
+            } label: {
+                Label("Find Route", systemImage: "wand.and.stars")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(isGeneratingSuggestion || plannerConsolidatedStreets.isEmpty)
+
+            if let suggestionMessage {
+                Text(suggestionMessage)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
         }
         .padding(10)
         .background(Color(.secondarySystemBackground))
@@ -538,6 +589,45 @@ struct RoutePlannerView: View {
             DispatchQueue.main.async {
                 stats = calculated
                 isComputingStats = false
+            }
+        }
+    }
+
+    private func generateSmartRouteSuggestion() {
+        let streets = plannerConsolidatedStreets
+        let existingCoverage = streetCoverageByID
+        let start = initialRegion.center
+        let distanceKm = suggestionDistance.kilometers
+        let shape = suggestionShape
+
+        guard !streets.isEmpty else {
+            suggestionMessage = "Street coverage data is still loading."
+            return
+        }
+
+        isGeneratingSuggestion = true
+        suggestionMessage = nil
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let suggestion = SmartRouteSuggestionEngine.generate(
+                start: start,
+                targetDistanceKm: distanceKm,
+                shape: shape,
+                consolidatedStreets: streets,
+                existingCoverage: existingCoverage
+            )
+
+            DispatchQueue.main.async {
+                isGeneratingSuggestion = false
+                guard let suggestion else {
+                    suggestionMessage = "No useful uncovered streets found nearby."
+                    return
+                }
+
+                plannerMode = .new
+                waypoints = suggestion.coordinates
+                focusRequestID = UUID()
+                suggestionMessage = "\(suggestion.newStreetCount) likely new streets over \(String(format: "%.1f", suggestion.distanceKm)) km"
             }
         }
     }
@@ -1109,6 +1199,172 @@ private enum SavedPlanSortMode: String, CaseIterable, Identifiable {
     private func value(_ value: Double?, fallback: Double) -> Double {
         guard let value, value.isFinite else { return fallback }
         return value
+    }
+}
+
+private enum SmartRouteDistance: String, CaseIterable, Identifiable {
+    case fiveK
+    case tenK
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .fiveK:
+            return "5k"
+        case .tenK:
+            return "10k"
+        }
+    }
+
+    var kilometers: Double {
+        switch self {
+        case .fiveK:
+            return 5
+        case .tenK:
+            return 10
+        }
+    }
+}
+
+private enum SmartRouteShape: String, CaseIterable, Identifiable {
+    case loop
+    case oneWay
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .loop:
+            return "Loop"
+        case .oneWay:
+            return "One-way"
+        }
+    }
+}
+
+private struct SmartRouteSuggestion {
+    let coordinates: [CLLocationCoordinate2D]
+    let distanceKm: Double
+    let newStreetCount: Int
+}
+
+private enum SmartRouteSuggestionEngine {
+    private struct Candidate {
+        let streetID: String
+        let streetName: String
+        let district: String
+        let coordinate: CLLocationCoordinate2D
+        let distanceFromStart: CLLocationDistance
+    }
+
+    static func generate(
+        start: CLLocationCoordinate2D,
+        targetDistanceKm: Double,
+        shape: SmartRouteShape,
+        consolidatedStreets: [ConsolidatedStreet],
+        existingCoverage: [String: ConsolidatedStreet.CoverageResult]
+    ) -> SmartRouteSuggestion? {
+        let candidates = uncoveredCandidates(
+            start: start,
+            consolidatedStreets: consolidatedStreets,
+            existingCoverage: existingCoverage
+        )
+        guard !candidates.isEmpty else { return nil }
+
+        let targetMeters = targetDistanceKm * 1_000
+        let maxMeters = targetMeters * 1.22
+        var waypoints = [start]
+        var current = start
+        var usedStreetIDs = Set<String>()
+
+        for candidate in candidates {
+            guard !usedStreetIDs.contains(candidate.streetID) else { continue }
+
+            let addedMeters = distanceMeters(from: current, to: candidate.coordinate)
+            let returnMeters = shape == .loop ? distanceMeters(from: candidate.coordinate, to: start) : 0
+            let currentMeters = routeDistanceMeters(waypoints)
+
+            if currentMeters + addedMeters + returnMeters > maxMeters {
+                continue
+            }
+
+            waypoints.append(candidate.coordinate)
+            usedStreetIDs.insert(candidate.streetID)
+            current = candidate.coordinate
+
+            if currentMeters + addedMeters + returnMeters >= targetMeters * 0.86 {
+                break
+            }
+        }
+
+        if shape == .loop, waypoints.count > 1 {
+            waypoints.append(start)
+        }
+
+        guard waypoints.count >= 2, !usedStreetIDs.isEmpty else { return nil }
+        return SmartRouteSuggestion(
+            coordinates: waypoints,
+            distanceKm: PlannedRouteStats.totalDistanceKm(for: waypoints),
+            newStreetCount: usedStreetIDs.count
+        )
+    }
+
+    private static func uncoveredCandidates(
+        start: CLLocationCoordinate2D,
+        consolidatedStreets: [ConsolidatedStreet],
+        existingCoverage: [String: ConsolidatedStreet.CoverageResult]
+    ) -> [Candidate] {
+        let startLocation = CLLocation(latitude: start.latitude, longitude: start.longitude)
+
+        return consolidatedStreets.compactMap { street in
+            let wasCovered = (existingCoverage[street.id]?.coveredPoints ?? 0) > 0 ||
+                (existingCoverage[street.id]?.percentage ?? 0) > 0
+            guard !wasCovered, let coordinate = representativeCoordinate(for: street) else { return nil }
+
+            let distance = startLocation.distance(from: CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude))
+            guard distance <= 7_500 else { return nil }
+
+            return Candidate(
+                streetID: street.id,
+                streetName: street.name,
+                district: street.district,
+                coordinate: coordinate,
+                distanceFromStart: distance
+            )
+        }
+        .sorted {
+            if abs($0.distanceFromStart - $1.distanceFromStart) > 250 {
+                return $0.distanceFromStart < $1.distanceFromStart
+            }
+            return $0.streetName.localizedCaseInsensitiveCompare($1.streetName) == .orderedAscending
+        }
+        .prefix(360)
+        .map { $0 }
+    }
+
+    private static func representativeCoordinate(for street: ConsolidatedStreet) -> CLLocationCoordinate2D? {
+        let coordinates = street.allCoordinates
+        guard !coordinates.isEmpty else { return nil }
+        let coordinate = coordinates[coordinates.count / 2]
+        return CLLocationCoordinate2D(latitude: coordinate.lat, longitude: coordinate.lon)
+    }
+
+    private static func routeDistanceMeters(_ coordinates: [CLLocationCoordinate2D]) -> CLLocationDistance {
+        guard coordinates.count >= 2 else { return 0 }
+        var total: CLLocationDistance = 0
+        for index in 0..<(coordinates.count - 1) {
+            total += distanceMeters(from: coordinates[index], to: coordinates[index + 1])
+        }
+        return total
+    }
+
+    private static func distanceMeters(
+        from: CLLocationCoordinate2D,
+        to: CLLocationCoordinate2D
+    ) -> CLLocationDistance {
+        CLLocation(latitude: from.latitude, longitude: from.longitude)
+            .distance(from: CLLocation(latitude: to.latitude, longitude: to.longitude))
     }
 }
 
