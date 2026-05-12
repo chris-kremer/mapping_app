@@ -223,6 +223,18 @@ class RunViewModel: ObservableObject {
             self.loadNewRuns()
         }
     }
+
+    func reloadRoutesFromCache(completion: (() -> Void)? = nil) {
+        routeStorage.loadRoutesAsync { cachedRoutes in
+            let validRoutes = cachedRoutes
+                .filter { $0.coordinates.count > 1 }
+                .sorted { $0.date > $1.date }
+
+            self.routes = validRoutes
+            self.hasContent = !validRoutes.isEmpty
+            completion?()
+        }
+    }
     
     func loadAllRunsFromScratch() {
         // Clear existing routes and cache
@@ -1450,6 +1462,7 @@ struct ContentView: View {
         .onAppear {
             startFakeLoading()
             viewModel.healthManager.requestAuthorization { _ in
+                RunMapHealthKitBackgroundService.shared.start()
                 viewModel.loadRuns()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                     if let latest = viewModel.routes.sorted(by: { $0.date > $1.date }).first {
@@ -1462,6 +1475,12 @@ struct ContentView: View {
                         region = coordinateRegion(for: allCoordinates)
                     }
                 }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .runMapHealthKitBackgroundImportDidFinish)) { _ in
+            viewModel.reloadRoutesFromCache {
+                showUpdatedToast()
+                startLaunchAchievementCheckAfterMapLoad()
             }
         }
         .onReceive(viewModel.$loadProgress) { progress in

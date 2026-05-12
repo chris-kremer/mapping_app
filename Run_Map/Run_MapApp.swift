@@ -9,6 +9,10 @@ import SwiftUI
 
 @main
 struct Run_MapApp: App {
+    init() {
+        RunMapHealthKitBackgroundService.shared.start()
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
