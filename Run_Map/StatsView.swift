@@ -5,6 +5,7 @@ struct StatsView: View {
     var routes: [Route]
     var onLocationSelected: ((String, String) -> Void)? // (country, city) -> Void
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var totalKm: Double = 0
     @State private var countryTotals: [(String, Double)] = []
     @State private var cityTotals: [(String, Double)] = []
@@ -16,6 +17,14 @@ struct StatsView: View {
     @State private var heuristicallyClassified = 0
     @State private var showAllCountries = false
     @State private var showAllCities = false
+    @State private var paceBins: [StatsFrequencyBin] = []
+    @State private var distanceBins: [StatsFrequencyBin] = []
+    @State private var dailyDistanceWeeks: [[DailyDistanceCell?]] = []
+    @State private var maxDailyDistance: Double = 0
+
+    private var contentMaxWidth: CGFloat {
+        horizontalSizeClass == .regular ? 760 : .infinity
+    }
 
     var body: some View {
         NavigationView {
@@ -29,6 +38,7 @@ struct StatsView: View {
                 }
             }
         }
+        .navigationViewStyle(.stack)
         .onAppear(perform: computeStats)
         .onChange(of: routes.count) { _ in
             computeStats()
@@ -43,6 +53,30 @@ struct StatsView: View {
                 emptyStateCard
             } else {
                 overviewCard
+
+                if !paceBins.isEmpty {
+                    frequencyCard(
+                        title: "Pace Frequency",
+                        subtitle: "Minutes per kilometer across workouts",
+                        icon: "speedometer",
+                        color: .blue,
+                        bins: paceBins
+                    )
+                }
+
+                if !distanceBins.isEmpty {
+                    frequencyCard(
+                        title: "Distance Frequency",
+                        subtitle: "Workout distance buckets",
+                        icon: "point.topleft.down.curvedto.point.bottomright.up",
+                        color: .green,
+                        bins: distanceBins
+                    )
+                }
+
+                if !dailyDistanceWeeks.isEmpty {
+                    dailyDistanceGridCard
+                }
                 
                 if !countryTotals.isEmpty {
                     countriesCard
@@ -54,6 +88,8 @@ struct StatsView: View {
             }
         }
         .padding()
+        .frame(maxWidth: contentMaxWidth)
+        .frame(maxWidth: .infinity)
     }
     
     private var loadingCard: some View {
@@ -81,6 +117,117 @@ struct StatsView: View {
                     Text("Showing partial results…")
                     .font(.caption2)
                     .foregroundColor(.orange)
+            }
+        }
+        .padding()
+        .background(Color(.systemBackground))
+        .cornerRadius(12)
+        .shadow(color: .black.opacity(0.1), radius: 4, x: 0, y: 2)
+    }
+
+    private func frequencyCard(
+        title: String,
+        subtitle: String,
+        icon: String,
+        color: Color,
+        bins: [StatsFrequencyBin]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(systemName: icon)
+                    .foregroundColor(color)
+                    .font(.title2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.headline)
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+            }
+
+            let maxCount = max(bins.map(\.count).max() ?? 1, 1)
+            VStack(spacing: 10) {
+                ForEach(bins) { bin in
+                    HStack(spacing: 10) {
+                        Text(bin.label)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .frame(width: 64, alignment: .leading)
+
+                        GeometryReader { proxy in
+                            ZStack(alignment: .leading) {
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(color.opacity(0.12))
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(color.opacity(0.72))
+                                    .frame(width: proxy.size.width * CGFloat(Double(bin.count) / Double(maxCount)))
+                            }
+                        }
+                        .frame(height: 16)
+
+                        Text("\(bin.count)")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .frame(width: 30, alignment: .trailing)
+                    }
+                }
+            }
+        }
+        .padding()
+        .background(Color(.systemBackground))
+        .cornerRadius(12)
+        .shadow(color: .black.opacity(0.1), radius: 4, x: 0, y: 2)
+    }
+
+    private var dailyDistanceGridCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(systemName: "calendar")
+                    .foregroundColor(.mint)
+                    .font(.title2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Daily Distance")
+                        .font(.headline)
+                    Text("Last 26 weeks")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Text(String(format: "Max %.1f km", maxDailyDistance))
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 4) {
+                    ForEach(Array(dailyDistanceWeeks.enumerated()), id: \.offset) { _, week in
+                        VStack(spacing: 4) {
+                            ForEach(Array(week.enumerated()), id: \.offset) { _, cell in
+                                RoundedRectangle(cornerRadius: 3)
+                                    .fill(dailyDistanceColor(for: cell?.distanceKm ?? 0))
+                                    .frame(width: 12, height: 12)
+                                    .accessibilityLabel(dailyDistanceAccessibilityLabel(for: cell))
+                            }
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+
+            HStack(spacing: 6) {
+                Text("Less")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                ForEach(0..<5, id: \.self) { level in
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(dailyDistanceLegendColor(level: level))
+                        .frame(width: 12, height: 12)
+                }
+                Text("More")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
         }
         .padding()
@@ -366,6 +513,7 @@ struct StatsView: View {
         heuristicallyClassified = 0
 
         loading = true
+        computeRouteCharts(from: routesArray)
         
         // Safely calculate total km with error handling
         totalKm = routesArray.compactMap { route in
@@ -444,6 +592,150 @@ struct StatsView: View {
             }
         }
     }
+
+    private func computeRouteCharts(from routes: [Route]) {
+        let validRoutes = routes.filter { route in
+            route.coordinates.count > 1 &&
+            route.distanceKm.isFinite &&
+            route.distanceKm > 0
+        }
+
+        paceBins = makeFrequencyBins(
+            values: validRoutes.compactMap { route in
+                guard route.durationSec > 0 else { return nil }
+                return route.durationSec / 60.0 / route.distanceKm
+            },
+            ranges: [
+                (0, 4, "<4"),
+                (4, 5, "4-5"),
+                (5, 6, "5-6"),
+                (6, 7, "6-7"),
+                (7, 8, "7-8"),
+                (8, 10, "8-10"),
+                (10, .infinity, "10+")
+            ]
+        )
+
+        distanceBins = makeFrequencyBins(
+            values: validRoutes.map(\.distanceKm),
+            ranges: [
+                (0, 2, "<2"),
+                (2, 5, "2-5"),
+                (5, 10, "5-10"),
+                (10, 15, "10-15"),
+                (15, 21.1, "15-21"),
+                (21.1, 30, "21-30"),
+                (30, .infinity, "30+")
+            ]
+        )
+
+        let dailyTotals = Dictionary(grouping: validRoutes) { route in
+            Calendar.current.startOfDay(for: route.date)
+        }
+        .mapValues { routes in
+            routes.map(\.distanceKm).reduce(0, +)
+        }
+
+        maxDailyDistance = dailyTotals.values.max() ?? 0
+        dailyDistanceWeeks = makeDailyDistanceWeeks(dailyTotals: dailyTotals)
+    }
+
+    private func makeFrequencyBins(
+        values: [Double],
+        ranges: [(lower: Double, upper: Double, label: String)]
+    ) -> [StatsFrequencyBin] {
+        ranges.map { range in
+            StatsFrequencyBin(
+                label: range.label,
+                count: values.filter { value in
+                    value >= range.lower && value < range.upper
+                }.count
+            )
+        }
+        .filter { $0.count > 0 }
+    }
+
+    private func makeDailyDistanceWeeks(dailyTotals: [Date: Double]) -> [[DailyDistanceCell?]] {
+        var calendar = Calendar.current
+        calendar.firstWeekday = 2
+
+        let today = calendar.startOfDay(for: Date())
+        let endWeek = calendar.dateInterval(of: .weekOfYear, for: today)?.start ?? today
+        let startWeek = calendar.date(byAdding: .day, value: -25 * 7, to: endWeek) ?? endWeek
+
+        var weeks: [[DailyDistanceCell?]] = []
+        var weekStart = startWeek
+
+        while weekStart <= endWeek {
+            var week: [DailyDistanceCell?] = []
+            for dayOffset in 0..<7 {
+                guard let date = calendar.date(byAdding: .day, value: dayOffset, to: weekStart) else {
+                    week.append(nil)
+                    continue
+                }
+
+                if date > today {
+                    week.append(nil)
+                } else {
+                    week.append(DailyDistanceCell(
+                        date: date,
+                        distanceKm: dailyTotals[date, default: 0]
+                    ))
+                }
+            }
+            weeks.append(week)
+
+            guard let nextWeek = calendar.date(byAdding: .day, value: 7, to: weekStart) else { break }
+            weekStart = nextWeek
+        }
+
+        return weeks
+    }
+
+    private func dailyDistanceColor(for distance: Double) -> Color {
+        guard distance > 0 else {
+            return Color(.systemGray5)
+        }
+        let level = dailyDistanceLevel(for: distance)
+        return dailyDistanceLegendColor(level: level)
+    }
+
+    private func dailyDistanceLegendColor(level: Int) -> Color {
+        switch level {
+        case 0:
+            return Color(.systemGray5)
+        case 1:
+            return Color.green.opacity(0.28)
+        case 2:
+            return Color.green.opacity(0.48)
+        case 3:
+            return Color.green.opacity(0.68)
+        default:
+            return Color.green.opacity(0.9)
+        }
+    }
+
+    private func dailyDistanceLevel(for distance: Double) -> Int {
+        guard maxDailyDistance > 0, distance > 0 else { return 0 }
+        let ratio = distance / maxDailyDistance
+        switch ratio {
+        case 0..<0.25:
+            return 1
+        case 0.25..<0.5:
+            return 2
+        case 0.5..<0.75:
+            return 3
+        default:
+            return 4
+        }
+    }
+
+    private func dailyDistanceAccessibilityLabel(for cell: DailyDistanceCell?) -> String {
+        guard let cell else { return "No day" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        return "\(formatter.string(from: cell.date)): \(String(format: "%.1f", cell.distanceKm)) km"
+    }
     
     private func cleanupCountryCache(_ cache: [String: String]) -> [String: String] {
         var cleanedCache: [String: String] = [:]
@@ -460,12 +752,10 @@ struct StatsView: View {
         var cleanedCache: [String: String] = [:]
         
         for (key, city) in cityCache {
-            // Remove obviously wrong city assignments (cities that are too far)
-            if coordCache[key] != nil {
-                // If we have a cached country, validate the city makes sense
+            // Remove non-city fallback labels and orphaned city cache entries.
+            if coordCache[key] != nil, LocalGeocoder.isSpecificCityName(city) {
                 cleanedCache[key] = city
             } else {
-                // Remove orphaned city cache entries
                 continue
             }
         }
@@ -536,7 +826,9 @@ struct StatsView: View {
                 
                 // Add distance to country/city (distributed across route)
                 countryDict[segment.country, default: 0] += segment.distance
-                cityDict[segment.city, default: 0] += segment.distance
+                if LocalGeocoder.isSpecificCityName(segment.city) {
+                    cityDict[segment.city, default: 0] += segment.distance
+                }
                 
                 // Track unique coordinates
                 if !visited.contains(segment.key) {
@@ -777,7 +1069,7 @@ struct StatsView: View {
             if let cachedCountry = mutableCoordCache[key] {
                 lockQueue.sync {
                     countryDict[cachedCountry, default: 0] += route.distanceKm
-                    if let cachedCity = mutableCityCache[key] {
+                    if let cachedCity = mutableCityCache[key], LocalGeocoder.isSpecificCityName(cachedCity) {
                         cityDict[cachedCity, default: 0] += route.distanceKm
                     }
                 }
@@ -829,7 +1121,9 @@ struct StatsView: View {
                     mutableCoordCache[key] = country
                     mutableCityCache[key] = city
                         countryDict[country, default: 0] += route.distanceKm
-                        cityDict[city, default: 0] += route.distanceKm
+                        if LocalGeocoder.isSpecificCityName(city) {
+                            cityDict[city, default: 0] += route.distanceKm
+                        }
                 }
                 
                 DispatchQueue.main.async {
@@ -857,6 +1151,18 @@ struct StatsView: View {
 
 }
 
+private struct StatsFrequencyBin: Identifiable {
+    let id = UUID()
+    let label: String
+    let count: Int
+}
+
+private struct DailyDistanceCell: Identifiable {
+    let id = UUID()
+    let date: Date
+    let distanceKm: Double
+}
+
 // MARK: - Array Extension for Batching
 extension Array {
     func chunked(into size: Int) -> [[Element]] {
@@ -871,4 +1177,3 @@ struct StatsView_Previews: PreviewProvider {
         StatsView(routes: [], onLocationSelected: nil)
     }
 }
-
