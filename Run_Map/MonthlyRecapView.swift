@@ -401,7 +401,7 @@ struct MonthlyRecapView: View {
     }
 
     private func header(_ report: MonthlyRecapReport) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        return VStack(alignment: .leading, spacing: 6) {
             Text(report.title)
                 .font(.largeTitle)
                 .fontWeight(.bold)
@@ -640,7 +640,13 @@ struct MonthlyGoalProgressSection: View {
     }
 
     private func progressRow(title: String, current: Double, target: Double, suffix: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let safeTarget = max(target, 1)
+        let scaleMax = max(current, safeTarget)
+        let progressFraction = min(max(current / scaleMax, 0), 1)
+        let goalFraction = min(max(safeTarget / scaleMax, 0), 1)
+        let axisEndPercent = Int(ceil((scaleMax / safeTarget) * 100))
+
+        return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(title)
                     .font(.subheadline)
@@ -650,7 +656,41 @@ struct MonthlyGoalProgressSection: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
-            ProgressView(value: min(current / max(target, 1), 1))
+
+            VStack(alignment: .leading, spacing: 4) {
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color(.systemGray5))
+
+                        Capsule()
+                            .fill(Color.accentColor)
+                            .frame(width: proxy.size.width * progressFraction)
+
+                        Rectangle()
+                            .fill(Color.primary.opacity(0.75))
+                            .frame(width: 2, height: 18)
+                            .offset(x: max(0, min(proxy.size.width - 2, proxy.size.width * goalFraction - 1)))
+                    }
+                }
+                .frame(height: 10)
+
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Text("0%")
+                            .position(x: 8, y: 7)
+                        Text("100%")
+                            .position(x: max(18, min(proxy.size.width - 18, proxy.size.width * goalFraction)), y: 7)
+                        if axisEndPercent > 100 {
+                            Text("\(axisEndPercent)%")
+                                .position(x: proxy.size.width - 18, y: 7)
+                        }
+                    }
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                }
+                .frame(height: 14)
+            }
         }
     }
 
