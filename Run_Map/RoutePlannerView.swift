@@ -339,6 +339,7 @@ private struct PlannerMapView: UIViewRepresentable {
             showCurrentStreetCoverage: showCurrentStreetCoverage,
             consolidatedStreets: consolidatedStreets,
             streetCoverageByID: streetCoverageByID,
+            waypoints: waypoints,
             on: mapView
         )
         context.coordinator.render(waypoints: waypoints, on: mapView)
@@ -359,8 +360,8 @@ private struct PlannerMapView: UIViewRepresentable {
         private var coverageOverlays: [MKOverlay] = []
         private weak var coveredStreetOverlay: MKMultiPolyline?
         private weak var uncoveredStreetOverlay: MKMultiPolyline?
+        private weak var plannedStreetOverlay: MKMultiPolyline?
         private var coverageRenderGeneration = 0
-        private var annotations: [MKAnnotation] = []
 
         init(parent: PlannerMapView) {
             self.parent = parent
@@ -377,11 +378,13 @@ private struct PlannerMapView: UIViewRepresentable {
             showCurrentStreetCoverage: Bool,
             consolidatedStreets: [ConsolidatedStreet],
             streetCoverageByID: [String: ConsolidatedStreet.CoverageResult],
+            waypoints: [CLLocationCoordinate2D],
             on mapView: MKMapView
         ) {
             let coveredStreetCount = streetCoverageByID.values.filter { $0.coveredPoints > 0 || $0.percentage > 0 }.count
+            let waypointSignature = Self.coordinateSignature(for: waypoints)
             let signature = showCurrentStreetCoverage
-                ? "on:\(consolidatedStreets.count):\(streetCoverageByID.count):\(coveredStreetCount)"
+                ? "on:\(consolidatedStreets.count):\(streetCoverageByID.count):\(coveredStreetCount):\(waypointSignature)"
                 : "off"
             guard signature != renderedCoverageSignature else { return }
             renderedCoverageSignature = signature
@@ -394,6 +397,7 @@ private struct PlannerMapView: UIViewRepresentable {
             }
             coveredStreetOverlay = nil
             uncoveredStreetOverlay = nil
+            plannedStreetOverlay = nil
 
             guard showCurrentStreetCoverage else { return }
 
@@ -403,7 +407,8 @@ private struct PlannerMapView: UIViewRepresentable {
                     : consolidatedStreets
                 let groups = Self.makeStreetCoveragePolylineGroups(
                     streets: streets,
-                    coverageByID: streetCoverageByID
+                    coverageByID: streetCoverageByID,
+                    waypoints: waypoints
                 )
 
                 DispatchQueue.main.async {
@@ -419,6 +424,12 @@ private struct PlannerMapView: UIViewRepresentable {
                     if !groups.covered.isEmpty {
                         let overlay = MKMultiPolyline(groups.covered)
                         self.coveredStreetOverlay = overlay
+                        newOverlays.append(overlay)
+                    }
+
+                    if !groups.planned.isEmpty {
+                        let overlay = MKMultiPolyline(groups.planned)
+                        self.plannedStreetOverlay = overlay
                         newOverlays.append(overlay)
                     }
 
@@ -439,22 +450,29 @@ private struct PlannerMapView: UIViewRepresentable {
 
         private static func makeStreetCoveragePolylineGroups(
             streets: [ConsolidatedStreet],
-            coverageByID: [String: ConsolidatedStreet.CoverageResult]
-        ) -> (covered: [MKPolyline], uncovered: [MKPolyline]) {
+            coverageByID: [String: ConsolidatedStreet.CoverageResult],
+            waypoints: [CLLocationCoordinate2D]
+        ) -> (covered: [MKPolyline], uncovered: [MKPolyline], planned: [MKPolyline]) {
             var covered: [MKPolyline] = []
             var uncovered: [MKPolyline] = []
+            var planned: [MKPolyline] = []
             covered.reserveCapacity(coverageByID.count)
+
+            let checker = makeRouteChecker(for: waypoints)
 
             for street in streets {
                 let coverage = coverageByID[street.id]
                 let hasAnyHit = (coverage?.coveredPoints ?? 0) > 0 || (coverage?.percentage ?? 0) > 0
+                let wouldBeHit = checker.map { street.calculateCoverage(using: $0, densify: false).coveredPoints > 0 } ?? false
 
                 for segment in street.segments {
                     let coordinates = segment.clCoordinates
                     guard coordinates.count >= 2 else { continue }
 
                     let polyline = MKPolyline(coordinates: coordinates, count: coordinates.count)
-                    if hasAnyHit {
+                    if wouldBeHit {
+                        planned.append(polyline)
+                    } else if hasAnyHit {
                         covered.append(polyline)
                     } else {
                         uncovered.append(polyline)
@@ -462,13 +480,28 @@ private struct PlannerMapView: UIViewRepresentable {
                 }
             }
 
-            return (covered, uncovered)
+            return (covered, uncovered, planned)
+        }
+
+        private static func makeRouteChecker(for waypoints: [CLLocationCoordinate2D]) -> FastStreetChecker? {
+            guard waypoints.count >= 2 else { return nil }
+            let route = Route(
+                coordinates: PlannedRouteStats.sampledPath(from: waypoints, maxStepMeters: 25),
+                date: Date(),
+                workoutType: .walking,
+                durationSec: 0
+            )
+            return FastStreetChecker(routes: [route])
+        }
+
+        private static func coordinateSignature(for coordinates: [CLLocationCoordinate2D]) -> String {
+            coordinates
+                .map { "\(String(format: "%.5f", $0.latitude)),\(String(format: "%.5f", $0.longitude))" }
+                .joined(separator: "|")
         }
 
         func render(waypoints: [CLLocationCoordinate2D], on mapView: MKMapView) {
-            let signature = waypoints
-                .map { "\(String(format: "%.5f", $0.latitude)),\(String(format: "%.5f", $0.longitude))" }
-                .joined(separator: "|")
+            let signature = Self.coordinateSignature(for: waypoints)
             guard signature != renderedSignature else { return }
             renderedSignature = signature
 
@@ -476,35 +509,11 @@ private struct PlannerMapView: UIViewRepresentable {
                 mapView.removeOverlays(overlays)
                 overlays.removeAll(keepingCapacity: true)
             }
-            if !annotations.isEmpty {
-                mapView.removeAnnotations(annotations)
-                annotations.removeAll(keepingCapacity: true)
-            }
 
             if waypoints.count >= 2 {
                 let polyline = PlannedRoutePolyline(coordinates: waypoints, count: waypoints.count)
                 overlays.append(polyline)
                 mapView.addOverlay(polyline)
-            }
-
-            if let first = waypoints.first {
-                let annotation = PlanWaypointAnnotation()
-                annotation.coordinate = first
-                annotation.title = "Start"
-                annotation.glyph = "S"
-                annotations.append(annotation)
-            }
-
-            if waypoints.count > 1, let last = waypoints.last {
-                let annotation = PlanWaypointAnnotation()
-                annotation.coordinate = last
-                annotation.title = "Finish"
-                annotation.glyph = "F"
-                annotations.append(annotation)
-            }
-
-            if !annotations.isEmpty {
-                mapView.addAnnotations(annotations)
             }
         }
 
@@ -528,6 +537,10 @@ private struct PlannerMapView: UIViewRepresentable {
                     renderer.strokeColor = UIColor.systemRed.withAlphaComponent(0.58)
                     renderer.lineWidth = 2.1
                     renderer.alpha = 0.95
+                } else if multiPolyline === plannedStreetOverlay {
+                    renderer.strokeColor = UIColor.systemYellow.withAlphaComponent(0.9)
+                    renderer.lineWidth = 3.5
+                    renderer.alpha = 0.98
                 } else {
                     renderer.strokeColor = UIColor.systemGray.withAlphaComponent(0.45)
                     renderer.lineWidth = 2
@@ -548,24 +561,9 @@ private struct PlannerMapView: UIViewRepresentable {
             renderer.lineJoin = .round
             return renderer
         }
-
-        func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
-            guard annotation is PlanWaypointAnnotation else { return nil }
-            let identifier = "PlanWaypoint"
-            let view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier) as? MKMarkerAnnotationView
-                ?? MKMarkerAnnotationView(annotation: annotation, reuseIdentifier: identifier)
-            view.annotation = annotation
-            view.markerTintColor = .systemPurple
-            view.glyphText = (annotation as? PlanWaypointAnnotation)?.glyph
-            view.canShowCallout = false
-            return view
-        }
     }
 }
 
-private final class PlanWaypointAnnotation: MKPointAnnotation {
-    var glyph: String?
-}
 private final class PlannedRoutePolyline: MKPolyline {}
 
 private struct SavedRoutePlan: Identifiable, Codable {
@@ -719,7 +717,7 @@ private struct PlannedRouteStats {
         return sorted(names)
     }
 
-    private static func sampledPath(from coordinates: [CLLocationCoordinate2D], maxStepMeters: Double) -> [CLLocationCoordinate2D] {
+    static func sampledPath(from coordinates: [CLLocationCoordinate2D], maxStepMeters: Double) -> [CLLocationCoordinate2D] {
         guard coordinates.count >= 2 else { return coordinates }
 
         var samples: [CLLocationCoordinate2D] = []
