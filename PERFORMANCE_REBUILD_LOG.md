@@ -30,6 +30,7 @@ This file tracks measurable changes made during the rebuild. Keep entries factua
 | 2026-05-12 | Generic iOS build after adding grouped Berlin street coverage map | Passed | App target compiles for generic iOS with `CODE_SIGNING_ALLOWED=NO`; the map uses two `MKMultiPolyline` overlays instead of thousands of individual street overlays. |
 | 2026-05-12 | Generic iOS build after adding indexed GeoNames city gazetteer | Passed | App target compiles for generic iOS with `CODE_SIGNING_ALLOWED=NO`; city lookup now loads a 63,489-city TSV once and searches nearby 2-degree spatial cells instead of relying only on the hardcoded major-city switch. |
 | 2026-05-12 | Generic iOS build after adding manual route planner preview | Passed | App target compiles for generic iOS with `CODE_SIGNING_ALLOWED=NO`; planned route stats run off the main thread and reuse cached street coverage data instead of mutating real achievement progress. |
+| 2026-05-12 | Generic iOS build after adding saved plans and planner street coverage overlay | Passed | App target compiles for generic iOS with `CODE_SIGNING_ALLOWED=NO`; saved route plans are stored separately from real routes and covered-street display uses one grouped `MKMultiPolyline` overlay. |
 
 ## Current Architectural Baseline
 
@@ -61,6 +62,7 @@ This file tracks measurable changes made during the rebuild. Keep entries factua
 | Berlin Streets achievement map | Point map rebuilt route proximity checks inside the sheet | Uses already computed street coverage and renders covered/uncovered streets as two grouped `MKMultiPolyline` overlays | Avoid external DB work and avoid one-overlay-per-street rendering churn. |
 | City geocoding coverage | Hardcoded list of roughly 80-90 global major cities | Bundled 63,489-row GeoNames city gazetteer indexed into 2-degree spatial cells, with hardcoded list retained as fallback | Improve city achievement coverage without a linear scan across all cities per geocode. |
 | Route planning preview | No way to preview route impact before a walk/run | Manual waypoint planner computes projected distance, walk/run duration, places, Berlin districts/Stadtteile, and likely new streets using existing caches | Let planning reuse rebuilt engines without adding HealthKit writes or achievement side effects. |
+| Planner map coverage context | No coverage context while drawing planned route | Optional current-street-coverage toggle renders covered Berlin street segments as a subtle grouped overlay | Provide planning context without rebuilding coverage or adding one MapKit overlay per street. |
 
 ## Change Log
 
@@ -109,3 +111,8 @@ This file tracks measurable changes made during the rebuild. Keep entries factua
 - Planner preview computes distance, estimated walk/run duration, countries/cities, Berlin districts/Stadtteile, and likely new Berlin streets using existing geocoding and street coverage data.
 - Planned route calculations run on a background queue and do not create real routes or mutate achievements.
 - Generic iOS app build passes with signing disabled after the planner change.
+- Added title-based saved plans inside the planner, persisted separately via `UserDefaults`.
+- Added saved plan loading and deletion from the planner sheet.
+- Added an optional current street coverage toggle in the planner map.
+- Current street coverage renders as one subtle `MKMultiPolyline` overlay built from already-covered Berlin street segments.
+- Generic iOS app build passes with signing disabled after saved plans and coverage context.

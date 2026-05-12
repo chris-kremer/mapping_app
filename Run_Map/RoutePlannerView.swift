@@ -12,6 +12,10 @@ struct RoutePlannerView: View {
     @State private var waypoints: [CLLocationCoordinate2D] = []
     @State private var stats = PlannedRouteStats.empty
     @State private var isComputingStats = false
+    @State private var savedPlans: [SavedRoutePlan] = []
+    @State private var showSavePlanDialog = false
+    @State private var planTitle = ""
+    @State private var showCurrentStreetCoverage = false
 
     private var waypointSignature: String {
         waypoints
@@ -25,6 +29,9 @@ struct RoutePlannerView: View {
                 PlannerMapView(
                     waypoints: waypoints,
                     initialRegion: initialRegion,
+                    showCurrentStreetCoverage: showCurrentStreetCoverage,
+                    consolidatedStreets: consolidatedStreets,
+                    streetCoverageByID: streetCoverageByID,
                     onAddWaypoint: { coordinate in
                         waypoints.append(coordinate)
                     }
@@ -52,6 +59,12 @@ struct RoutePlannerView: View {
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Menu {
+                        Button("Save Plan", systemImage: "square.and.arrow.down") {
+                            planTitle = defaultPlanTitle
+                            showSavePlanDialog = true
+                        }
+                        .disabled(waypoints.count < 2)
+
                         Button("Undo Last", systemImage: "arrow.uturn.backward") {
                             if !waypoints.isEmpty {
                                 waypoints.removeLast()
@@ -70,9 +83,22 @@ struct RoutePlannerView: View {
             }
         }
         .navigationViewStyle(.stack)
-        .onAppear(perform: recalculateStats)
+        .onAppear {
+            savedPlans = SavedRoutePlanStore.load()
+            recalculateStats()
+        }
         .onChange(of: waypointSignature) { _ in
             recalculateStats()
+        }
+        .alert("Save Plan", isPresented: $showSavePlanDialog) {
+            TextField("Title", text: $planTitle)
+            Button("Save") {
+                saveCurrentPlan()
+            }
+            .disabled(planTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Name this planned route so you can reopen it later.")
         }
     }
 
@@ -95,6 +121,24 @@ struct RoutePlannerView: View {
                     metricPill(title: "Points", value: "\(waypoints.count)", color: .orange)
                 }
 
+                HStack(spacing: 12) {
+                    Button {
+                        planTitle = defaultPlanTitle
+                        showSavePlanDialog = true
+                    } label: {
+                        Label("Save Plan", systemImage: "square.and.arrow.down")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(waypoints.count < 2)
+
+                    Toggle(isOn: $showCurrentStreetCoverage) {
+                        Label("Street Coverage", systemImage: "map")
+                    }
+                    .toggleStyle(.switch)
+                    .font(.subheadline)
+                    .disabled(consolidatedStreets.isEmpty || streetCoverageByID.isEmpty)
+                }
+
                 if waypoints.count < 2 {
                     Text("Add at least two waypoints to preview route stats.")
                         .font(.subheadline)
@@ -104,10 +148,48 @@ struct RoutePlannerView: View {
                     statsSection(title: "Berlin", items: stats.berlinLines)
                     newStreetSection
                 }
+
+                savedPlansSection
             }
             .padding()
         }
-        .frame(maxHeight: 285)
+        .frame(maxHeight: 340)
+    }
+
+    private var savedPlansSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !savedPlans.isEmpty {
+                Text("Saved Plans")
+                    .font(.headline)
+
+                ForEach(savedPlans.prefix(5)) { plan in
+                    HStack(spacing: 10) {
+                        Button {
+                            waypoints = plan.coordinates
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(plan.title)
+                                    .font(.subheadline)
+                                    .fontWeight(.semibold)
+                                Text("\(plan.coordinates.count) points")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
+
+                        Button(role: .destructive) {
+                            deletePlan(plan)
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
     }
 
     private var newStreetSection: some View {
@@ -203,11 +285,35 @@ struct RoutePlannerView: View {
             }
         }
     }
+
+    private var defaultPlanTitle: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return "Plan \(formatter.string(from: Date()))"
+    }
+
+    private func saveCurrentPlan() {
+        let trimmedTitle = planTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard waypoints.count >= 2, !trimmedTitle.isEmpty else { return }
+
+        let plan = SavedRoutePlan(title: trimmedTitle, createdAt: Date(), coordinates: waypoints)
+        savedPlans.insert(plan, at: 0)
+        SavedRoutePlanStore.save(savedPlans)
+    }
+
+    private func deletePlan(_ plan: SavedRoutePlan) {
+        savedPlans.removeAll { $0.id == plan.id }
+        SavedRoutePlanStore.save(savedPlans)
+    }
 }
 
 private struct PlannerMapView: UIViewRepresentable {
     let waypoints: [CLLocationCoordinate2D]
     let initialRegion: MKCoordinateRegion
+    let showCurrentStreetCoverage: Bool
+    let consolidatedStreets: [ConsolidatedStreet]
+    let streetCoverageByID: [String: ConsolidatedStreet.CoverageResult]
     let onAddWaypoint: (CLLocationCoordinate2D) -> Void
 
     func makeUIView(context: Context) -> MKMapView {
@@ -226,6 +332,12 @@ private struct PlannerMapView: UIViewRepresentable {
 
     func updateUIView(_ mapView: MKMapView, context: Context) {
         context.coordinator.parent = self
+        context.coordinator.renderStreetCoverage(
+            showCurrentStreetCoverage: showCurrentStreetCoverage,
+            consolidatedStreets: consolidatedStreets,
+            streetCoverageByID: streetCoverageByID,
+            on: mapView
+        )
         context.coordinator.render(waypoints: waypoints, on: mapView)
     }
 
@@ -237,7 +349,9 @@ private struct PlannerMapView: UIViewRepresentable {
         var parent: PlannerMapView
         weak var mapView: MKMapView?
         private var renderedSignature = ""
+        private var renderedCoverageSignature = ""
         private var overlays: [MKOverlay] = []
+        private var coverageOverlays: [MKOverlay] = []
         private var annotations: [MKAnnotation] = []
 
         init(parent: PlannerMapView) {
@@ -249,6 +363,45 @@ private struct PlannerMapView: UIViewRepresentable {
             let point = recognizer.location(in: mapView)
             let coordinate = mapView.convert(point, toCoordinateFrom: mapView)
             parent.onAddWaypoint(coordinate)
+        }
+
+        func renderStreetCoverage(
+            showCurrentStreetCoverage: Bool,
+            consolidatedStreets: [ConsolidatedStreet],
+            streetCoverageByID: [String: ConsolidatedStreet.CoverageResult],
+            on mapView: MKMapView
+        ) {
+            let coveredStreetCount = streetCoverageByID.values.filter { $0.coveredPoints > 0 }.count
+            let signature = showCurrentStreetCoverage
+                ? "on:\(consolidatedStreets.count):\(streetCoverageByID.count):\(coveredStreetCount)"
+                : "off"
+            guard signature != renderedCoverageSignature else { return }
+            renderedCoverageSignature = signature
+
+            if !coverageOverlays.isEmpty {
+                mapView.removeOverlays(coverageOverlays)
+                coverageOverlays.removeAll(keepingCapacity: true)
+            }
+
+            guard showCurrentStreetCoverage else { return }
+
+            var coveredPolylines: [MKPolyline] = []
+            coveredPolylines.reserveCapacity(coveredStreetCount)
+
+            for street in consolidatedStreets {
+                guard (streetCoverageByID[street.id]?.coveredPoints ?? 0) > 0 else { continue }
+
+                for segment in street.segments {
+                    let coordinates = segment.clCoordinates
+                    guard coordinates.count >= 2 else { continue }
+                    coveredPolylines.append(MKPolyline(coordinates: coordinates, count: coordinates.count))
+                }
+            }
+
+            guard !coveredPolylines.isEmpty else { return }
+            let overlay = MKMultiPolyline(coveredPolylines)
+            coverageOverlays = [overlay]
+            mapView.addOverlay(overlay, level: .aboveRoads)
         }
 
         func render(waypoints: [CLLocationCoordinate2D], on mapView: MKMapView) {
@@ -286,6 +439,15 @@ private struct PlannerMapView: UIViewRepresentable {
         }
 
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            if let multiPolyline = overlay as? MKMultiPolyline {
+                let renderer = MKMultiPolylineRenderer(multiPolyline: multiPolyline)
+                renderer.strokeColor = UIColor.systemTeal.withAlphaComponent(0.35)
+                renderer.lineWidth = 2
+                renderer.lineCap = .round
+                renderer.lineJoin = .round
+                return renderer
+            }
+
             guard let polyline = overlay as? PlannedRoutePolyline else {
                 return MKOverlayRenderer(overlay: overlay)
             }
@@ -314,6 +476,47 @@ private struct PlannerMapView: UIViewRepresentable {
 
 private final class PlanWaypointAnnotation: MKPointAnnotation {}
 private final class PlannedRoutePolyline: MKPolyline {}
+
+private struct SavedRoutePlan: Identifiable, Codable {
+    let id: UUID
+    let title: String
+    let createdAt: Date
+    let points: [SavedRoutePlanPoint]
+
+    init(id: UUID = UUID(), title: String, createdAt: Date, coordinates: [CLLocationCoordinate2D]) {
+        self.id = id
+        self.title = title
+        self.createdAt = createdAt
+        self.points = coordinates.map { SavedRoutePlanPoint(latitude: $0.latitude, longitude: $0.longitude) }
+    }
+
+    var coordinates: [CLLocationCoordinate2D] {
+        points.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
+    }
+}
+
+private struct SavedRoutePlanPoint: Codable {
+    let latitude: Double
+    let longitude: Double
+}
+
+private enum SavedRoutePlanStore {
+    private static let key = "routePlanner.savedPlans.v1"
+
+    static func load() -> [SavedRoutePlan] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let plans = try? JSONDecoder().decode([SavedRoutePlan].self, from: data) else {
+            return []
+        }
+        return plans.sorted { $0.createdAt > $1.createdAt }
+    }
+
+    static func save(_ plans: [SavedRoutePlan]) {
+        let sortedPlans = plans.sorted { $0.createdAt > $1.createdAt }
+        guard let data = try? JSONEncoder().encode(sortedPlans) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+}
 
 private struct PlannedRouteStats {
     let distanceKm: Double
