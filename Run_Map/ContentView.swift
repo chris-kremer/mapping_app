@@ -61,30 +61,85 @@ final class Route: Identifiable {
     }
 }
 
+private enum RouteCoordinateSimplifier {
+    static let maxStoredCoordinates = 600
+
+    static func simplified(_ coordinates: [CLLocationCoordinate2D]) -> [CLLocationCoordinate2D] {
+        guard coordinates.count > maxStoredCoordinates else { return coordinates }
+
+        let step = max(1, coordinates.count / maxStoredCoordinates)
+        var sampled: [CLLocationCoordinate2D] = []
+        sampled.reserveCapacity(maxStoredCoordinates + 2)
+
+        for index in stride(from: 0, to: coordinates.count, by: step) {
+            sampled.append(coordinates[index])
+        }
+
+        if let last = coordinates.last,
+           let sampledLast = sampled.last,
+           !sampledLast.isEqual(to: last, tolerance: 0.000001) {
+            sampled.append(last)
+        }
+
+        return sampled
+    }
+}
+
 // MARK: - Persistable Route Data
+
+struct PersistedCoordinate: Codable {
+    let lat: Double
+    let lon: Double
+}
 
 struct PersistedRoute: Codable {
     let id: UUID
-    let coordinates: [[String: Double]]
+    let coordinates: [PersistedCoordinate]
     let date: Date
     let workoutType: UInt
     let durationSec: Double
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case coordinates
+        case date
+        case workoutType
+        case durationSec
+    }
     
     init(from route: Route) {
         self.id = route.id
-        self.coordinates = route.coordinates.map { ["lat": $0.latitude, "lon": $0.longitude] }
+        self.coordinates = route.coordinates.map { PersistedCoordinate(lat: $0.latitude, lon: $0.longitude) }
         self.date = route.date
         self.workoutType = route.workoutType.rawValue
         self.durationSec = route.durationSec
     }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        date = try container.decode(Date.self, forKey: .date)
+        workoutType = try container.decode(UInt.self, forKey: .workoutType)
+        durationSec = try container.decode(Double.self, forKey: .durationSec)
+
+        if let compact = try? container.decode([PersistedCoordinate].self, forKey: .coordinates) {
+            coordinates = compact
+            return
+        }
+
+        let legacy = try container.decode([[String: Double]].self, forKey: .coordinates)
+        coordinates = legacy.compactMap { dict in
+            guard let lat = dict["lat"], let lon = dict["lon"] else { return nil }
+            return PersistedCoordinate(lat: lat, lon: lon)
+        }
+    }
     
     func toRoute() -> Route {
-        let coords = coordinates.compactMap { dict -> CLLocationCoordinate2D? in
-            guard let lat = dict["lat"], let lon = dict["lon"] else { return nil }
-            return CLLocationCoordinate2D(latitude: lat, longitude: lon)
+        let coords = coordinates.map { coordinate in
+            CLLocationCoordinate2D(latitude: coordinate.lat, longitude: coordinate.lon)
         }
         return Route(
-            coordinates: coords,
+            coordinates: RouteCoordinateSimplifier.simplified(coords),
             date: date,
             workoutType: HKWorkoutActivityType(rawValue: workoutType) ?? .other,
             durationSec: durationSec
@@ -97,6 +152,8 @@ struct PersistedRoute: Codable {
 class RouteStorage {
     private let fileManager = FileManager.default
     private let fileName = "cached_routes.json"
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
     
     private var fileURL: URL {
         let documentsPath = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -104,13 +161,36 @@ class RouteStorage {
     }
     
     func saveRoutes(_ routes: [Route]) {
+        let tempURL = fileURL.appendingPathExtension("tmp")
         do {
-            let persistedRoutes = routes.map { PersistedRoute(from: $0) }
-            let data = try JSONEncoder().encode(persistedRoutes)
-            try data.write(to: fileURL)
+            fileManager.createFile(atPath: tempURL.path, contents: nil)
+            let handle = try FileHandle(forWritingTo: tempURL)
+            defer { try? handle.close() }
+
+            for route in routes {
+                let data = try encoder.encode(PersistedRoute(from: route))
+                try handle.write(contentsOf: data)
+                try handle.write(contentsOf: Data([0x0A]))
+            }
+
+            if fileManager.fileExists(atPath: fileURL.path) {
+                _ = try fileManager.replaceItemAt(fileURL, withItemAt: tempURL)
+            } else {
+                try fileManager.moveItem(at: tempURL, to: fileURL)
+            }
             print("✅ Saved \(routes.count) routes to cache")
         } catch {
+            try? fileManager.removeItem(at: tempURL)
             print("❌ Failed to save routes: \(error.localizedDescription)")
+        }
+    }
+
+    func saveRoutesAsync(_ routes: [Route], completion: (() -> Void)? = nil) {
+        DispatchQueue.global(qos: .utility).async {
+            self.saveRoutes(routes)
+            DispatchQueue.main.async {
+                completion?()
+            }
         }
     }
     
@@ -118,22 +198,36 @@ class RouteStorage {
         do {
             let routes = try RunMapPerformanceMetrics.measure("route_cache_decode") {
                 let data = try Data(contentsOf: fileURL)
-                let persistedRoutes = try JSONDecoder().decode([PersistedRoute].self, from: data)
-                return persistedRoutes.compactMap { persistedRoute -> Route? in
-                    let route = persistedRoute.toRoute()
-                    // Filter out routes with no coordinates
-                    guard !route.coordinates.isEmpty else {
-                        print("⚠️ Filtering out cached route with no coordinates: \(route.id)")
-                        return nil
-                    }
-                    return route
-                }
+                let persistedRoutes = try decodePersistedRoutes(from: data)
+                return validRoutes(from: persistedRoutes)
             }
             print("✅ Loaded \(routes.count) routes from cache")
             return routes
         } catch {
             print("ℹ️ No cached routes found or failed to load: \(error.localizedDescription)")
             return []
+        }
+    }
+
+    private func decodePersistedRoutes(from data: Data) throws -> [PersistedRoute] {
+        if data.first == UInt8(ascii: "[") {
+            return try decoder.decode([PersistedRoute].self, from: data)
+        }
+
+        return data.split(separator: UInt8(ascii: "\n")).compactMap { line in
+            guard !line.isEmpty else { return nil }
+            return try? decoder.decode(PersistedRoute.self, from: Data(line))
+        }
+    }
+
+    private func validRoutes(from persistedRoutes: [PersistedRoute]) -> [Route] {
+        persistedRoutes.compactMap { persistedRoute -> Route? in
+            let route = persistedRoute.toRoute()
+            guard !route.coordinates.isEmpty else {
+                print("⚠️ Filtering out cached route with no coordinates: \(route.id)")
+                return nil
+            }
+            return route
         }
     }
 
@@ -215,7 +309,7 @@ class RunViewModel: ObservableObject {
                 // Save cleaned routes back to cache if we removed any
                 if validRoutes.count != cachedRoutes.count {
                     print("💾 Saving cleaned routes to cache: \(validRoutes.count) routes (removed \(cachedRoutes.count - validRoutes.count))")
-                    self.routeStorage.saveRoutes(validRoutes)
+                    self.routeStorage.saveRoutesAsync(validRoutes)
                 }
             }
 
@@ -292,7 +386,7 @@ class RunViewModel: ObservableObject {
             group.notify(queue: .main) {
                 self.routes = newRoutes.sorted { $0.date > $1.date }
                 self.hasContent = !self.routes.isEmpty
-                self.routeStorage.saveRoutes(self.routes)
+                self.routeStorage.saveRoutesAsync(self.routes)
                 self.routeStorage.setLastSyncDate(Date())
             }
         }
@@ -381,7 +475,7 @@ class RunViewModel: ObservableObject {
                 if !dedupedRoutes.isEmpty {
                     self.routes = dedupedRoutes
                     self.hasContent = true
-                    self.routeStorage.saveRoutes(dedupedRoutes)
+                    self.routeStorage.saveRoutesAsync(dedupedRoutes)
                     print("💾 Full HealthKit refresh saved \(dedupedRoutes.count) routes")
                 } else {
                     print("ℹ️ Full HealthKit refresh found no route data; keeping existing cache")
@@ -453,17 +547,49 @@ class RunViewModel: ObservableObject {
             }
             
             var newRoutes: [Route] = []
-            let group = DispatchGroup()
-            
-            for workout in newWorkouts {
-                group.enter()
+            var skippedCount = 0
+
+            func processWorkout(at index: Int) {
+                guard index < newWorkouts.count else {
+                    DispatchQueue.main.async {
+                        print("📊 Processed \(newWorkouts.count) new workouts: \(newRoutes.count) with GPS data, \(skippedCount) skipped")
+                        if !newRoutes.isEmpty {
+                            print("📍 Adding \(newRoutes.count) new routes to existing \(self.routes.count)")
+                            self.routes.append(contentsOf: newRoutes)
+                            self.routes.sort { $0.date > $1.date }
+                            self.hasContent = !self.routes.isEmpty
+
+                            // Save updated routes to cache
+                            self.routeStorage.saveRoutesAsync(self.routes)
+                            print("💾 Total routes after sync: \(self.routes.count)")
+                        } else {
+                            if skippedCount > 0 {
+                                print("ℹ️ No new routes added - all \(skippedCount) workouts lacked GPS data")
+                            } else {
+                                print("ℹ️ No new routes to add")
+                            }
+                        }
+                        self.routeStorage.setLastSyncDate(Date())
+                        self.loadProgress = 1.0
+                    }
+                    return
+                }
+
+                let workout = newWorkouts[index]
                 self.healthManager.fetchRoute(for: workout) { locations in
                     let coordinates = locations.map { $0.coordinate }
                     
                     // Only process workouts that have GPS data
                     guard !coordinates.isEmpty else {
                         print("⚠️ Skipping workout with no GPS data: \(workout.startDate)")
-                        group.leave()
+                        skippedCount += 1
+                        DispatchQueue.main.async {
+                            self.loadedCount += 1
+                            if self.totalToLoad > 0 {
+                                self.loadProgress = Double(self.loadedCount) / Double(self.totalToLoad)
+                            }
+                        }
+                        processWorkout(at: index + 1)
                         return
                     }
                     
@@ -471,16 +597,17 @@ class RunViewModel: ObservableObject {
                     
                     let segments = self.filterRoute(coordinates)
                     
-                        for segment in segments {
+                    for segment in segments {
                         // Only create routes with meaningful coordinate data
                         guard segment.count > 1 else { continue }
+                        let storedSegment = RouteCoordinateSimplifier.simplified(segment)
                         
-                        let route = Route(coordinates: segment,
-                                                     date: workout.startDate,
-                                                     workoutType: workout.workoutActivityType,
-                                        durationSec: workout.duration)
+                        let route = Route(coordinates: storedSegment,
+                                          date: workout.startDate,
+                                          workoutType: workout.workoutActivityType,
+                                          durationSec: workout.duration)
                         newRoutes.append(route)
-                        }
+                    }
                     
                     DispatchQueue.main.async {
                         self.loadedCount += 1
@@ -488,35 +615,14 @@ class RunViewModel: ObservableObject {
                             self.loadProgress = Double(self.loadedCount) / Double(self.totalToLoad)
                         }
                     }
-                    group.leave()
+                    processWorkout(at: index + 1)
                 }
             }
-            
-            group.notify(queue: .main) {
-                let skippedCount = newWorkouts.count - newRoutes.count
-                print("📊 Processed \(newWorkouts.count) new workouts: \(newRoutes.count) with GPS data, \(skippedCount) skipped")
-                if !newRoutes.isEmpty {
-                    print("📍 Adding \(newRoutes.count) new routes to existing \(self.routes.count)")
-                    self.routes.append(contentsOf: newRoutes)
-                    self.routes.sort { $0.date > $1.date }
-                        self.hasContent = !self.routes.isEmpty
-                    
-                    // Save updated routes to cache
-                    self.routeStorage.saveRoutes(self.routes)
-                    print("💾 Total routes after sync: \(self.routes.count)")
-                } else {
-                    if skippedCount > 0 {
-                        print("ℹ️ No new routes added - all \(skippedCount) workouts lacked GPS data")
-                    } else {
-                        print("ℹ️ No new routes to add")
-                    }
-                }
-                self.routeStorage.setLastSyncDate(Date())
-                self.loadProgress = 1.0
-            }
+
+            processWorkout(at: 0)
         }
     }
-    
+
     func filterRoute(_ coordinates: [CLLocationCoordinate2D], maxDistance: CLLocationDistance = 20) -> [[CLLocationCoordinate2D]] {
         guard coordinates.count > 1 else { return [coordinates] }
         var segments: [[CLLocationCoordinate2D]] = []
@@ -1950,6 +2056,8 @@ struct ContentView: View {
 // MARK: - RouteMapView
 
 struct RouteMapView: UIViewRepresentable {
+    private static let maxRenderedRouteOverlays = 500
+
     var routes: [Route]
     var region: MKCoordinateRegion
     var highlightedRouteIDs: Set<UUID>
@@ -2003,8 +2111,9 @@ struct RouteMapView: UIViewRepresentable {
             streetsByStadtteil: streetsByStadtteil
         )
 
+        let desiredRoutes = routesForRendering()
         let existingIDs = Set(context.coordinator.routeOverlaysByID.keys)
-        let desiredIDs = Set(routes.map(\.id))
+        let desiredIDs = Set(desiredRoutes.map(\.id))
 
         let staleIDs = existingIDs.subtracting(desiredIDs)
         let staleOverlays = staleIDs.compactMap { context.coordinator.routeOverlaysByID.removeValue(forKey: $0) }
@@ -2013,7 +2122,7 @@ struct RouteMapView: UIViewRepresentable {
         }
 
         var toAdd: [MKOverlay] = []
-        for route in routes where !existingIDs.contains(route.id) {
+        for route in desiredRoutes where !existingIDs.contains(route.id) {
             let pl = RoutePolyline.fromCoordinates(route.coordinates)
             pl.routeID = route.id
             pl.routeDate = route.date
@@ -2037,6 +2146,22 @@ struct RouteMapView: UIViewRepresentable {
                 }
             }
         }
+    }
+
+    private func routesForRendering() -> [Route] {
+        guard routes.count > Self.maxRenderedRouteOverlays else { return routes }
+
+        var selected = Array(routes.prefix(Self.maxRenderedRouteOverlays))
+        let selectedIDs = Set(selected.map(\.id))
+        let highlightedOutsideWindow = routes.filter {
+            highlightedRouteIDs.contains($0.id) && !selectedIDs.contains($0.id)
+        }
+
+        if !highlightedOutsideWindow.isEmpty {
+            selected.append(contentsOf: highlightedOutsideWindow)
+        }
+
+        return selected
     }
 
     // Create the coordinator that acts as MKMapViewDelegate
