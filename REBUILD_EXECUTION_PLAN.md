@@ -16,14 +16,20 @@ The new `Run_Map/Foundation` layer starts the replacement path:
 - `StreetCoverageDeltaProcessor`: skips route ids that have already been processed and returns a merged coverage state.
 - `StreetCoverageStateStore`: file-backed JSON persistence for the new incremental coverage state.
 - `RunMapLegacyAdapters`: converts current `Route`, `BerlinStreets.Street`, and `ConsolidatedStreet` values into the new snapshot models.
+- `RouteStorage`: now acts as a serialized merge-on-write repository with atomic replacement, backup recovery, and stable HealthKit source identities.
+- `RunMapRouteAnalysis`: creates and persists versioned precalculated route/stat snapshots.
+- `RunMapBackgroundAnalysisService`: coalesces analysis work at utility priority so it cannot stack up behind the UI.
+- `RouteMapView`: renders all history in grouped `MKMultiPolyline` chunks instead of dropping every route after the newest 500.
 
 This is intentionally separate from `Route`, `AchievementsManager`, `MKPolyline`, and `BerlinStreets` so it can become the core model without dragging UI state into processing.
 
 ## Next Implementation Steps
 
-1. Add first-run migration/clear-state controls for the new street coverage cache so stale legacy `UserDefaults` coverage cannot mask rebuilt state.
-2. Continue moving large SwiftUI files into focused views/services, next by extracting graph and non-street achievement detail sections out of `AchievementsView.swift`.
-3. Move street coverage persistence from JSON to SQLite if the dataset continues to grow.
+1. Continue moving large SwiftUI files into focused views/services, next by extracting graph and non-street achievement detail sections out of `AchievementsView.swift`.
+2. Move street coverage persistence from JSON to SQLite if the dataset continues to grow.
+3. Extend timing metrics from route-cache and district-list coverage into street data load, coverage delta processing, and overlay counts.
+4. Replace remaining legacy `FastStreetProcessor` UI-progress mutation loops with a pure processing result stream or actor-backed progress model.
+5. Add a build-phase guard or target-resource audit so backup/source-only files cannot be copied into the app bundle again.
 
 ## Verification Target
 
@@ -39,4 +45,4 @@ Also keep the generic app build green:
 xcodebuild build -project Run_Map.xcodeproj -scheme Run_Map -destination 'generic/platform=iOS' -derivedDataPath /private/tmp/run_map_derived_data CODE_SIGNING_ALLOWED=NO
 ```
 
-Current status: both commands pass on this machine with Xcode 16.2. Full-scheme testing still needs UI-test launch cleanup.
+Current status: both commands pass on this machine with Xcode 16.2. Generic iOS build is warning-clean in the captured log after the May 11 optimization pass. Full-scheme testing still needs UI-test launch cleanup.

@@ -15,7 +15,7 @@ struct BerlinStreetsListView: View {
     @State private var stadtteilStats: [StadtteilCoverageStats] = []
     @State private var selectedDistrictFilter: String?
     @State private var selectedStadtteilFilter: String?
-    @State private var showMissingStreetsMap: Bool = false
+    @State private var showStreetCoverageMap: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -61,12 +61,8 @@ struct BerlinStreetsListView: View {
                 processor: achievementsManager.fastProcessor ?? FastStreetProcessor()
             )
         }
-        .sheet(isPresented: $showMissingStreetsMap) {
-            MissingStreetsMapView(
-                allStreets: streetCoverage,
-                routes: routes,
-                processor: achievementsManager.fastProcessor ?? FastStreetProcessor()
-            )
+        .sheet(isPresented: $showStreetCoverageMap) {
+            BerlinStreetCoverageMapSheet(allStreets: streetCoverage)
         }
     }
 
@@ -120,7 +116,8 @@ struct BerlinStreetsListView: View {
     private func computeStreetCoverage() async {
         if !achievementsManager.streetCoverageByID.isEmpty {
             let coverageDict = achievementsManager.streetCoverageByID
-            let consolidated = achievementsManager.fastProcessor?.consolidatedStreets ?? []
+            let processorStreets = achievementsManager.fastProcessor?.consolidatedStreets ?? []
+            let consolidated = processorStreets.isEmpty ? achievementsManager.consolidatedStreets : processorStreets
 
             guard !consolidated.isEmpty else {
                 await MainActor.run {
@@ -231,16 +228,16 @@ struct BerlinStreetsListView: View {
 
                 // Coverage map button
                 Button {
-                    showMissingStreetsMap = true
+                    showStreetCoverageMap = true
                 } label: {
                     HStack {
                         Image(systemName: "map.fill")
                             .foregroundColor(.blue)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("View Coverage Map")
+                            Text("View Street Coverage Map")
                                 .font(.subheadline)
                                 .fontWeight(.semibold)
-                            Text("See all street points colored by coverage")
+                            Text("Green streets are visited, red streets are not visited")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
@@ -250,14 +247,14 @@ struct BerlinStreetsListView: View {
                                 Circle()
                                     .fill(Color.green)
                                     .frame(width: 8, height: 8)
-                                Text("Covered")
+                                Text("Visited")
                                     .font(.caption2)
                             }
                             HStack(spacing: 4) {
                                 Circle()
                                     .fill(Color.red)
                                     .frame(width: 8, height: 8)
-                                Text("Missing")
+                                Text("Not visited")
                                     .font(.caption2)
                             }
                         }
@@ -746,6 +743,7 @@ private struct FilteredStreetListView: View {
                 }
             }
         }
+        .navigationViewStyle(.stack)
         .sheet(item: Binding(
             get: { selectedStreet.map { IdentifiableStreet(street: $0) } },
             set: { selectedStreet = $0?.street }
@@ -920,6 +918,261 @@ private struct MultiStreetMapView: UIViewRepresentable {
     }
 }
 
+private struct BerlinStreetCoverageMapSheet: View {
+    let allStreets: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)]
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var stats = StreetCoverageMapStats()
+    @State private var isRendering = true
+    @State private var showOnlyNotVisited = false
+
+    private var visitedStreetCount: Int {
+        allStreets.filter { $0.coverage.coveredPoints > 0 || $0.coverage.percentage > 0 }.count
+    }
+
+    private var notVisitedStreetCount: Int {
+        max(0, allStreets.count - visitedStreetCount)
+    }
+
+    var body: some View {
+        NavigationView {
+            ZStack(alignment: .bottom) {
+                BerlinStreetCoverageMapRepresentable(
+                    streets: allStreets,
+                    showOnlyNotVisited: showOnlyNotVisited,
+                    onRenderComplete: { newStats in
+                        stats = newStats
+                        isRendering = false
+                    }
+                )
+                .ignoresSafeArea(edges: .bottom)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 16) {
+                        if !showOnlyNotVisited {
+                            legendItem(color: .green, title: "Visited", value: "\(visitedStreetCount)")
+                        }
+                        legendItem(color: .red, title: "Not visited", value: "\(notVisitedStreetCount)")
+                        Spacer()
+                        if isRendering {
+                            ProgressView()
+                        } else {
+                            Text("\(stats.renderedPolylineCount) lines")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    Text("Street color is based on whether at least one stored coordinate for that street has been reached.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+
+                    Toggle(isOn: $showOnlyNotVisited) {
+                        Text("Only not visited")
+                            .font(.subheadline)
+                    }
+                    .onChange(of: showOnlyNotVisited) { _ in
+                        isRendering = true
+                    }
+                }
+                .padding(12)
+                .background(.regularMaterial)
+                .cornerRadius(8)
+                .padding()
+            }
+            .navigationTitle("Berlin Street Coverage")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
+    }
+
+    private func legendItem(color: Color, title: String, value: String) -> some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 9, height: 9)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(value)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Text(title)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+}
+
+private struct StreetCoverageMapStats {
+    var renderedPolylineCount: Int = 0
+    var coveredPolylineCount: Int = 0
+    var uncoveredPolylineCount: Int = 0
+}
+
+private struct BerlinStreetCoverageMapRepresentable: UIViewRepresentable {
+    let streets: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)]
+    let showOnlyNotVisited: Bool
+    let onRenderComplete: (StreetCoverageMapStats) -> Void
+
+    func makeUIView(context: Context) -> MKMapView {
+        let mapView = MKMapView()
+        mapView.delegate = context.coordinator
+        mapView.pointOfInterestFilter = .excludingAll
+        mapView.isPitchEnabled = false
+        mapView.setRegion(Self.berlinRegion, animated: false)
+        context.coordinator.render(
+            streets: streets,
+            showOnlyNotVisited: showOnlyNotVisited,
+            on: mapView,
+            onRenderComplete: onRenderComplete
+        )
+        return mapView
+    }
+
+    func updateUIView(_ mapView: MKMapView, context: Context) {
+        context.coordinator.render(
+            streets: streets,
+            showOnlyNotVisited: showOnlyNotVisited,
+            on: mapView,
+            onRenderComplete: onRenderComplete
+        )
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    private static let berlinRegion = MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: 52.52, longitude: 13.405),
+        span: MKCoordinateSpan(latitudeDelta: 0.34, longitudeDelta: 0.46)
+    )
+
+    final class Coordinator: NSObject, MKMapViewDelegate {
+        private var renderedSignature: String?
+        private var renderGeneration = 0
+        private weak var coveredOverlay: MKMultiPolyline?
+        private weak var uncoveredOverlay: MKMultiPolyline?
+
+        func render(
+            streets: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)],
+            showOnlyNotVisited: Bool,
+            on mapView: MKMapView,
+            onRenderComplete: @escaping (StreetCoverageMapStats) -> Void
+        ) {
+            let signature = Self.signature(for: streets, showOnlyNotVisited: showOnlyNotVisited)
+            guard signature != renderedSignature else { return }
+
+            renderedSignature = signature
+            renderGeneration += 1
+            let generation = renderGeneration
+
+            let existing = mapView.overlays
+            if !existing.isEmpty {
+                mapView.removeOverlays(existing)
+            }
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                let groups = Self.makePolylineGroups(from: streets, showOnlyNotVisited: showOnlyNotVisited)
+                let stats = StreetCoverageMapStats(
+                    renderedPolylineCount: groups.covered.count + groups.uncovered.count,
+                    coveredPolylineCount: groups.covered.count,
+                    uncoveredPolylineCount: groups.uncovered.count
+                )
+
+                DispatchQueue.main.async {
+                    guard generation == self.renderGeneration else { return }
+
+                    if !groups.uncovered.isEmpty {
+                        let overlay = MKMultiPolyline(groups.uncovered)
+                        self.uncoveredOverlay = overlay
+                        mapView.addOverlay(overlay, level: .aboveRoads)
+                    }
+
+                    if !groups.covered.isEmpty {
+                        let overlay = MKMultiPolyline(groups.covered)
+                        self.coveredOverlay = overlay
+                        mapView.addOverlay(overlay, level: .aboveRoads)
+                    }
+
+                    onRenderComplete(stats)
+                }
+            }
+        }
+
+        func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            guard let multiPolyline = overlay as? MKMultiPolyline else {
+                return MKOverlayRenderer(overlay: overlay)
+            }
+
+            let renderer = MKMultiPolylineRenderer(multiPolyline: multiPolyline)
+            if multiPolyline === coveredOverlay {
+                renderer.strokeColor = UIColor.systemGreen.withAlphaComponent(0.82)
+                renderer.lineWidth = 2.7
+                renderer.alpha = 0.95
+            } else if multiPolyline === uncoveredOverlay {
+                renderer.strokeColor = UIColor.systemRed.withAlphaComponent(0.58)
+                renderer.lineWidth = 2.1
+                renderer.alpha = 0.95
+            } else {
+                renderer.strokeColor = UIColor.systemGray.withAlphaComponent(0.5)
+                renderer.lineWidth = 1.6
+            }
+            return renderer
+        }
+
+        private static func signature(
+            for streets: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)],
+            showOnlyNotVisited: Bool
+        ) -> String {
+            let coveredCount = streets.reduce(0) { partial, item in
+                partial + ((item.coverage.coveredPoints > 0 || item.coverage.percentage > 0) ? 1 : 0)
+            }
+            let pointCount = streets.reduce(0) { partial, item in
+                partial + item.street.totalPoints
+            }
+            return "\(streets.count)-\(coveredCount)-\(pointCount)-notVisitedOnly:\(showOnlyNotVisited)"
+        }
+
+        private static func makePolylineGroups(
+            from streets: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)],
+            showOnlyNotVisited: Bool
+        ) -> (covered: [MKPolyline], uncovered: [MKPolyline]) {
+            var covered: [MKPolyline] = []
+            var uncovered: [MKPolyline] = []
+
+            for item in streets {
+                let hasAnyHit = item.coverage.coveredPoints > 0 || item.coverage.percentage > 0
+                if showOnlyNotVisited && hasAnyHit {
+                    continue
+                }
+                for segment in item.street.segments {
+                    let coordinates = segment.coordinates.compactMap { coordinate -> CLLocationCoordinate2D? in
+                        guard coordinate.lat.isFinite, coordinate.lon.isFinite else { return nil }
+                        return CLLocationCoordinate2D(latitude: coordinate.lat, longitude: coordinate.lon)
+                    }
+                    guard coordinates.count >= 2 else { continue }
+
+                    let polyline = MKPolyline(coordinates: coordinates, count: coordinates.count)
+                    if hasAnyHit {
+                        covered.append(polyline)
+                    } else {
+                        uncovered.append(polyline)
+                    }
+                }
+            }
+
+            return (covered, uncovered)
+        }
+    }
+}
+
 // Map view showing all street points in Berlin colored by coverage
 private struct MissingStreetsMapView: View {
     let allStreets: [(street: ConsolidatedStreet, coverage: ConsolidatedStreet.CoverageResult)]
@@ -984,6 +1237,7 @@ private struct MissingStreetsMapView: View {
                 }
             }
         }
+        .navigationViewStyle(.stack)
     }
 }
 

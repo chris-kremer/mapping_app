@@ -2,14 +2,32 @@ import Foundation
 import HealthKit
 import CoreLocation
 
+enum RunMapHealthKitAccess: Equatable {
+    case authorized
+    case denied
+    case unavailable
+}
+
+struct RunMapHealthRouteSample {
+    let id: UUID
+    let startDate: Date
+    let locations: [CLLocation]
+}
+
 class HealthKitManager: ObservableObject {
     private let healthStore = HKHealthStore()
     
     @Published var workouts: [HKWorkout] = []
+
+    var isHealthDataAvailable: Bool {
+        HKHealthStore.isHealthDataAvailable()
+    }
     
-    func requestAuthorization(completion: @escaping (Bool) -> Void) {
-        guard HKHealthStore.isHealthDataAvailable() else {
-            completion(false)
+    func requestAuthorization(completion: @escaping (RunMapHealthKitAccess) -> Void) {
+        guard isHealthDataAvailable else {
+            DispatchQueue.main.async {
+                completion(.unavailable)
+            }
             return
         }
         
@@ -23,7 +41,7 @@ class HealthKitManager: ObservableObject {
                 print("❌ Authorization failed: \(error.localizedDescription)")
             }
             DispatchQueue.main.async {
-                completion(success)
+                completion(success ? .authorized : .denied)
             }
         }
     }
@@ -45,13 +63,56 @@ class HealthKitManager: ObservableObject {
     }
     
     func fetchRoute(for workout: HKWorkout, completion: @escaping ([CLLocation]) -> Void) {
+        fetchRouteSamples(for: workout) { samples in
+            completion(samples.flatMap(\.locations))
+        }
+    }
+
+    /// Loads every route sample attached to a workout. HealthKit may split one workout
+    /// into multiple `HKWorkoutRoute` samples, so reading only the first loses history.
+    func fetchRouteSamples(
+        for workout: HKWorkout,
+        completion: @escaping ([RunMapHealthRouteSample]) -> Void
+    ) {
         let predicate = HKQuery.predicateForObjects(from: workout)
-        let routeQuery = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(), predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { [weak self] _, samples, error in
-            guard let route = samples?.first as? HKWorkoutRoute else {
-                completion([])
+        let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+        let routeQuery = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(), predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { [weak self] _, samples, error in
+            if let error = error {
+                print("❌ Failed to fetch workout route: \(error.localizedDescription)")
+            }
+            let workoutRoutes = samples as? [HKWorkoutRoute] ?? []
+            guard !workoutRoutes.isEmpty else {
+                DispatchQueue.main.async {
+                    completion([])
+                }
                 return
             }
-            self?.loadRouteLocations(from: route, completion: completion)
+            guard let self else {
+                DispatchQueue.main.async { completion([]) }
+                return
+            }
+
+            let group = DispatchGroup()
+            let lock = NSLock()
+            var loaded: [RunMapHealthRouteSample] = []
+
+            for route in workoutRoutes {
+                group.enter()
+                self.loadRouteLocations(from: route) { locations in
+                    lock.lock()
+                    loaded.append(RunMapHealthRouteSample(
+                        id: route.uuid,
+                        startDate: route.startDate,
+                        locations: locations
+                    ))
+                    lock.unlock()
+                    group.leave()
+                }
+            }
+
+            group.notify(queue: .main) {
+                completion(loaded.sorted { $0.startDate < $1.startDate })
+            }
         }
         healthStore.execute(routeQuery)
     }

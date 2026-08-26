@@ -32,8 +32,8 @@ struct DistrictCoverageStats: Codable, Identifiable {
     let totalPoints: Int
 
     var coveragePercentage: Double {
-        guard totalPoints > 0 else { return 0 }
-        return (Double(coveredPoints) / Double(totalPoints)) * 100.0
+        guard totalStreets > 0 else { return 0 }
+        return (Double(coveredStreets) / Double(totalStreets)) * 100.0
     }
 }
 
@@ -49,8 +49,8 @@ struct StadtteilCoverageStats: Codable, Identifiable {
     let totalPoints: Int
 
     var coveragePercentage: Double {
-        guard totalPoints > 0 else { return 0 }
-        return (Double(coveredPoints) / Double(totalPoints)) * 100.0
+        guard totalStreets > 0 else { return 0 }
+        return (Double(coveredStreets) / Double(totalStreets)) * 100.0
     }
 }
 
@@ -106,7 +106,7 @@ class FastStreetProcessor: ObservableObject {
             processingStatus = "Loading street data..."
         }
 
-        let allStreets = await BerlinStreets.getStreets(forDistricts: districts)
+        let allStreets = BerlinStreets.getStreets(forDistricts: districts)
         print("📊 Loaded \(allStreets.count) street segments")
 
         // Consolidate streets by name
@@ -220,18 +220,24 @@ class FastStreetProcessor: ObservableObject {
 
                 // Update progress
                 let progress = Double(streetIndex + 1) / Double(streets.count)
+                let currentProcessedGlobal = processedGlobal
+                let currentCoveredGlobal = coveredGlobal
+                let currentFullyCoveredGlobal = fullyCoveredGlobal
+                let currentStadtteilProcessed = stadtteilProcessed
+                let currentStadtteilCovered = stadtteilCovered
+
                 await MainActor.run {
                     processingProgress = progress
                     processingStatus = "\(stadtteil): \(streetIndex + 1)/\(streets.count) - \(street.name) (\(String(format: "%.1f", coverage.percentage))%)"
-                    processedStreetCount = processedGlobal
-                    coveredStreetCount = coveredGlobal
-                    fullyCoveredStreetCount = fullyCoveredGlobal
+                    processedStreetCount = currentProcessedGlobal
+                    coveredStreetCount = currentCoveredGlobal
+                    fullyCoveredStreetCount = currentFullyCoveredGlobal
                     currentStadtteilProgress = StadtteilProgressInfo(
                         stadtteil: stadtteil,
                         district: district,
                         totalStreets: streets.count,
-                        processedStreets: stadtteilProcessed,
-                        coveredStreets: stadtteilCovered
+                        processedStreets: currentStadtteilProcessed,
+                        coveredStreets: currentStadtteilCovered
                     )
                 }
 
@@ -277,32 +283,36 @@ class FastStreetProcessor: ObservableObject {
             }
             .sorted { $0.coveragePercentage > $1.coveragePercentage }
 
-        let overallPct = totalPoints > 0 ? (Double(totalCoveredPoints) / Double(totalPoints)) * 100.0 : 0.0
+        let finalProcessedStreets = allProcessedStreets
+        let finalCoverageByStreet = coverageByStreet
+        let finalCoveredGlobal = coveredGlobal
+        let finalFullyCoveredGlobal = fullyCoveredGlobal
+        let overallPct = finalProcessedStreets.isEmpty ? 0.0 : (Double(finalCoveredGlobal) / Double(finalProcessedStreets.count)) * 100.0
 
         await MainActor.run {
-            processingStatus = "Complete! Processed \(allProcessedStreets.count) streets"
+            processingStatus = "Complete! Processed \(finalProcessedStreets.count) streets"
             processingProgress = 1.0
-            consolidatedStreets = allProcessedStreets
-            coverageByStreetID = coverageByStreet
+            consolidatedStreets = finalProcessedStreets
+            coverageByStreetID = finalCoverageByStreet
             districtSummaries = districtStats
             stadtteilSummaries = stadtteilStats
             overallStreetCoverage = overallPct
-            totalStreetCount = allProcessedStreets.count
-            processedStreetCount = allProcessedStreets.count
-            coveredStreetCount = coveredGlobal
-            fullyCoveredStreetCount = fullyCoveredGlobal
+            totalStreetCount = finalProcessedStreets.count
+            processedStreetCount = finalProcessedStreets.count
+            coveredStreetCount = finalCoveredGlobal
+            fullyCoveredStreetCount = finalFullyCoveredGlobal
             currentStadtteilProgress = nil
         }
 
         return StreetProcessingOutput(
-            consolidatedStreets: allProcessedStreets,
-            coverageByStreetID: coverageByStreet,
+            consolidatedStreets: finalProcessedStreets,
+            coverageByStreetID: finalCoverageByStreet,
             districtStats: districtStats,
             stadtteilStats: stadtteilStats,
             overallCoveragePercentage: overallPct,
-            totalStreetCount: allProcessedStreets.count,
-            coveredStreetCount: coveredGlobal,
-            fullyCoveredStreetCount: fullyCoveredGlobal,
+            totalStreetCount: finalProcessedStreets.count,
+            coveredStreetCount: finalCoveredGlobal,
+            fullyCoveredStreetCount: finalFullyCoveredGlobal,
             coveredPoints: totalCoveredPoints,
             totalPoints: totalPoints
         )

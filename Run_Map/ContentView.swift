@@ -2,16 +2,24 @@ import SwiftUI
 import MapKit
 import CoreLocation
 import HealthKit
+import UniformTypeIdentifiers
 
 // MARK: - Location Manager
 
 class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     @Published var currentLocation: CLLocation?
     private let locationManager = CLLocationManager()
+    private var hasStarted = false
+
     override init() {
         super.init()
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyBest
+    }
+
+    func start() {
+        guard !hasStarted else { return }
+        hasStarted = true
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()
     }
@@ -28,11 +36,21 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
 // MARK: - Route Model
 
 final class Route: Identifiable {
-    let id = UUID()
+    let id: UUID
     let coordinates: [CLLocationCoordinate2D]
     let date: Date
     let workoutType: HKWorkoutActivityType
     let durationSec: Double
+    let sourceWorkoutID: UUID?
+    let sourceRouteID: UUID?
+    let segmentIndex: Int
+
+    var persistenceKey: String {
+        if let sourceWorkoutID, let sourceRouteID {
+            return "health|\(sourceWorkoutID.uuidString)|\(sourceRouteID.uuidString)|\(segmentIndex)"
+        }
+        return "route|\(id.uuidString)"
+    }
 
     lazy var averageSpeedKmH: Double = {
         guard durationSec > 0 else { return 0 }
@@ -50,18 +68,26 @@ final class Route: Identifiable {
             .reduce(0, +) / 1_000
     }()
     
-    init(coordinates: [CLLocationCoordinate2D],
+    init(id: UUID = UUID(),
+         coordinates: [CLLocationCoordinate2D],
          date: Date,
          workoutType: HKWorkoutActivityType,
-         durationSec: Double) {
+         durationSec: Double,
+         sourceWorkoutID: UUID? = nil,
+         sourceRouteID: UUID? = nil,
+         segmentIndex: Int = 0) {
+        self.id = id
         self.coordinates = coordinates
         self.date = date
         self.workoutType = workoutType
         self.durationSec = durationSec
+        self.sourceWorkoutID = sourceWorkoutID
+        self.sourceRouteID = sourceRouteID
+        self.segmentIndex = segmentIndex
     }
 }
 
-private enum RouteCoordinateSimplifier {
+enum RouteCoordinateSimplifier {
     static let maxStoredCoordinates = 600
 
     static func simplified(_ coordinates: [CLLocationCoordinate2D]) -> [CLLocationCoordinate2D] {
@@ -85,6 +111,26 @@ private enum RouteCoordinateSimplifier {
     }
 }
 
+enum RouteRenderCoordinateSimplifier {
+    static let maxRenderedCoordinates = 220
+
+    static func simplified(_ coordinates: [CLLocationCoordinate2D]) -> [CLLocationCoordinate2D] {
+        guard coordinates.count > maxRenderedCoordinates else { return coordinates }
+
+        let step = Int(ceil(Double(coordinates.count - 1) / Double(maxRenderedCoordinates - 1)))
+        var sampled: [CLLocationCoordinate2D] = []
+        sampled.reserveCapacity(maxRenderedCoordinates)
+        for index in stride(from: 0, to: coordinates.count, by: step) {
+            sampled.append(coordinates[index])
+        }
+        if let last = coordinates.last,
+           sampled.last?.isEqual(to: last, tolerance: 0.000001) != true {
+            sampled.append(last)
+        }
+        return sampled
+    }
+}
+
 // MARK: - Persistable Route Data
 
 struct PersistedCoordinate: Codable {
@@ -98,6 +144,9 @@ struct PersistedRoute: Codable {
     let date: Date
     let workoutType: UInt
     let durationSec: Double
+    let sourceWorkoutID: UUID?
+    let sourceRouteID: UUID?
+    let segmentIndex: Int
 
     private enum CodingKeys: String, CodingKey {
         case id
@@ -105,6 +154,9 @@ struct PersistedRoute: Codable {
         case date
         case workoutType
         case durationSec
+        case sourceWorkoutID
+        case sourceRouteID
+        case segmentIndex
     }
     
     init(from route: Route) {
@@ -113,6 +165,9 @@ struct PersistedRoute: Codable {
         self.date = route.date
         self.workoutType = route.workoutType.rawValue
         self.durationSec = route.durationSec
+        self.sourceWorkoutID = route.sourceWorkoutID
+        self.sourceRouteID = route.sourceRouteID
+        self.segmentIndex = route.segmentIndex
     }
 
     init(from decoder: Decoder) throws {
@@ -121,6 +176,9 @@ struct PersistedRoute: Codable {
         date = try container.decode(Date.self, forKey: .date)
         workoutType = try container.decode(UInt.self, forKey: .workoutType)
         durationSec = try container.decode(Double.self, forKey: .durationSec)
+        sourceWorkoutID = try container.decodeIfPresent(UUID.self, forKey: .sourceWorkoutID)
+        sourceRouteID = try container.decodeIfPresent(UUID.self, forKey: .sourceRouteID)
+        segmentIndex = try container.decodeIfPresent(Int.self, forKey: .segmentIndex) ?? 0
 
         if let compact = try? container.decode([PersistedCoordinate].self, forKey: .coordinates) {
             coordinates = compact
@@ -139,30 +197,72 @@ struct PersistedRoute: Codable {
             CLLocationCoordinate2D(latitude: coordinate.lat, longitude: coordinate.lon)
         }
         return Route(
+            id: id,
             coordinates: RouteCoordinateSimplifier.simplified(coords),
             date: date,
             workoutType: HKWorkoutActivityType(rawValue: workoutType) ?? .other,
-            durationSec: durationSec
+            durationSec: durationSec,
+            sourceWorkoutID: sourceWorkoutID,
+            sourceRouteID: sourceRouteID,
+            segmentIndex: segmentIndex
         )
     }
 }
 
 // MARK: - Route Persistence Manager
 
-class RouteStorage {
+final class RouteStorage {
+    enum ArchiveError: Error {
+        case malformedRouteLine(Int)
+    }
+
+    static let shared = RouteStorage()
+
+    private static let ioQueue = DispatchQueue(label: "runmap.routes.store", qos: .utility)
     private let fileManager = FileManager.default
     private let fileName = "cached_routes.json"
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let directoryURL: URL
+    private var primaryNeedsRecovery = false
+
+    init(directoryURL: URL? = nil) {
+        self.directoryURL = directoryURL ?? fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
     
     private var fileURL: URL {
-        let documentsPath = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return documentsPath.appendingPathComponent(fileName)
+        directoryURL.appendingPathComponent(fileName)
+    }
+
+    private var backupURL: URL {
+        fileURL.appendingPathExtension("backup")
     }
     
     func saveRoutes(_ routes: [Route]) {
+        Self.ioQueue.sync {
+            _ = mergeAndSaveUnlocked(routes)
+        }
+    }
+
+    @discardableResult
+    func mergeRoutes(_ routes: [Route]) -> [Route] {
+        Self.ioQueue.sync {
+            mergeAndSaveUnlocked(routes)
+        }
+    }
+
+    private func mergeAndSaveUnlocked(_ routes: [Route]) -> [Route] {
+        let merged = deduplicatedRoutes(loadRoutesUnlocked(logResult: false) + routes)
+            .sorted { $0.date > $1.date }
+        saveRoutesUnlocked(merged)
+        return merged
+    }
+
+    private func saveRoutesUnlocked(_ routes: [Route]) {
         let tempURL = fileURL.appendingPathExtension("tmp")
         do {
+            try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+            try? fileManager.removeItem(at: tempURL)
             fileManager.createFile(atPath: tempURL.path, contents: nil)
             let handle = try FileHandle(forWritingTo: tempURL)
             defer { try? handle.close() }
@@ -174,10 +274,16 @@ class RouteStorage {
             }
 
             if fileManager.fileExists(atPath: fileURL.path) {
+                // Never replace a known-good backup with a corrupt primary archive.
+                if !primaryNeedsRecovery {
+                    try? fileManager.removeItem(at: backupURL)
+                    try fileManager.copyItem(at: fileURL, to: backupURL)
+                }
                 _ = try fileManager.replaceItemAt(fileURL, withItemAt: tempURL)
             } else {
                 try fileManager.moveItem(at: tempURL, to: fileURL)
             }
+            primaryNeedsRecovery = false
             print("✅ Saved \(routes.count) routes to cache")
         } catch {
             try? fileManager.removeItem(at: tempURL)
@@ -186,8 +292,8 @@ class RouteStorage {
     }
 
     func saveRoutesAsync(_ routes: [Route], completion: (() -> Void)? = nil) {
-        DispatchQueue.global(qos: .utility).async {
-            self.saveRoutes(routes)
+        Self.ioQueue.async {
+            _ = self.mergeAndSaveUnlocked(routes)
             DispatchQueue.main.async {
                 completion?()
             }
@@ -195,18 +301,49 @@ class RouteStorage {
     }
     
     func loadRoutes() -> [Route] {
-        do {
-            let routes = try RunMapPerformanceMetrics.measure("route_cache_decode") {
-                let data = try Data(contentsOf: fileURL)
-                let persistedRoutes = try decodePersistedRoutes(from: data)
-                return validRoutes(from: persistedRoutes)
+        Self.ioQueue.sync { loadRoutesUnlocked(logResult: true) }
+    }
+
+    private func loadRoutesUnlocked(logResult: Bool) -> [Route] {
+        for candidateURL in [fileURL, backupURL] where fileManager.fileExists(atPath: candidateURL.path) {
+            do {
+                let routes = try RunMapPerformanceMetrics.measure("route_cache_decode") {
+                    let data = try Data(contentsOf: candidateURL, options: .mappedIfSafe)
+                    return validRoutes(from: try decodePersistedRoutes(from: data))
+                }
+                if logResult {
+                    let source = candidateURL == fileURL ? "cache" : "backup"
+                    print("✅ Loaded \(routes.count) routes from \(source)")
+                }
+                primaryNeedsRecovery = candidateURL == backupURL
+                return routes
+            } catch {
+                if candidateURL == fileURL {
+                    primaryNeedsRecovery = true
+                }
+                print("⚠️ Route archive read failed at \(candidateURL.lastPathComponent): \(error.localizedDescription)")
             }
-            print("✅ Loaded \(routes.count) routes from cache")
-            return routes
-        } catch {
-            print("ℹ️ No cached routes found or failed to load: \(error.localizedDescription)")
-            return []
         }
+        if logResult { print("ℹ️ No cached routes found") }
+        return []
+    }
+
+    func exportData(for routes: [Route]) throws -> Data {
+        let persistedRoutes = routes.map(PersistedRoute.init)
+        return try encoder.encode(persistedRoutes)
+    }
+
+    func importRoutes(from url: URL) throws -> [Route] {
+        let shouldStopAccessing = url.startAccessingSecurityScopedResource()
+        defer {
+            if shouldStopAccessing {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let data = try Data(contentsOf: url)
+        let persistedRoutes = try decodePersistedRoutes(from: data)
+        return validRoutes(from: persistedRoutes)
     }
 
     private func decodePersistedRoutes(from data: Data) throws -> [PersistedRoute] {
@@ -214,10 +351,15 @@ class RouteStorage {
             return try decoder.decode([PersistedRoute].self, from: data)
         }
 
-        return data.split(separator: UInt8(ascii: "\n")).compactMap { line in
-            guard !line.isEmpty else { return nil }
-            return try? decoder.decode(PersistedRoute.self, from: Data(line))
+        var routes: [PersistedRoute] = []
+        for (index, line) in data.split(separator: UInt8(ascii: "\n")).enumerated() {
+            guard !line.isEmpty else { continue }
+            guard let route = try? decoder.decode(PersistedRoute.self, from: Data(line)) else {
+                throw ArchiveError.malformedRouteLine(index + 1)
+            }
+            routes.append(route)
         }
+        return routes
     }
 
     private func validRoutes(from persistedRoutes: [PersistedRoute]) -> [Route] {
@@ -232,8 +374,8 @@ class RouteStorage {
     }
 
     func loadRoutesAsync(completion: @escaping ([Route]) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let routes = self.loadRoutes()
+        Self.ioQueue.async {
+            let routes = self.loadRoutesUnlocked(logResult: true)
             DispatchQueue.main.async {
                 completion(routes)
             }
@@ -247,11 +389,90 @@ class RouteStorage {
     func setLastSyncDate(_ date: Date) {
         UserDefaults.standard.set(date, forKey: "lastRouteSyncDate")
     }
+
+    func needsFullHistoryAudit(now: Date = Date(), interval: TimeInterval = 7 * 24 * 60 * 60) -> Bool {
+        guard let lastAudit = UserDefaults.standard.object(forKey: "lastFullRouteHistoryAudit") as? Date else {
+            return true
+        }
+        return now.timeIntervalSince(lastAudit) >= interval
+    }
+
+    func setLastFullHistoryAudit(_ date: Date) {
+        UserDefaults.standard.set(date, forKey: "lastFullRouteHistoryAudit")
+    }
+
+    func checkedWorkoutIDs() -> Set<UUID> {
+        Self.ioQueue.sync { checkedWorkoutIDsUnlocked() }
+    }
+
+    func markWorkoutsChecked(_ workoutIDs: [UUID]) {
+        guard !workoutIDs.isEmpty else { return }
+        Self.ioQueue.sync {
+            let merged = checkedWorkoutIDsUnlocked().union(workoutIDs)
+            UserDefaults.standard.set(merged.map(\.uuidString).sorted(), forKey: "checkedHealthWorkoutIDs")
+        }
+    }
+
+    private func checkedWorkoutIDsUnlocked() -> Set<UUID> {
+        Set((UserDefaults.standard.stringArray(forKey: "checkedHealthWorkoutIDs") ?? []).compactMap(UUID.init(uuidString:)))
+    }
     
     func clearCache() {
-        try? fileManager.removeItem(at: fileURL)
+        Self.ioQueue.sync {
+            try? fileManager.removeItem(at: fileURL)
+            try? fileManager.removeItem(at: backupURL)
+        }
         UserDefaults.standard.removeObject(forKey: "lastRouteSyncDate")
+        UserDefaults.standard.removeObject(forKey: "lastFullRouteHistoryAudit")
+        UserDefaults.standard.removeObject(forKey: "checkedHealthWorkoutIDs")
         print("🗑️ Cleared route cache")
+    }
+
+    private func deduplicatedRoutes(_ routes: [Route]) -> [Route] {
+        var sourceKeys = Set<String>()
+        var geometryKeys = Set<String>()
+        let preferred = routes.sorted {
+            if ($0.sourceRouteID != nil) != ($1.sourceRouteID != nil) {
+                return $0.sourceRouteID != nil
+            }
+            return $0.coordinates.count > $1.coordinates.count
+        }
+
+        return preferred.filter { route in
+            if route.sourceRouteID != nil, !sourceKeys.insert(route.persistenceKey).inserted {
+                return false
+            }
+            let first = route.coordinates.first
+            let last = route.coordinates.last
+            let geometryKey = [
+                String(Int(route.date.timeIntervalSince1970.rounded())),
+                String(route.workoutType.rawValue),
+                String(route.coordinates.count),
+                String(format: "%.6f", first?.latitude ?? 0),
+                String(format: "%.6f", first?.longitude ?? 0),
+                String(format: "%.6f", last?.latitude ?? 0),
+                String(format: "%.6f", last?.longitude ?? 0)
+            ].joined(separator: "|")
+            return geometryKeys.insert(geometryKey).inserted
+        }
+    }
+}
+
+struct RunMapRoutesDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.json] }
+
+    var data: Data
+
+    init(data: Data = Data()) {
+        self.data = data
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        data = configuration.file.regularFileContents ?? Data()
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
     }
 }
 
@@ -269,6 +490,10 @@ class RunViewModel: ObservableObject {
     @Published var routes: [Route] = []
     @Published var hasContent: Bool = false
     @Published var selectedFilter: WorkoutFilter = .all
+    @Published var healthKitAccess: RunMapHealthKitAccess?
+    @Published private(set) var hasLoadedRouteCache = false
+    @Published private(set) var isSyncing = false
+    private var hasRequestedHealthKitAccess = false
 
     // Loading progress tracking
     @Published var loadProgress: Double = 0        // 0‥1
@@ -288,9 +513,9 @@ class RunViewModel: ObservableObject {
     }
 
     let healthManager = HealthKitManager()
-    let routeStorage = RouteStorage()
+    let routeStorage = RouteStorage.shared
     
-    func loadRuns() {
+    func loadRuns(fetchHealthKit: Bool = true) {
         // First, load cached routes immediately for instant UI
         routeStorage.loadRoutesAsync { cachedRoutes in
             if !cachedRoutes.isEmpty {
@@ -305,7 +530,6 @@ class RunViewModel: ObservableObject {
 
                 self.routes = validRoutes
                 self.hasContent = !validRoutes.isEmpty
-
                 // Save cleaned routes back to cache if we removed any
                 if validRoutes.count != cachedRoutes.count {
                     print("💾 Saving cleaned routes to cache: \(validRoutes.count) routes (removed \(cachedRoutes.count - validRoutes.count))")
@@ -313,9 +537,45 @@ class RunViewModel: ObservableObject {
                 }
             }
 
-            // Then fetch new routes in background
-            self.loadNewRuns()
+            self.hasLoadedRouteCache = true
+
+            // Then fetch new routes in background, when HealthKit can be queried.
+            if fetchHealthKit {
+                if self.routeStorage.needsFullHistoryAudit() {
+                    self.reloadAllHealthKitRoutesPreservingCache()
+                } else {
+                    self.loadNewRuns()
+                }
+            }
         }
+    }
+
+    /// Starts HealthKit only after cached content has reached the screen. This keeps
+    /// authorization, a weekly history audit, and MapKit's first render from competing.
+    func beginDeferredHealthKitSync() {
+        guard !hasRequestedHealthKitAccess else { return }
+        hasRequestedHealthKitAccess = true
+
+        healthManager.requestAuthorization { [weak self] access in
+            guard let self else { return }
+            self.healthKitAccess = access
+
+            guard access == .authorized else {
+                self.loadProgress = 1.0
+                return
+            }
+
+            RunMapHealthKitBackgroundService.shared.start()
+            if self.routeStorage.needsFullHistoryAudit() {
+                self.reloadAllHealthKitRoutesPreservingCache()
+            } else {
+                self.loadNewRuns()
+            }
+        }
+    }
+
+    func scheduleRouteAnalysis() {
+        RunMapBackgroundAnalysisService.shared.schedule(routes: routes)
     }
 
     func reloadRoutesFromCache(completion: (() -> Void)? = nil) {
@@ -326,6 +586,7 @@ class RunViewModel: ObservableObject {
 
             self.routes = validRoutes
             self.hasContent = !validRoutes.isEmpty
+            RunMapBackgroundAnalysisService.shared.schedule(routes: validRoutes)
             completion?()
         }
     }
@@ -350,28 +611,13 @@ class RunViewModel: ObservableObject {
             
             for workout in workouts {
                 group.enter()
-                self.healthManager.fetchRoute(for: workout) { locations in
-                    let coordinates = locations.map { $0.coordinate }
-                    
-                    // Only process workouts that have GPS data
-                    guard !coordinates.isEmpty else {
+                self.healthManager.fetchRouteSamples(for: workout) { samples in
+                    guard !samples.isEmpty else {
                         print("⚠️ Skipping workout with no GPS data: \(workout.startDate)")
                         group.leave()
                         return
                     }
-                    
-                    let segments = self.filterRoute(coordinates)
-                    
-                        for segment in segments {
-                        // Only create routes with meaningful coordinate data
-                        guard segment.count > 1 else { continue }
-                        
-                        let route = Route(coordinates: segment,
-                                                     date: workout.startDate,
-                                                     workoutType: workout.workoutActivityType,
-                                        durationSec: workout.duration)
-                        newRoutes.append(route)
-                        }
+                    newRoutes.append(contentsOf: self.routes(from: workout, samples: samples))
                     
                     DispatchQueue.main.async {
                         self.loadedCount += 1
@@ -388,24 +634,37 @@ class RunViewModel: ObservableObject {
                 self.hasContent = !self.routes.isEmpty
                 self.routeStorage.saveRoutesAsync(self.routes)
                 self.routeStorage.setLastSyncDate(Date())
+                self.routeStorage.setLastFullHistoryAudit(Date())
+                self.routeStorage.markWorkoutsChecked(workouts.map(\.uuid))
+                RunMapBackgroundAnalysisService.shared.schedule(routes: self.routes)
             }
         }
     }
 
     func refreshFromHealthKit() {
+        guard !isSyncing else { return }
         DispatchQueue.main.async {
             self.totalToLoad = 0
             self.loadedCount = 0
             self.loadProgress = 0
         }
 
-        healthManager.requestAuthorization { [weak self] authorized in
+        healthManager.requestAuthorization { [weak self] access in
             guard let self = self else { return }
-            guard authorized else {
+            self.healthKitAccess = access
+
+            guard access == .authorized else {
                 DispatchQueue.main.async {
                     self.loadProgress = 1.0
                 }
-                print("⚠️ HealthKit authorization was not granted; keeping cached routes")
+                switch access {
+                case .unavailable:
+                    print("⚠️ HealthKit data is unavailable on this device; keeping cached routes")
+                case .denied:
+                    print("⚠️ HealthKit authorization was not granted; keeping cached routes")
+                case .authorized:
+                    break
+                }
                 return
             }
 
@@ -414,6 +673,8 @@ class RunViewModel: ObservableObject {
     }
 
     private func reloadAllHealthKitRoutesPreservingCache() {
+        guard !isSyncing else { return }
+        isSyncing = true
         let cachedRoutes = routes
 
         healthManager.fetchRunningWorkouts { workouts in
@@ -425,29 +686,27 @@ class RunViewModel: ObservableObject {
 
             guard !workouts.isEmpty else {
                 print("ℹ️ HealthKit returned no running/walking workouts; keeping cached routes")
+                DispatchQueue.main.async { self.isSyncing = false }
                 return
             }
 
             var refreshedRoutes: [Route] = []
             var workoutsMissingRoutes: [HKWorkout] = []
             let group = DispatchGroup()
+            var nextWorkoutIndex = 0
 
-            for workout in workouts {
-                group.enter()
-                self.healthManager.fetchRoute(for: workout) { locations in
-                    let coordinates = locations.map { $0.coordinate }
-
-                    if coordinates.isEmpty {
+            func processNextWorkout() {
+                guard nextWorkoutIndex < workouts.count else {
+                    group.leave()
+                    return
+                }
+                let workout = workouts[nextWorkoutIndex]
+                nextWorkoutIndex += 1
+                self.healthManager.fetchRouteSamples(for: workout) { samples in
+                    if samples.isEmpty {
                         workoutsMissingRoutes.append(workout)
                     } else {
-                        let segments = self.filterRoute(coordinates)
-                        for segment in segments {
-                            guard segment.count > 1 else { continue }
-                            refreshedRoutes.append(Route(coordinates: segment,
-                                                         date: workout.startDate,
-                                                         workoutType: workout.workoutActivityType,
-                                                         durationSec: workout.duration))
-                        }
+                        refreshedRoutes.append(contentsOf: self.routes(from: workout, samples: samples))
                     }
 
                     DispatchQueue.main.async {
@@ -456,26 +715,28 @@ class RunViewModel: ObservableObject {
                             self.loadProgress = Double(self.loadedCount) / Double(self.totalToLoad)
                         }
                     }
-                    group.leave()
+                    processNextWorkout()
                 }
             }
 
+            // A small worker pool completes a full audit quickly without flooding
+            // HealthKit or competing with map rendering for CPU and memory.
+            let workerCount = min(2, workouts.count)
+            for _ in 0..<workerCount {
+                group.enter()
+                processNextWorkout()
+            }
+
             group.notify(queue: .main) {
-                var mergedRoutes = refreshedRoutes
-
-                for workout in workoutsMissingRoutes {
-                    let cachedForWorkout = cachedRoutes.filter { route in
-                        abs(route.date.timeIntervalSince1970 - workout.startDate.timeIntervalSince1970) < 1.0
-                    }
-                    mergedRoutes.append(contentsOf: cachedForWorkout)
-                }
-
-                let dedupedRoutes = self.deduplicatedRoutes(mergedRoutes).sorted { $0.date > $1.date }
+                // HealthKit is not authoritative for imported or temporarily unavailable
+                // history. Always union a full audit with the local archive.
+                let dedupedRoutes = self.deduplicatedRoutes(cachedRoutes + refreshedRoutes).sorted { $0.date > $1.date }
 
                 if !dedupedRoutes.isEmpty {
                     self.routes = dedupedRoutes
                     self.hasContent = true
                     self.routeStorage.saveRoutesAsync(dedupedRoutes)
+                    RunMapBackgroundAnalysisService.shared.schedule(routes: dedupedRoutes)
                     print("💾 Full HealthKit refresh saved \(dedupedRoutes.count) routes")
                 } else {
                     print("ℹ️ Full HealthKit refresh found no route data; keeping existing cache")
@@ -483,7 +744,15 @@ class RunViewModel: ObservableObject {
                 }
 
                 self.routeStorage.setLastSyncDate(Date())
+                self.routeStorage.setLastFullHistoryAudit(Date())
+                let missingIDs = Set(workoutsMissingRoutes.map(\.uuid))
+                let checkedIDs = workouts.compactMap { workout -> UUID? in
+                    if !missingIDs.contains(workout.uuid) { return workout.uuid }
+                    return Date().timeIntervalSince(workout.endDate) > 24 * 60 * 60 ? workout.uuid : nil
+                }
+                self.routeStorage.markWorkoutsChecked(checkedIDs)
                 self.loadProgress = 1.0
+                self.isSyncing = false
 
                 if !workoutsMissingRoutes.isEmpty {
                     print("⏳ \(workoutsMissingRoutes.count) workouts had no route samples yet; scheduling a follow-up check")
@@ -496,23 +765,52 @@ class RunViewModel: ObservableObject {
     }
 
     private func deduplicatedRoutes(_ routes: [Route]) -> [Route] {
-        var seen = Set<String>()
-        return routes.filter { route in
+        var sourceKeys = Set<String>()
+        var geometryKeys = Set<String>()
+        let preferred = routes.sorted {
+            if ($0.sourceRouteID != nil) != ($1.sourceRouteID != nil) {
+                return $0.sourceRouteID != nil
+            }
+            return $0.coordinates.count > $1.coordinates.count
+        }
+        return preferred.filter { route in
+            if route.sourceRouteID != nil, !sourceKeys.insert(route.persistenceKey).inserted {
+                return false
+            }
             let first = route.coordinates.first
             let last = route.coordinates.last
             let key = [
                 String(Int(route.date.timeIntervalSince1970.rounded())),
+                String(route.workoutType.rawValue),
                 String(route.coordinates.count),
                 String(format: "%.6f", first?.latitude ?? 0),
                 String(format: "%.6f", first?.longitude ?? 0),
                 String(format: "%.6f", last?.latitude ?? 0),
                 String(format: "%.6f", last?.longitude ?? 0)
             ].joined(separator: "_")
-            return seen.insert(key).inserted
+            return geometryKeys.insert(key).inserted
         }
+    }
+
+    func importRoutes(_ importedRoutes: [Route]) {
+        let mergedRoutes = deduplicatedRoutes(routes + importedRoutes).sorted { $0.date > $1.date }
+        routes = mergedRoutes
+        hasContent = !mergedRoutes.isEmpty
+        routeStorage.saveRoutesAsync(mergedRoutes)
+        RunMapBackgroundAnalysisService.shared.schedule(routes: mergedRoutes)
+        loadProgress = 1.0
     }
     
     func loadNewRuns() {
+        guard !isSyncing else { return }
+        guard healthKitAccess == .authorized else {
+            DispatchQueue.main.async {
+                self.loadProgress = 1.0
+            }
+            return
+        }
+        isSyncing = true
+
         // Get all existing route IDs to avoid duplicates
         _ = Set(routes.map { route in
             // Create a unique identifier for each route based on date and coordinates
@@ -523,12 +821,17 @@ class RunViewModel: ObservableObject {
             print("🔍 Checking \(workouts.count) total workouts against \(self.routes.count) existing routes")
             
             // Filter out workouts we already have, with some tolerance for date precision
+            let sourceWorkoutIDs = Set(self.routes.compactMap(\.sourceWorkoutID))
+            let checkedWorkoutIDs = self.routeStorage.checkedWorkoutIDs()
             let newWorkouts = workouts.filter { workout in
-                // Check if we already have this workout (allowing for small time differences)
-                let hasExisting = self.routes.contains { route in
+                if sourceWorkoutIDs.contains(workout.uuid) || checkedWorkoutIDs.contains(workout.uuid) {
+                    return false
+                }
+                // Legacy archives predate HealthKit source identifiers.
+                return !self.routes.contains { route in
+                    route.sourceWorkoutID == nil &&
                     abs(route.date.timeIntervalSince1970 - workout.startDate.timeIntervalSince1970) < 1.0
                 }
-                return !hasExisting
             }
             
             print("🆕 Found \(newWorkouts.count) potentially new workouts to check")
@@ -536,6 +839,7 @@ class RunViewModel: ObservableObject {
             guard !newWorkouts.isEmpty else {
                 DispatchQueue.main.async {
                     self.loadProgress = 1.0
+                    self.isSyncing = false
                 }
             return
         }
@@ -561,6 +865,7 @@ class RunViewModel: ObservableObject {
 
                             // Save updated routes to cache
                             self.routeStorage.saveRoutesAsync(self.routes)
+                            RunMapBackgroundAnalysisService.shared.schedule(routes: self.routes)
                             print("💾 Total routes after sync: \(self.routes.count)")
                         } else {
                             if skippedCount > 0 {
@@ -571,18 +876,23 @@ class RunViewModel: ObservableObject {
                         }
                         self.routeStorage.setLastSyncDate(Date())
                         self.loadProgress = 1.0
+                        self.isSyncing = false
                     }
                     return
                 }
 
                 let workout = newWorkouts[index]
-                self.healthManager.fetchRoute(for: workout) { locations in
-                    let coordinates = locations.map { $0.coordinate }
+                self.healthManager.fetchRouteSamples(for: workout) { samples in
                     
                     // Only process workouts that have GPS data
-                    guard !coordinates.isEmpty else {
+                    guard !samples.isEmpty else {
                         print("⚠️ Skipping workout with no GPS data: \(workout.startDate)")
                         skippedCount += 1
+                        // Routes can arrive shortly after a workout. Retry recent workouts,
+                        // but remember older GPS-less workouts until the next weekly audit.
+                        if Date().timeIntervalSince(workout.endDate) > 24 * 60 * 60 {
+                            self.routeStorage.markWorkoutsChecked([workout.uuid])
+                        }
                         DispatchQueue.main.async {
                             self.loadedCount += 1
                             if self.totalToLoad > 0 {
@@ -594,20 +904,8 @@ class RunViewModel: ObservableObject {
                     }
                     
                     print("✅ Processing workout with GPS data: \(workout.startDate)")
-                    
-                    let segments = self.filterRoute(coordinates)
-                    
-                    for segment in segments {
-                        // Only create routes with meaningful coordinate data
-                        guard segment.count > 1 else { continue }
-                        let storedSegment = RouteCoordinateSimplifier.simplified(segment)
-                        
-                        let route = Route(coordinates: storedSegment,
-                                          date: workout.startDate,
-                                          workoutType: workout.workoutActivityType,
-                                          durationSec: workout.duration)
-                        newRoutes.append(route)
-                    }
+                    newRoutes.append(contentsOf: self.routes(from: workout, samples: samples))
+                    self.routeStorage.markWorkoutsChecked([workout.uuid])
                     
                     DispatchQueue.main.async {
                         self.loadedCount += 1
@@ -620,6 +918,24 @@ class RunViewModel: ObservableObject {
             }
 
             processWorkout(at: 0)
+        }
+    }
+
+    private func routes(from workout: HKWorkout, samples: [RunMapHealthRouteSample]) -> [Route] {
+        samples.enumerated().flatMap { sampleIndex, sample in
+            let coordinates = sample.locations.map(\.coordinate)
+            return filterRoute(coordinates).enumerated().compactMap { segmentIndex, segment -> Route? in
+                guard segment.count > 1 else { return nil }
+                return Route(
+                    coordinates: RouteCoordinateSimplifier.simplified(segment),
+                    date: workout.startDate,
+                    workoutType: workout.workoutActivityType,
+                    durationSec: workout.duration,
+                    sourceWorkoutID: workout.uuid,
+                    sourceRouteID: sample.id,
+                    segmentIndex: sampleIndex * 10_000 + segmentIndex
+                )
+            }
         }
     }
 
@@ -1244,13 +1560,17 @@ struct ContentView: View {
     @State private var showAchievementsPage = false
     @State private var showRoutePlanner = false
     @State private var showMonthlyRecap = false
+    @State private var showRouteExporter = false
+    @State private var showRouteImporter = false
+    @State private var routeExportDocument = RunMapRoutesDocument()
+    @State private var routeTransferMessage: String?
     @StateObject private var achievementsManager = AchievementsManager()
-    @State private var fakeLoadingPercent = 0
-    @State private var fakeLoadingTask: Task<Void, Never>?
-    @State private var loadingStatusMessage: String?
-    @State private var isLoadingInBackground = false
     @State private var showUpdatedMessage = false
-    @State private var longLoadingMessageShownAt: Date?
+    @State private var didStartLaunch = false
+    @State private var didStartDeferredServices = false
+    @State private var launchStartedAt = CFAbsoluteTimeGetCurrent()
+    @State private var shouldMountMap = false
+    @State private var isMapReady = false
     
     // District overlay state
     @State private var selectedDistrictOverlay: (name: String, lat: Double, lon: Double)? = nil
@@ -1264,7 +1584,6 @@ struct ContentView: View {
     @State private var launchSummary: LaunchSummaryData?
     @State private var pendingLaunchSummary: PendingLaunchSummary?
     @State private var hasShownSummary = false
-    @State private var hasQueuedLaunchAchievementCheck = false
 
     private var usesRegularWidthLayout: Bool {
         horizontalSizeClass == .regular
@@ -1291,80 +1610,21 @@ struct ContentView: View {
             .shadow(color: .black.opacity(0.18), radius: 5, x: 0, y: 3)
     }
 
-    private func startFakeLoading() {
-        fakeLoadingTask?.cancel()
-        isLoading = true
-        isLoadingInBackground = false
-        showUpdatedMessage = false
-        loadingStatusMessage = nil
-        longLoadingMessageShownAt = nil
-        fakeLoadingPercent = 0
-        hasQueuedLaunchAchievementCheck = false
+    private func beginDeferredServicesIfReady() {
+        guard hasSeenTutorial,
+              viewModel.hasLoadedRouteCache,
+              !didStartDeferredServices else { return }
+        didStartDeferredServices = true
+        locationManager.start()
 
-        fakeLoadingTask = Task {
-            for percent in 0...99 {
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    fakeLoadingPercent = percent
-                }
-                try? await Task.sleep(nanoseconds: 60_000_000)
-            }
-
-            await MainActor.run {
-                loadingStatusMessage = "This is taking a bit longer than expected. We'll load in the background."
-                longLoadingMessageShownAt = Date()
-            }
-
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-
-            await MainActor.run {
-                guard viewModel.loadProgress < 1 else { return }
-                isLoading = false
-                isLoadingInBackground = true
-                loadingStatusMessage = nil
-                longLoadingMessageShownAt = nil
-            }
+        // Give MapKit one quiet turn to display the cached archive before HealthKit
+        // reconciliation and precalculation start at background priority.
+        let healthKitDelay = viewModel.routes.isEmpty ? 0.25 : 1.5
+        DispatchQueue.main.asyncAfter(deadline: .now() + healthKitDelay) {
+            viewModel.beginDeferredHealthKitSync()
         }
-    }
-
-    private func finishFakeLoading() {
-        fakeLoadingTask?.cancel()
-        fakeLoadingTask = nil
-        let remainingLongMessageSeconds: TimeInterval
-        if let longLoadingMessageShownAt, isLoading {
-            remainingLongMessageSeconds = max(0, 3 - Date().timeIntervalSince(longLoadingMessageShownAt))
-        } else {
-            remainingLongMessageSeconds = 0
-        }
-
-        if remainingLongMessageSeconds > 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + remainingLongMessageSeconds) {
-                completeVisibleLoading()
-            }
-            return
-        }
-
-        completeVisibleLoading()
-    }
-
-    private func completeVisibleLoading() {
-        loadingStatusMessage = nil
-        longLoadingMessageShownAt = nil
-
-        if isLoadingInBackground || !isLoading {
-            isLoading = false
-            isLoadingInBackground = false
-            fakeLoadingPercent = 0
-            showUpdatedToast()
-            return
-        }
-
-        fakeLoadingPercent = 100
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            isLoading = false
-            fakeLoadingPercent = 0
-            showUpdatedToast()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+            viewModel.scheduleRouteAnalysis()
         }
     }
 
@@ -1375,19 +1635,52 @@ struct ContentView: View {
         }
     }
 
+    private var noWorkoutsTitle: String {
+        switch viewModel.healthKitAccess {
+        case .unavailable:
+            return "HealthKit unavailable"
+        case .denied:
+            return "Health permission needed"
+        case .authorized, nil:
+            return "No workouts found"
+        }
+    }
+
+    private var noWorkoutsMessage: String {
+        switch viewModel.healthKitAccess {
+        case .unavailable:
+            return "This Mac build cannot access HealthKit, so macOS will not show a Health permission prompt. Use the iPhone or iPad app to sync workouts, or load demo workouts to explore the app."
+        case .denied:
+            return "Health access was not granted. Open Settings, allow Run Map to read workouts and workout routes, then try syncing again."
+        case .authorized, nil:
+            return "Connect to Health and record a run or tap below to load a couple of demo workouts to see the app in action."
+        }
+    }
+
     var body: some View {
         ZStack {
-            RouteMapView(routes: viewModel.displayedRoutes,
-                         region: region,
-                         highlightedRouteIDs: highlightedRouteIDs,
-                         showUserLocation: showUserLocation,
-                         mapType: mapType,
-                         districtOverlay: selectedDistrictOverlay,
-                         showAllBerlinDistricts: showAllBerlinDistricts,
-                         visitedBerlinDistricts: achievementsManager.berlinDistrictsVisitedCached,
-                         showAllBerlinStadtteile: showAllBerlinStadtteile,
-                         visitedBerlinStadtteile: achievementsManager.berlinStadtteileVisitedCached,
-                         streetsByStadtteil: achievementsManager.streetsByStadtteil)
+            LinearGradient(
+                colors: [Color.blue.opacity(0.78), Color.cyan.opacity(0.38)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            if shouldMountMap {
+                RouteMapView(routes: viewModel.displayedRoutes,
+                             region: region,
+                             highlightedRouteIDs: highlightedRouteIDs,
+                             showUserLocation: showUserLocation,
+                             mapType: mapType,
+                             districtOverlay: selectedDistrictOverlay,
+                             showAllBerlinDistricts: showAllBerlinDistricts,
+                             visitedBerlinDistricts: achievementsManager.berlinDistrictsVisitedCached,
+                             showAllBerlinStadtteile: showAllBerlinStadtteile,
+                             visitedBerlinStadtteile: achievementsManager.berlinStadtteileVisitedCached,
+                             streetsByStadtteil: achievementsManager.streetsByStadtteil,
+                             onMapReady: {
+                                 isMapReady = true
+                             })
                 .onReceive(locationManager.$currentLocation) { location in
                     // Center map on user's current location when first obtained
                     if let location = location, !hasSetInitialLocation {
@@ -1419,6 +1712,7 @@ struct ContentView: View {
                     }
                 }
                 .ignoresSafeArea()
+            }
             
             VStack {
                 // Demo workout label
@@ -1442,21 +1736,35 @@ struct ContentView: View {
                 .padding(.bottom, 8)
             }
             
-            if isLoading {
-                VStack(spacing: 8) {
-                    Text("Loading \(fakeLoadingPercent)%")
+            if isLoading || !isMapReady {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .tint(.white)
+                    Text(isLoading ? "Loading route history…" : "Preparing map…")
                         .fontWeight(.semibold)
-                    if let loadingStatusMessage {
-                        Text(loadingStatusMessage)
-                            .font(.subheadline)
-                            .multilineTextAlignment(.center)
-                    }
                 }
-                    .padding()
-                    .background(Color.black.opacity(0.6))
-                    .foregroundColor(.white)
-                    .cornerRadius(8)
-                    .padding(.horizontal, 28)
+                .padding()
+                .background(Color.black.opacity(0.68))
+                .foregroundColor(.white)
+                .cornerRadius(12)
+                .padding(.horizontal, 28)
+            }
+
+            if viewModel.isSyncing && !isLoading {
+                VStack {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Updating routes in the background")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial)
+                    .clipShape(Capsule())
+                    .padding(.top, 10)
+                    Spacer()
+                }
             }
 
             if showUpdatedMessage {
@@ -1468,6 +1776,20 @@ struct ContentView: View {
                     .background(Color.black.opacity(0.75))
                     .foregroundColor(.white)
                     .cornerRadius(10)
+                    .transition(.opacity)
+            }
+
+            if let routeTransferMessage {
+                Text(routeTransferMessage)
+                    .font(.headline)
+                    .fontWeight(.semibold)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .background(Color.black.opacity(0.75))
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
+                    .padding(.horizontal, 28)
                     .transition(.opacity)
             }
             
@@ -1491,8 +1813,19 @@ struct ContentView: View {
                         // Update‑from‑HealthKit button
                         circleButton(icon: "arrow.clockwise")
                             .onTapGesture {
-                                startFakeLoading()
                                 viewModel.refreshFromHealthKit()
+                            }
+
+                        // Export routes for transfer to another device
+                        circleButton(icon: "square.and.arrow.up")
+                            .onTapGesture {
+                                prepareRouteExport()
+                            }
+
+                        // Import routes exported from another device
+                        circleButton(icon: "square.and.arrow.down")
+                            .onTapGesture {
+                                showRouteImporter = true
                             }
 
                         // Re‑center to current location
@@ -1538,6 +1871,7 @@ struct ContentView: View {
                         // Route planner button
                         circleButton(icon: "point.topleft.down.curvedto.point.bottomright.up.fill")
                             .onTapGesture {
+                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
                                 showRoutePlanner = true
                             }
 
@@ -1550,12 +1884,15 @@ struct ContentView: View {
                         // Monthly recap button
                         circleButton(icon: "calendar.badge.clock")
                             .onTapGesture {
+                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+                                MonthlyRecapNotificationScheduler.configure()
                                 showMonthlyRecap = true
                             }
 
                         // Achievements button
                         circleButton(icon: "trophy.fill")
                             .onTapGesture {
+                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
                                 showAchievementsPage = true
                             }
 
@@ -1573,42 +1910,36 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            startFakeLoading()
-            viewModel.healthManager.requestAuthorization { _ in
-                RunMapHealthKitBackgroundService.shared.start()
-                viewModel.loadRuns()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                    if let latest = viewModel.routes.sorted(by: { $0.date > $1.date }).first {
-                        let calendar = Calendar.current
-                        let routesFromLatestDay = viewModel.routes.filter { route in
-                            calendar.isDate(route.date, inSameDayAs: latest.date)
-                        }
-                        highlightedRouteIDs = Set(routesFromLatestDay.map { $0.id })
-                        let allCoordinates = routesFromLatestDay.flatMap { $0.coordinates }
-                        region = coordinateRegion(for: allCoordinates)
-                    }
-                }
-            }
+            guard !didStartLaunch else { return }
+            didStartLaunch = true
+            isLoading = true
+            viewModel.loadRuns(fetchHealthKit: false)
         }
         .onReceive(NotificationCenter.default.publisher(for: .runMapHealthKitBackgroundImportDidFinish)) { _ in
             viewModel.reloadRoutesFromCache {
                 showUpdatedToast()
-                startLaunchAchievementCheckAfterMapLoad()
             }
+        }
+        .onReceive(viewModel.$hasLoadedRouteCache) { hasLoadedCache in
+            guard hasLoadedCache else { return }
+            RunMapPerformanceMetrics.log(
+                "launch_cache_ready",
+                seconds: CFAbsoluteTimeGetCurrent() - launchStartedAt,
+                metadata: "routes=\(viewModel.routes.count)"
+            )
+            isLoading = false
+            // Commit the lightweight SwiftUI shell first. MapKit is mounted on the
+            // following run-loop turn so its renderer cannot delay the first frame.
+            DispatchQueue.main.async {
+                shouldMountMap = true
+            }
+            showNoWorkouts = false
+            beginDeferredServicesIfReady()
         }
         .onReceive(viewModel.$loadProgress) { progress in
             if progress >= 1 {
                 // After all HealthKit queries finish decide whether to show the empty state
                 showNoWorkouts = viewModel.routes.isEmpty
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    finishFakeLoading()
-                    // Check for new countries after loading is complete
-                    checkForNewCountries(routes: viewModel.routes)
-                    if !hasQueuedLaunchAchievementCheck {
-                        hasQueuedLaunchAchievementCheck = true
-                        startLaunchAchievementCheckAfterMapLoad()
-                    }
-                }
                 if !hasShownSummary {
                     let newRuns = max(0, viewModel.routes.count - lastRunCount)
                     let newlyAddedRoutes = Array(viewModel.routes.sorted { $0.date > $1.date }.prefix(newRuns))
@@ -1621,8 +1952,9 @@ struct ContentView: View {
                                 newRoutes: newlyAddedRoutes,
                                 runningKPI: launchWorkoutKPI(for: newlyAddedRoutes, type: .running),
                                 walkingKPI: launchWorkoutKPI(for: newlyAddedRoutes, type: .walking),
-                                touchedAreaCount: touchedLaunchAreaCount(for: newlyAddedRoutes)
+                                touchedAreaCount: 0
                             )
+                            presentPendingLaunchSummary()
                         }
                     }
                     lastRunCount = viewModel.routes.count
@@ -1630,10 +1962,11 @@ struct ContentView: View {
                     hasShownSummary = true
                     hasLaunchedBefore = true
                 }
-            } else {
-                if !isLoading && !isLoadingInBackground {
-                    startFakeLoading()
-                }
+            }
+        }
+        .onChange(of: hasSeenTutorial) { hasSeen in
+            if hasSeen {
+                beginDeferredServicesIfReady()
             }
         }
         .onReceive(achievementsManager.$newlyCoveredStreetNames) { _ in
@@ -1653,10 +1986,32 @@ struct ContentView: View {
             }
         }
         .fullScreenCover(isPresented: $showNoWorkouts) {
-            NoWorkoutsView {
+            NoWorkoutsView(
+                title: noWorkoutsTitle,
+                message: noWorkoutsMessage
+            ) {
                 loadDemoWorkouts()
                 showNoWorkouts = false
             }
+        }
+        .fileExporter(
+            isPresented: $showRouteExporter,
+            document: routeExportDocument,
+            contentType: .json,
+            defaultFilename: "Run_Map_routes"
+        ) { result in
+            switch result {
+            case .success:
+                showRouteTransferMessage("Routes exported")
+            case .failure(let error):
+                showRouteTransferMessage("Export failed: \(error.localizedDescription)")
+            }
+        }
+        .fileImporter(
+            isPresented: $showRouteImporter,
+            allowedContentTypes: [.json]
+        ) { result in
+            importRoutes(from: result)
         }
         .sheet(isPresented: $showStats) {
             StatsView(routes: viewModel.displayedRoutes) { country, city in
@@ -1772,6 +2127,57 @@ struct ContentView: View {
         viewModel.hasContent = !viewModel.routes.isEmpty
     }
 
+    private func prepareRouteExport() {
+        guard !viewModel.routes.isEmpty else {
+            showRouteTransferMessage("No routes to export")
+            return
+        }
+
+        do {
+            routeExportDocument = RunMapRoutesDocument(
+                data: try viewModel.routeStorage.exportData(for: viewModel.routes)
+            )
+            showRouteExporter = true
+        } catch {
+            showRouteTransferMessage("Export failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func importRoutes(from result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            do {
+                let importedRoutes = try viewModel.routeStorage.importRoutes(from: url)
+                guard !importedRoutes.isEmpty else {
+                    showRouteTransferMessage("No routes found in file")
+                    return
+                }
+
+                viewModel.importRoutes(importedRoutes)
+                showNoWorkouts = false
+                showRouteTransferMessage("Imported \(importedRoutes.count) routes")
+                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+            } catch {
+                showRouteTransferMessage("Import failed: \(error.localizedDescription)")
+            }
+        case .failure(let error):
+            showRouteTransferMessage("Import failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func showRouteTransferMessage(_ message: String) {
+        withAnimation {
+            routeTransferMessage = message
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
+            withAnimation {
+                if routeTransferMessage == message {
+                    routeTransferMessage = nil
+                }
+            }
+        }
+    }
+
     private func markLatestDayRoutes() {
         guard let latest = viewModel.routes.sorted(by: { $0.date > $1.date }).first else { return }
         let calendar = Calendar.current
@@ -1842,74 +2248,6 @@ struct ContentView: View {
         )
     }
 
-    private func touchedLaunchAreaCount(for routes: [Route]) -> Int {
-        var areaNames = Set<String>()
-        let coordinates = routes.flatMap(\.coordinates)
-
-        for coordinate in coordinates {
-            if let district = BerlinDistricts.getDistrict(lat: coordinate.latitude, lon: coordinate.longitude) {
-                areaNames.insert(district)
-            }
-        }
-
-        for stadtteil in BerlinStreets.getStadtteileFromCoordinates(coordinates) {
-            areaNames.insert(stadtteil)
-        }
-
-        return areaNames.count
-    }
-
-    private func startLaunchAchievementCheckAfterMapLoad() {
-        let routes = viewModel.routes
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            achievementsManager.checkAndUnlockAchievementsInBackground(routes: routes)
-        }
-    }
-
-    private func checkForNewCountries(routes: [Route]) {
-        let oneWeekAgo = Calendar.current.date(byAdding: .day, value: -7, to: Date()) ?? Date()
-        
-        // Get routes from the last week
-        let recentRoutes = routes.filter { $0.date >= oneWeekAgo }
-        guard !recentRoutes.isEmpty else { return }
-        
-        // Get ALL historical countries from all routes (not just stored ones)
-        var allHistoricalCountries = Set<String>()
-        
-        for route in routes {
-            guard let firstCoord = route.coordinates.first else { continue }
-            let geocodeResult = LocalGeocoder.geocode(latitude: firstCoord.latitude, longitude: firstCoord.longitude)
-            if !geocodeResult.country.isEmpty && geocodeResult.country != "Unknown" {
-                allHistoricalCountries.insert(geocodeResult.country)
-            }
-        }
-        
-        // Get countries from recent routes only
-        var recentCountries = Set<String>()
-        
-        for route in recentRoutes {
-            guard let firstCoord = route.coordinates.first else { continue }
-            let geocodeResult = LocalGeocoder.geocode(latitude: firstCoord.latitude, longitude: firstCoord.longitude)
-            if !geocodeResult.country.isEmpty && geocodeResult.country != "Unknown" {
-                recentCountries.insert(geocodeResult.country)
-            }
-        }
-        
-        // Get previously stored countries (from last app run)
-        let previouslyKnownCountries = Set(UserDefaults.standard.stringArray(forKey: "visitedCountries") ?? [])
-        
-        // Find truly new countries: countries from recent workouts that weren't known in the previous app session
-        let newCountries = recentCountries.subtracting(previouslyKnownCountries)
-        
-        if !newCountries.isEmpty {
-            newCountriesFound = Array(newCountries).sorted()
-            showNewCountryAlert = true
-        }
-        
-        // Update stored countries with all historical countries
-        UserDefaults.standard.set(Array(allHistoricalCountries), forKey: "visitedCountries")
-    }
-    
     private func navigateToLocation(country: String, city: String) {
         print("🗺️ Navigating to: country='\(country)', city='\(city)'")
         
@@ -2056,8 +2394,6 @@ struct ContentView: View {
 // MARK: - RouteMapView
 
 struct RouteMapView: UIViewRepresentable {
-    private static let maxRenderedRouteOverlays = 500
-
     var routes: [Route]
     var region: MKCoordinateRegion
     var highlightedRouteIDs: Set<UUID>
@@ -2069,6 +2405,7 @@ struct RouteMapView: UIViewRepresentable {
     var showAllBerlinStadtteile: Bool = false
     var visitedBerlinStadtteile: Set<String> = []
     var streetsByStadtteil: [String: [ConsolidatedStreet]] = [:]
+    var onMapReady: () -> Void = {}
     
     func makeUIView(context: Context) -> MKMapView {
         let mapView = MKMapView()
@@ -2076,6 +2413,9 @@ struct RouteMapView: UIViewRepresentable {
         mapView.showsUserLocation = showUserLocation
         mapView.mapType = mapType
         mapView.delegate = context.coordinator
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            onMapReady()
+        }
         return mapView
     }
 
@@ -2111,61 +2451,20 @@ struct RouteMapView: UIViewRepresentable {
             streetsByStadtteil: streetsByStadtteil
         )
 
-        let desiredRoutes = routesForRendering()
-        let existingIDs = Set(context.coordinator.routeOverlaysByID.keys)
-        let desiredIDs = Set(desiredRoutes.map(\.id))
-
-        let staleIDs = existingIDs.subtracting(desiredIDs)
-        let staleOverlays = staleIDs.compactMap { context.coordinator.routeOverlaysByID.removeValue(forKey: $0) }
-        if !staleOverlays.isEmpty {
-            mapView.removeOverlays(staleOverlays)
-        }
-
-        var toAdd: [MKOverlay] = []
-        for route in desiredRoutes where !existingIDs.contains(route.id) {
-            let pl = RoutePolyline.fromCoordinates(route.coordinates)
-            pl.routeID = route.id
-            pl.routeDate = route.date
-            pl.workoutType = route.workoutType
-            pl.isHighlighted = highlightedRouteIDs.contains(route.id)
-            pl.averageSpeed = route.averageSpeedKmH
-            context.coordinator.routeOverlaysByID[route.id] = pl
-            toAdd.append(pl)
-        }
-        if !toAdd.isEmpty { mapView.addOverlays(toAdd) }
-
-        for (routeID, pl) in context.coordinator.routeOverlaysByID {
-            let shouldHighlight = highlightedRouteIDs.contains(routeID)
-            if pl.isHighlighted != shouldHighlight {
-                pl.isHighlighted = shouldHighlight
-                if let r = mapView.renderer(for: pl) as? MKPolylineRenderer {
-                    r.strokeColor = shouldHighlight ? .orange :
-                        (pl.workoutType == .running ? UIColor(red: 0.0, green: 0.5, blue: 1.0, alpha: 1.0) :
-                         pl.workoutType == .walking ? .systemBlue : .systemGreen)
-                    r.setNeedsDisplay()
-                }
-            }
-        }
-    }
-
-    private func routesForRendering() -> [Route] {
-        guard routes.count > Self.maxRenderedRouteOverlays else { return routes }
-
-        var selected = Array(routes.prefix(Self.maxRenderedRouteOverlays))
-        let selectedIDs = Set(selected.map(\.id))
-        let highlightedOutsideWindow = routes.filter {
-            highlightedRouteIDs.contains($0.id) && !selectedIDs.contains($0.id)
-        }
-
-        if !highlightedOutsideWindow.isEmpty {
-            selected.append(contentsOf: highlightedOutsideWindow)
-        }
-
-        return selected
+        context.coordinator.reconcileRoutes(
+            on: mapView,
+            routes: routes,
+            highlightedRouteIDs: highlightedRouteIDs
+        )
     }
 
     // Create the coordinator that acts as MKMapViewDelegate
     func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    static func dismantleUIView(_ uiView: MKMapView, coordinator: Coordinator) {
+        coordinator.cancelRouteRendering()
+        uiView.delegate = nil
+    }
     
     class Coordinator: NSObject, MKMapViewDelegate {
         var parent: RouteMapView
@@ -2175,9 +2474,129 @@ struct RouteMapView: UIViewRepresentable {
         private var stadtteilOverlayKey: String?
         private var stadtteilOverlays: [MKOverlay] = []
         private var stadtteilAnnotations: [MKAnnotation] = []
-        var routeOverlaysByID: [UUID: RoutePolyline] = [:]
+        private var routeRenderKey: Int?
+        private var routeRenderGeneration = 0
+        private var routeRenderStartedAt = CFAbsoluteTimeGetCurrent()
+        private var routeOverlays: [MKOverlay] = []
+        private var routeGroupActivity: [ObjectIdentifier: HKWorkoutActivityType] = [:]
 
         init(_ parent: RouteMapView) { self.parent = parent }
+
+        func reconcileRoutes(
+            on mapView: MKMapView,
+            routes: [Route],
+            highlightedRouteIDs: Set<UUID>
+        ) {
+            var hasher = Hasher()
+            hasher.combine(routes.count)
+            for route in routes {
+                hasher.combine(route.id)
+                hasher.combine(route.workoutType.rawValue)
+                hasher.combine(highlightedRouteIDs.contains(route.id))
+            }
+            let nextKey = hasher.finalize()
+            guard nextKey != routeRenderKey else { return }
+            routeRenderKey = nextKey
+            routeRenderGeneration += 1
+            let generation = routeRenderGeneration
+            routeRenderStartedAt = CFAbsoluteTimeGetCurrent()
+
+            if !routeOverlays.isEmpty {
+                mapView.removeOverlays(routeOverlays)
+                routeOverlays.removeAll(keepingCapacity: true)
+                routeGroupActivity.removeAll(keepingCapacity: true)
+            }
+
+            let highlightedRoutes = routes.filter { highlightedRouteIDs.contains($0.id) }
+            let regularRoutes = routes.filter { !highlightedRouteIDs.contains($0.id) }
+
+            var immediateOverlays: [MKOverlay] = []
+            for route in highlightedRoutes {
+                let polyline = RoutePolyline.fromCoordinates(route.coordinates)
+                polyline.routeID = route.id
+                polyline.routeDate = route.date
+                polyline.workoutType = route.workoutType
+                polyline.isHighlighted = true
+                polyline.averageSpeed = route.averageSpeedKmH
+                routeOverlays.append(polyline)
+                immediateOverlays.append(polyline)
+            }
+
+            if !immediateOverlays.isEmpty {
+                mapView.addOverlays(immediateOverlays)
+            }
+
+            // Add all historical routes progressively. Each small batch yields to the
+            // run loop so a large archive cannot trip the launch watchdog or freeze map
+            // gestures. Geometry is display-simplified only; the stored route stays intact.
+            appendRouteBatch(
+                on: mapView,
+                routes: regularRoutes,
+                startIndex: 0,
+                generation: generation
+            )
+            if regularRoutes.isEmpty {
+                logCompletedRouteRender(routeCount: routes.count, generation: generation)
+            }
+        }
+
+        func cancelRouteRendering() {
+            routeRenderGeneration += 1
+        }
+
+        private func appendRouteBatch(
+            on mapView: MKMapView,
+            routes: [Route],
+            startIndex: Int,
+            generation: Int
+        ) {
+            guard generation == routeRenderGeneration, startIndex < routes.count else { return }
+
+            let batchSize = 60
+            let endIndex = min(startIndex + batchSize, routes.count)
+            let grouped = Dictionary(grouping: routes[startIndex..<endIndex], by: { $0.workoutType.rawValue })
+            var newOverlays: [MKOverlay] = []
+
+            for (rawActivity, activityRoutes) in grouped {
+                let polylines = activityRoutes.map { route -> MKPolyline in
+                    let coordinates = RouteRenderCoordinateSimplifier.simplified(route.coordinates)
+                    return MKPolyline(coordinates: coordinates, count: coordinates.count)
+                }
+                guard !polylines.isEmpty else { continue }
+                let multiPolyline = MKMultiPolyline(polylines)
+                routeGroupActivity[ObjectIdentifier(multiPolyline)] =
+                    HKWorkoutActivityType(rawValue: rawActivity) ?? .other
+                routeOverlays.append(multiPolyline)
+                newOverlays.append(multiPolyline)
+            }
+
+            if !newOverlays.isEmpty {
+                mapView.addOverlays(newOverlays)
+            }
+
+            guard endIndex < routes.count else {
+                logCompletedRouteRender(routeCount: routes.count, generation: generation)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) { [weak self, weak mapView] in
+                guard let self, let mapView else { return }
+                self.appendRouteBatch(
+                    on: mapView,
+                    routes: routes,
+                    startIndex: endIndex,
+                    generation: generation
+                )
+            }
+        }
+
+        private func logCompletedRouteRender(routeCount: Int, generation: Int) {
+            guard generation == routeRenderGeneration else { return }
+            RunMapPerformanceMetrics.log(
+                "route_map_progressive_render",
+                seconds: CFAbsoluteTimeGetCurrent() - routeRenderStartedAt,
+                metadata: "routes=\(routeCount) overlays=\(routeOverlays.count)"
+            )
+        }
 
         func reconcileDistrictOverlays(
             on mapView: MKMapView,
@@ -2337,6 +2756,21 @@ struct RouteMapView: UIViewRepresentable {
                 renderer.lineDashPattern = polygon.isVisited ? nil : [6, 4]
                 return renderer
             }
+            if let multiPolyline = overlay as? MKMultiPolyline {
+                let renderer = MKMultiPolylineRenderer(multiPolyline: multiPolyline)
+                switch routeGroupActivity[ObjectIdentifier(multiPolyline)] ?? .other {
+                case .running:
+                    renderer.strokeColor = UIColor(red: 0.0, green: 0.5, blue: 1.0, alpha: 0.82)
+                case .walking:
+                    renderer.strokeColor = UIColor.systemBlue.withAlphaComponent(0.76)
+                default:
+                    renderer.strokeColor = UIColor.systemGreen.withAlphaComponent(0.76)
+                }
+                renderer.lineWidth = 3
+                renderer.lineCap = .round
+                renderer.lineJoin = .round
+                return renderer
+            }
             guard let polyline = overlay as? RoutePolyline else {
                 return MKOverlayRenderer(overlay: overlay)
             }
@@ -2492,6 +2926,8 @@ struct OnboardingView: View {
 
 // MARK: - No Workouts View
 struct NoWorkoutsView: View {
+    var title: String = "No workouts found"
+    var message: String = "Connect to Health and record a run or tap below to load a couple of demo workouts to see the app in action."
     var loadDemoAndDismiss: () -> Void
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -2505,10 +2941,10 @@ struct NoWorkoutsView: View {
                 .resizable().scaledToFit().frame(height: 120)
                 .foregroundColor(.blue)
 
-            Text("No workouts found")
+            Text(title)
                 .font(.title).bold()
 
-            Text("Connect to Health and record a run or tap below to load a couple of demo workouts to see the app in action.")
+            Text(message)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
 

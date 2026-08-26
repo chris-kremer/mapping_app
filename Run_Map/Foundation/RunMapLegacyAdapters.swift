@@ -22,11 +22,7 @@ extension RunMapRouteSnapshot {
         let activity = Activity(workoutType: route.workoutType)
 
         self.init(
-            id: RunMapRouteNormalizer.stableID(
-                startDate: route.date,
-                activity: activity,
-                coordinateCount: coordinates.count
-            ),
+            id: route.persistenceKey,
             startDate: route.date,
             activity: activity,
             durationSeconds: route.durationSec,
@@ -63,4 +59,3 @@ extension StreetGeometrySnapshot {
         )
     }
 }
-

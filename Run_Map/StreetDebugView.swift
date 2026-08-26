@@ -41,7 +41,7 @@ struct StreetDebugView: View {
             .background(Color(.systemBackground))
 
             // Map showing street points and routes
-            if let selected = selectedStreet {
+            if selectedStreet != nil {
                 ZStack {
                     StreetDebugMapView(
                         region: region,
@@ -201,7 +201,7 @@ struct StreetDebugView: View {
                     }
                 }
 
-                if let selected = selectedStreet {
+                if selectedStreet != nil {
                     Section(header: Text("Coverage Details")) {
                         let covered = coverageResults.filter { $0.isCovered }.count
                         let total = coverageResults.count
@@ -252,7 +252,7 @@ struct StreetDebugView: View {
 
         Task {
             // Load only Mitte district
-            let allStreets = await BerlinStreets.getStreets(forDistricts: ["Mitte"])
+            let allStreets = BerlinStreets.getStreets(forDistricts: ["Mitte"])
 
             // Further filter to just "Mitte" stadtteil if needed
             let mitteStreets = allStreets.filter { street in
@@ -519,6 +519,15 @@ struct DebugRoutePolyline: Identifiable {
     let coordinates: [CLLocationCoordinate2D]
 }
 
+final class DebugMapPolyline: MKPolyline {
+    enum Kind {
+        case route
+        case street
+    }
+
+    var kind: Kind = .route
+}
+
 // MARK: - Map View
 
 struct StreetDebugMapView: UIViewRepresentable {
@@ -534,32 +543,50 @@ struct StreetDebugMapView: UIViewRepresentable {
     }
 
     func updateUIView(_ mapView: MKMapView, context: Context) {
-        // Update region
-        mapView.setRegion(region, animated: true)
+        let signature = MapSignature(region: region, routePolylines: routePolylines, coverageResults: coverageResults)
+        if context.coordinator.regionSignature != signature.regionSignature {
+            mapView.setRegion(region, animated: context.coordinator.regionSignature != nil)
+            context.coordinator.regionSignature = signature.regionSignature
+        }
 
-        // Remove existing overlays and annotations
-        mapView.removeOverlays(mapView.overlays)
-        mapView.removeAnnotations(mapView.annotations)
+        guard context.coordinator.contentSignature != signature.contentSignature else {
+            return
+        }
+        context.coordinator.contentSignature = signature.contentSignature
+
+        // Remove existing overlays and annotations owned by this representable.
+        mapView.removeOverlays(context.coordinator.overlays)
+        mapView.removeAnnotations(context.coordinator.annotations)
+        context.coordinator.overlays.removeAll(keepingCapacity: true)
+        context.coordinator.annotations.removeAll(keepingCapacity: true)
 
         // Add route polylines (blue)
+        var overlays: [MKOverlay] = []
+        overlays.reserveCapacity(routePolylines.count + 1)
         for routePoly in routePolylines {
-            let polyline = MKPolyline(coordinates: routePoly.coordinates, count: routePoly.coordinates.count)
-            mapView.addOverlay(polyline)
+            let polyline = DebugMapPolyline(coordinates: routePoly.coordinates, count: routePoly.coordinates.count)
+            polyline.kind = .route
+            overlays.append(polyline)
         }
 
         // Add street polyline (purple)
         if !coverageResults.isEmpty {
             let streetCoords = coverageResults.map { $0.coordinate }
-            let streetPolyline = MKPolyline(coordinates: streetCoords, count: streetCoords.count)
-            mapView.addOverlay(streetPolyline)
+            let streetPolyline = DebugMapPolyline(coordinates: streetCoords, count: streetCoords.count)
+            streetPolyline.kind = .street
+            overlays.append(streetPolyline)
         }
+        mapView.addOverlays(overlays)
+        context.coordinator.overlays = overlays
 
         // Add start marker
+        var annotations: [MKAnnotation] = []
+        annotations.reserveCapacity(coverageResults.count + 2)
         if let first = coverageResults.first {
             let annotation = MKPointAnnotation()
             annotation.coordinate = first.coordinate
             annotation.title = "Start"
-            mapView.addAnnotation(annotation)
+            annotations.append(annotation)
         }
 
         // Add end marker
@@ -567,7 +594,7 @@ struct StreetDebugMapView: UIViewRepresentable {
             let annotation = MKPointAnnotation()
             annotation.coordinate = last.coordinate
             annotation.title = "End"
-            mapView.addAnnotation(annotation)
+            annotations.append(annotation)
         }
 
         // Add coverage point annotations
@@ -575,8 +602,10 @@ struct StreetDebugMapView: UIViewRepresentable {
             let annotation = CoveragePointAnnotation()
             annotation.coordinate = point.coordinate
             annotation.isCovered = point.isCovered
-            mapView.addAnnotation(annotation)
+            annotations.append(annotation)
         }
+        mapView.addAnnotations(annotations)
+        context.coordinator.annotations = annotations
     }
 
     func makeCoordinator() -> Coordinator {
@@ -585,6 +614,14 @@ struct StreetDebugMapView: UIViewRepresentable {
 
     class Coordinator: NSObject, MKMapViewDelegate {
         let parent: StreetDebugMapView
+        var regionSignature: String?
+        var contentSignature: String?
+        var overlays: [MKOverlay] = []
+        var annotations: [MKAnnotation] = []
+        private var coveredPointImage: UIImage?
+        private var uncoveredPointImage: UIImage?
+        private var startMarkerImage: UIImage?
+        private var endMarkerImage: UIImage?
 
         init(_ parent: StreetDebugMapView) {
             self.parent = parent
@@ -597,8 +634,7 @@ struct StreetDebugMapView: UIViewRepresentable {
 
             let renderer = MKPolylineRenderer(polyline: polyline)
 
-            // Determine if this is the street polyline (last one added) or a route
-            if mapView.overlays.last === overlay && !parent.coverageResults.isEmpty {
+            if let debugPolyline = overlay as? DebugMapPolyline, debugPolyline.kind == .street {
                 // Street polyline - purple
                 renderer.strokeColor = UIColor.systemPurple.withAlphaComponent(0.7)
                 renderer.lineWidth = 4
@@ -617,20 +653,7 @@ struct StreetDebugMapView: UIViewRepresentable {
                 let view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier) ?? MKAnnotationView(annotation: annotation, reuseIdentifier: identifier)
                 view.annotation = annotation
 
-                // Create a colored circle
-                let size: CGFloat = 8
-                let color: UIColor = coverageAnnotation.isCovered ? .systemGreen.withAlphaComponent(0.7) : .systemRed.withAlphaComponent(0.7)
-
-                UIGraphicsBeginImageContextWithOptions(CGSize(width: size, height: size), false, 0)
-                let context = UIGraphicsGetCurrentContext()
-                context?.setFillColor(color.cgColor)
-                context?.fillEllipse(in: CGRect(x: 0, y: 0, width: size, height: size))
-                context?.setStrokeColor(UIColor.white.cgColor)
-                context?.setLineWidth(1)
-                context?.strokeEllipse(in: CGRect(x: 0, y: 0, width: size, height: size))
-                view.image = UIGraphicsGetImageFromCurrentImageContext()
-                UIGraphicsEndImageContext()
-
+                view.image = coverageAnnotation.isCovered ? coveredImage() : uncoveredImage()
                 view.centerOffset = CGPoint(x: 0, y: 0)
                 return view
             }
@@ -640,32 +663,99 @@ struct StreetDebugMapView: UIViewRepresentable {
                 let view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier) ?? MKAnnotationView(annotation: annotation, reuseIdentifier: identifier)
                 view.annotation = annotation
 
-                // Create start/end marker
-                let size: CGFloat = 20
-                let color: UIColor = pointAnnotation.title == "Start" ? .systemGreen : .systemRed
-                let text = pointAnnotation.title == "Start" ? "S" : "E"
+                view.image = pointAnnotation.title == "Start" ? startImage() : endImage()
 
-                UIGraphicsBeginImageContextWithOptions(CGSize(width: size, height: size), false, 0)
-                let context = UIGraphicsGetCurrentContext()
-                context?.setFillColor(color.cgColor)
-                context?.fillEllipse(in: CGRect(x: 0, y: 0, width: size, height: size))
-
-                let textStyle = NSMutableParagraphStyle()
-                textStyle.alignment = .center
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.boldSystemFont(ofSize: 12),
-                    .foregroundColor: UIColor.white,
-                    .paragraphStyle: textStyle
-                ]
-                (text as NSString).draw(in: CGRect(x: 0, y: 4, width: size, height: size), withAttributes: attrs)
-                view.image = UIGraphicsGetImageFromCurrentImageContext()
-                UIGraphicsEndImageContext()
-
-                view.centerOffset = CGPoint(x: 0, y: -size/2)
+                view.centerOffset = CGPoint(x: 0, y: -10)
                 return view
             }
 
             return nil
+        }
+
+        private func coveredImage() -> UIImage? {
+            if coveredPointImage == nil {
+                coveredPointImage = makePointImage(color: .systemGreen.withAlphaComponent(0.7))
+            }
+            return coveredPointImage
+        }
+
+        private func uncoveredImage() -> UIImage? {
+            if uncoveredPointImage == nil {
+                uncoveredPointImage = makePointImage(color: .systemRed.withAlphaComponent(0.7))
+            }
+            return uncoveredPointImage
+        }
+
+        private func startImage() -> UIImage? {
+            if startMarkerImage == nil {
+                startMarkerImage = makeMarkerImage(color: .systemGreen, text: "S")
+            }
+            return startMarkerImage
+        }
+
+        private func endImage() -> UIImage? {
+            if endMarkerImage == nil {
+                endMarkerImage = makeMarkerImage(color: .systemRed, text: "E")
+            }
+            return endMarkerImage
+        }
+
+        private func makePointImage(color: UIColor) -> UIImage? {
+            let size: CGFloat = 8
+            UIGraphicsBeginImageContextWithOptions(CGSize(width: size, height: size), false, 0)
+            let context = UIGraphicsGetCurrentContext()
+            context?.setFillColor(color.cgColor)
+            context?.fillEllipse(in: CGRect(x: 0, y: 0, width: size, height: size))
+            context?.setStrokeColor(UIColor.white.cgColor)
+            context?.setLineWidth(1)
+            context?.strokeEllipse(in: CGRect(x: 0, y: 0, width: size, height: size))
+            let image = UIGraphicsGetImageFromCurrentImageContext()
+            UIGraphicsEndImageContext()
+            return image
+        }
+
+        private func makeMarkerImage(color: UIColor, text: String) -> UIImage? {
+            let size: CGFloat = 20
+            UIGraphicsBeginImageContextWithOptions(CGSize(width: size, height: size), false, 0)
+            let context = UIGraphicsGetCurrentContext()
+            context?.setFillColor(color.cgColor)
+            context?.fillEllipse(in: CGRect(x: 0, y: 0, width: size, height: size))
+
+            let textStyle = NSMutableParagraphStyle()
+            textStyle.alignment = .center
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.boldSystemFont(ofSize: 12),
+                .foregroundColor: UIColor.white,
+                .paragraphStyle: textStyle
+            ]
+            (text as NSString).draw(in: CGRect(x: 0, y: 4, width: size, height: size), withAttributes: attrs)
+            let image = UIGraphicsGetImageFromCurrentImageContext()
+            UIGraphicsEndImageContext()
+            return image
+        }
+    }
+
+    private struct MapSignature {
+        let regionSignature: String
+        let contentSignature: String
+
+        init(region: MKCoordinateRegion, routePolylines: [DebugRoutePolyline], coverageResults: [StreetPointDebugInfo]) {
+            regionSignature = [
+                region.center.latitude,
+                region.center.longitude,
+                region.span.latitudeDelta,
+                region.span.longitudeDelta
+            ]
+            .map { String(format: "%.6f", $0) }
+            .joined(separator: "|")
+
+            let routePointCount = routePolylines.reduce(0) { $0 + $1.coordinates.count }
+            let firstRoute = routePolylines.first?.coordinates.first?.signatureValue ?? "none"
+            let lastRoute = routePolylines.last?.coordinates.last?.signatureValue ?? "none"
+            let coveredCount = coverageResults.reduce(0) { $0 + ($1.isCovered ? 1 : 0) }
+            let firstCoverage = coverageResults.first?.coordinate.signatureValue ?? "none"
+            let lastCoverage = coverageResults.last?.coordinate.signatureValue ?? "none"
+            contentSignature = "\(routePolylines.count)|\(routePointCount)|\(firstRoute)|\(lastRoute)|\(coverageResults.count)|\(coveredCount)|\(firstCoverage)|\(lastCoverage)"
         }
     }
 }
@@ -676,6 +766,12 @@ class CoveragePointAnnotation: NSObject, MKAnnotation {
 
     init(coordinate: CLLocationCoordinate2D = CLLocationCoordinate2D()) {
         self.coordinate = coordinate
+    }
+}
+
+private extension CLLocationCoordinate2D {
+    var signatureValue: String {
+        String(format: "%.6f,%.6f", latitude, longitude)
     }
 }
 
@@ -705,4 +801,5 @@ struct CoverageIndicator: View {
     NavigationView {
         StreetDebugView(routes: [])
     }
+    .navigationViewStyle(.stack)
 }

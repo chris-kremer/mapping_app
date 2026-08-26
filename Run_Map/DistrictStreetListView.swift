@@ -117,15 +117,28 @@ struct DistrictStreetListView: View {
     }
 
     private func calculateCoverage() async {
-        for street in streets {
-            let coverage = street.calculateCoverage(
-                using: FastStreetChecker(routes: routes),
-                densify: false
-            )
+        let streets = self.streets
+        let routes = self.routes
 
-            await MainActor.run {
-                coverageCache[street.id] = coverage
+        let coverageByStreet = await Task.detached(priority: .userInitiated) {
+            RunMapPerformanceMetrics.measure(
+                "district_street_coverage",
+                metadata: "streets=\(streets.count) routes=\(routes.count)"
+            ) {
+                let checker = FastStreetChecker(routes: routes)
+                var results: [String: ConsolidatedStreet.CoverageResult] = [:]
+                results.reserveCapacity(streets.count)
+
+                for street in streets {
+                    results[street.id] = street.calculateCoverage(using: checker, densify: false)
+                }
+
+                return results
             }
+        }.value
+
+        await MainActor.run {
+            coverageCache = coverageByStreet
         }
     }
 
@@ -205,13 +218,14 @@ struct StreetMapView: View {
                 }
             }
         }
+        .navigationViewStyle(.stack)
         .task {
             await loadCoverageData()
         }
     }
 
     private func loadCoverageData() async {
-        let (coverage, points) = processor.calculateStreetCoverage(
+        let (_, points) = processor.calculateStreetCoverage(
             street: street,
             routes: routes,
             densify: false
@@ -272,25 +286,41 @@ struct StreetCoverageMapView: UIViewRepresentable {
     }
 
     func updateUIView(_ mapView: MKMapView, context: Context) {
-        mapView.setRegion(region, animated: true)
+        let signature = MapSignature(region: region, coveragePoints: coveragePoints, streetCoordinates: streetCoordinates)
+        if context.coordinator.regionSignature != signature.regionSignature {
+            mapView.setRegion(region, animated: context.coordinator.regionSignature != nil)
+            context.coordinator.regionSignature = signature.regionSignature
+        }
+
+        guard context.coordinator.contentSignature != signature.contentSignature else {
+            return
+        }
+        context.coordinator.contentSignature = signature.contentSignature
 
         // Remove old overlays/annotations
-        mapView.removeOverlays(mapView.overlays)
-        mapView.removeAnnotations(mapView.annotations)
+        mapView.removeOverlays(context.coordinator.overlays)
+        mapView.removeAnnotations(context.coordinator.annotations)
+        context.coordinator.overlays.removeAll(keepingCapacity: true)
+        context.coordinator.annotations.removeAll(keepingCapacity: true)
 
         // Add street polyline
         if streetCoordinates.count >= 2 {
             let polyline = MKPolyline(coordinates: streetCoordinates, count: streetCoordinates.count)
             mapView.addOverlay(polyline)
+            context.coordinator.overlays.append(polyline)
         }
 
         // Add coverage point annotations
+        var annotations: [StreetPointAnnotation] = []
+        annotations.reserveCapacity(coveragePoints.count)
         for point in coveragePoints {
             let annotation = StreetPointAnnotation()
             annotation.coordinate = point.coordinate
             annotation.isCovered = point.isCovered
-            mapView.addAnnotation(annotation)
+            annotations.append(annotation)
         }
+        mapView.addAnnotations(annotations)
+        context.coordinator.annotations = annotations
     }
 
     func makeCoordinator() -> Coordinator {
@@ -298,6 +328,13 @@ struct StreetCoverageMapView: UIViewRepresentable {
     }
 
     class Coordinator: NSObject, MKMapViewDelegate {
+        var regionSignature: String?
+        var contentSignature: String?
+        var overlays: [MKOverlay] = []
+        var annotations: [MKAnnotation] = []
+        private var coveredPointImage: UIImage?
+        private var uncoveredPointImage: UIImage?
+
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let polyline = overlay as? MKPolyline {
                 let renderer = MKPolylineRenderer(polyline: polyline)
@@ -318,11 +355,27 @@ struct StreetCoverageMapView: UIViewRepresentable {
                 ?? MKAnnotationView(annotation: annotation, reuseIdentifier: identifier)
             view.annotation = annotation
 
-            let size: CGFloat = 8
-            let color: UIColor = pointAnnotation.isCovered
-                ? .systemGreen.withAlphaComponent(0.7)
-                : .systemRed.withAlphaComponent(0.7)
+            view.image = pointAnnotation.isCovered ? coveredImage() : uncoveredImage()
 
+            return view
+        }
+
+        private func coveredImage() -> UIImage? {
+            if coveredPointImage == nil {
+                coveredPointImage = makePointImage(color: .systemGreen.withAlphaComponent(0.7))
+            }
+            return coveredPointImage
+        }
+
+        private func uncoveredImage() -> UIImage? {
+            if uncoveredPointImage == nil {
+                uncoveredPointImage = makePointImage(color: .systemRed.withAlphaComponent(0.7))
+            }
+            return uncoveredPointImage
+        }
+
+        private func makePointImage(color: UIColor) -> UIImage? {
+            let size: CGFloat = 8
             UIGraphicsBeginImageContextWithOptions(CGSize(width: size, height: size), false, 0)
             let context = UIGraphicsGetCurrentContext()
             context?.setFillColor(color.cgColor)
@@ -330,10 +383,32 @@ struct StreetCoverageMapView: UIViewRepresentable {
             context?.setStrokeColor(UIColor.white.cgColor)
             context?.setLineWidth(1)
             context?.strokeEllipse(in: CGRect(x: 0, y: 0, width: size, height: size))
-            view.image = UIGraphicsGetImageFromCurrentImageContext()
+            let image = UIGraphicsGetImageFromCurrentImageContext()
             UIGraphicsEndImageContext()
+            return image
+        }
+    }
 
-            return view
+    private struct MapSignature {
+        let regionSignature: String
+        let contentSignature: String
+
+        init(region: MKCoordinateRegion, coveragePoints: [StreetCoveragePoint], streetCoordinates: [CLLocationCoordinate2D]) {
+            regionSignature = [
+                region.center.latitude,
+                region.center.longitude,
+                region.span.latitudeDelta,
+                region.span.longitudeDelta
+            ]
+            .map { String(format: "%.6f", $0) }
+            .joined(separator: "|")
+
+            let coveredCount = coveragePoints.reduce(0) { $0 + ($1.isCovered ? 1 : 0) }
+            let firstPoint = coveragePoints.first?.coordinate.signatureValue ?? "none"
+            let lastPoint = coveragePoints.last?.coordinate.signatureValue ?? "none"
+            let firstStreet = streetCoordinates.first?.signatureValue ?? "none"
+            let lastStreet = streetCoordinates.last?.signatureValue ?? "none"
+            contentSignature = "\(coveragePoints.count)|\(coveredCount)|\(firstPoint)|\(lastPoint)|\(streetCoordinates.count)|\(firstStreet)|\(lastStreet)"
         }
     }
 }
@@ -344,5 +419,11 @@ class StreetPointAnnotation: NSObject, MKAnnotation {
 
     init(coordinate: CLLocationCoordinate2D = CLLocationCoordinate2D()) {
         self.coordinate = coordinate
+    }
+}
+
+private extension CLLocationCoordinate2D {
+    var signatureValue: String {
+        String(format: "%.6f,%.6f", latitude, longitude)
     }
 }

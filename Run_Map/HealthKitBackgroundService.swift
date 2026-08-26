@@ -10,7 +10,8 @@ final class RunMapHealthKitBackgroundService {
     static let shared = RunMapHealthKitBackgroundService()
 
     private let healthStore = HKHealthStore()
-    private let routeStorage = RouteStorage()
+    private let routeStorage = RouteStorage.shared
+    private let routeHealthManager = HealthKitManager()
     private let stateQueue = DispatchQueue(label: "runmap.healthkit.background.state")
     private var observerQuery: HKObserverQuery?
     private var isStarted = false
@@ -79,7 +80,7 @@ final class RunMapHealthKitBackgroundService {
                     "totalRouteCount": summary.totalRouteCount
                 ]
             )
-            processAchievementsInBackground(routes: summary.routes)
+            RunMapBackgroundAnalysisService.shared.schedule(routes: summary.routes)
         }
 
         let completions: [HKObserverQueryCompletionHandler] = stateQueue.sync {
@@ -103,8 +104,14 @@ final class RunMapHealthKitBackgroundService {
                 return
             }
 
+            let sourceWorkoutIDs = Set(cachedRoutes.compactMap(\.sourceWorkoutID))
+            let checkedWorkoutIDs = self.routeStorage.checkedWorkoutIDs()
             let newWorkouts = workouts.filter { workout in
-                !cachedRoutes.contains { route in
+                if sourceWorkoutIDs.contains(workout.uuid) || checkedWorkoutIDs.contains(workout.uuid) {
+                    return false
+                }
+                return !cachedRoutes.contains { route in
+                    route.sourceWorkoutID == nil &&
                     abs(route.date.timeIntervalSince1970 - workout.startDate.timeIntervalSince1970) < 1.0
                 }
             }
@@ -123,44 +130,65 @@ final class RunMapHealthKitBackgroundService {
             var importedRoutes: [Route] = []
             let group = DispatchGroup()
             let lock = NSLock()
+            var nextWorkoutIndex = 0
 
-            for workout in newWorkouts {
-                group.enter()
-                self.fetchRoute(for: workout) { locations in
-                    defer { group.leave() }
-
-                    let coordinates = locations.map(\.coordinate)
-                    guard !coordinates.isEmpty else {
+            func processNextWorkout() {
+                guard nextWorkoutIndex < newWorkouts.count else {
+                    group.leave()
+                    return
+                }
+                let workout = newWorkouts[nextWorkoutIndex]
+                nextWorkoutIndex += 1
+                self.routeHealthManager.fetchRouteSamples(for: workout) { samples in
+                    guard !samples.isEmpty else {
                         print("⚠️ Background import skipped workout with no route: \(workout.startDate)")
+                        if Date().timeIntervalSince(workout.endDate) > 24 * 60 * 60 {
+                            self.routeStorage.markWorkoutsChecked([workout.uuid])
+                        }
+                        processNextWorkout()
                         return
                     }
 
-                    let routes = Self.filterRoute(coordinates).compactMap { segment -> Route? in
-                        guard segment.count > 1 else { return nil }
-                        return Route(
-                            coordinates: segment,
-                            date: workout.startDate,
-                            workoutType: workout.workoutActivityType,
-                            durationSec: workout.duration
-                        )
+                    let routes = samples.enumerated().flatMap { sampleIndex, sample in
+                        let coordinates = sample.locations.map(\.coordinate)
+                        return Self.filterRoute(coordinates).enumerated().compactMap { segmentIndex, segment -> Route? in
+                            guard segment.count > 1 else { return nil }
+                            return Route(
+                                coordinates: RouteCoordinateSimplifier.simplified(segment),
+                                date: workout.startDate,
+                                workoutType: workout.workoutActivityType,
+                                durationSec: workout.duration,
+                                sourceWorkoutID: workout.uuid,
+                                sourceRouteID: sample.id,
+                                segmentIndex: sampleIndex * 10_000 + segmentIndex
+                            )
+                        }
                     }
+                    self.routeStorage.markWorkoutsChecked([workout.uuid])
 
                     lock.lock()
                     importedRoutes.append(contentsOf: routes)
                     lock.unlock()
+                    processNextWorkout()
                 }
             }
 
+            let workerCount = min(3, newWorkouts.count)
+            for _ in 0..<workerCount {
+                group.enter()
+                processNextWorkout()
+            }
+
             group.notify(queue: .global(qos: .utility)) {
-                let mergedRoutes = self.deduplicatedRoutes(cachedRoutes + importedRoutes).sorted { $0.date > $1.date }
-                if !importedRoutes.isEmpty {
-                    self.routeStorage.saveRoutes(mergedRoutes)
+                let mergedRoutes = self.routeStorage.mergeRoutes(importedRoutes)
+                let addedRouteCount = max(0, mergedRoutes.count - cachedRoutes.count)
+                if addedRouteCount > 0 {
                     self.routeStorage.setLastSyncDate(Date())
-                    print("✅ HealthKit background import saved \(importedRoutes.count) new routes")
+                    print("✅ HealthKit background import saved \(addedRouteCount) new routes")
                 }
 
                 completion(RunMapBackgroundImportSummary(
-                    addedRouteCount: importedRoutes.count,
+                    addedRouteCount: addedRouteCount,
                     totalRouteCount: mergedRoutes.count,
                     routes: mergedRoutes
                 ))
@@ -233,29 +261,6 @@ final class RunMapHealthKitBackgroundService {
         }
 
         healthStore.execute(query)
-    }
-
-    private func processAchievementsInBackground(routes: [Route]) {
-        guard !routes.isEmpty else { return }
-        let manager = AchievementsManager()
-        manager.checkAndUnlockAchievementsInBackground(routes: routes)
-    }
-
-    private func deduplicatedRoutes(_ routes: [Route]) -> [Route] {
-        var seen = Set<String>()
-        return routes.filter { route in
-            let first = route.coordinates.first
-            let last = route.coordinates.last
-            let key = [
-                String(Int(route.date.timeIntervalSince1970.rounded())),
-                String(route.coordinates.count),
-                String(format: "%.6f", first?.latitude ?? 0),
-                String(format: "%.6f", first?.longitude ?? 0),
-                String(format: "%.6f", last?.latitude ?? 0),
-                String(format: "%.6f", last?.longitude ?? 0)
-            ].joined(separator: "_")
-            return seen.insert(key).inserted
-        }
     }
 
     private static func filterRoute(

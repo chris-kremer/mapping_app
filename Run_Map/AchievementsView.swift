@@ -812,19 +812,40 @@ class AchievementsManager: ObservableObject {
     private let streetCoverageFormatVersion = 2
     private var berlinVisitedFingerprint: String = ""
     private var streetCoverageStateStoreHasProcessedRoutes = false
+    private var lastRequestedAnalysisFingerprint: String?
+    private var hasPreparedForFeatureUse = false
+    private var isPreparingFeatureData = false
+    private var isLoadingStreetGeometry = false
+    private var pendingPreparationRoutes: [Route]?
     
     init() {
         loadAchievements()
-        loadCachedData()
-        
-        // Start loading streets in background
-        BerlinStreets.loadStreetsInBackground {
-            // Streets are now loaded, trigger any pending processing
-            print("✅ Streets loaded, ready for processing")
+    }
+
+    /// Loads the large compatibility caches and Berlin street geometry only after a
+    /// feature that needs them is opened. The home map can therefore reach first paint
+    /// without paying the achievements subsystem's memory and decoding cost.
+    func prepareForFeatureUse(routes: [Route]) {
+        pendingPreparationRoutes = routes
+
+        if hasPreparedForFeatureUse {
+            checkAndUnlockAchievementsInBackground(routes: routes)
+            return
+        }
+        guard !isPreparingFeatureData else { return }
+        isPreparingFeatureData = true
+
+        loadCachedData { [weak self] in
+            guard let self else { return }
+            self.isPreparingFeatureData = false
+            self.hasPreparedForFeatureUse = true
+            let routesToAnalyze = self.pendingPreparationRoutes ?? routes
+            self.pendingPreparationRoutes = nil
+            self.checkAndUnlockAchievementsInBackground(routes: routesToAnalyze)
         }
     }
     
-    private func loadCachedData() {
+    private func loadCachedData(completion: @escaping () -> Void) {
         // Version key for street data format - ONLY increment when you need to clear cache
         let currentVersion = "v16_radius_20m"  // Changed: increased detection radius from 15m to 20m
         let savedVersion = UserDefaults.standard.string(forKey: "berlinStreetsDataVersion") ?? ""
@@ -913,79 +934,98 @@ class AchievementsManager: ObservableObject {
             berlinStadtteileVisitedCached = Set(stadtteile)
         }
         
-        // Load processed routes
-        if let routesData = UserDefaults.standard.data(forKey: "berlinProcessedRoutes"),
-           let routes = try? JSONDecoder().decode([String: RouteCoverageData].self, from: routesData) {
-            processedRoutes = routes
-        }
-        
-        // Load covered segments
-        if let segmentsData = UserDefaults.standard.data(forKey: "berlinCoveredSegments"),
-           let segments = try? JSONDecoder().decode(Set<StreetSegment>.self, from: segmentsData) {
-            streetSegmentsCovered = segments
-        }
-
-        streetCoverageStateStoreHasProcessedRoutes = hasIncrementalStreetCoverageState()
-
-        // Load cached street coverage summaries only when the rebuilt incremental store exists.
-        // This prevents stale UserDefaults summaries from masking an empty file-backed source of truth.
-        if let coverageData = UserDefaults.standard.data(forKey: streetCoverageCacheKey),
-           let cache = try? JSONDecoder().decode(StreetCoverageCache.self, from: coverageData),
-           cache.formatVersion == streetCoverageFormatVersion,
-           streetCoverageStateStoreHasProcessedRoutes {
-            streetCoverageByID = cache.coverageByStreetID
-            districtCoverageStats = cache.districtStats
-            stadtteilCoverageStats = cache.stadtteilStats
-            overallStreetCoverage = cache.overallCoveragePercentage
-            totalBerlinStreets = cache.totalStreetCount
-            processedBerlinStreets = cache.totalStreetCount
-            coveredBerlinStreets = cache.coveredStreetCount
-            fullyCoveredBerlinStreets = cache.fullyCoveredStreetCount
-            coveredBerlinPoints = cache.coveredPoints
-            totalBerlinPoints = cache.totalPoints
-            streetCoverageLastUpdated = cache.generatedAt
-
-            if berlinStadtteileVisitedCached.isEmpty {
-                let visited = cache.stadtteilStats.filter { $0.coveredStreets > 0 }.map { $0.stadtteil }
-                berlinStadtteileVisitedCached = Set(visited)
+        // Legacy compatibility caches can be very large. Read and decode all of them
+        // away from the main actor, then publish one coherent snapshot.
+        let expectedVersion = streetCoverageFormatVersion
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let processedRoutesData = UserDefaults.standard.data(forKey: "berlinProcessedRoutes")
+            let coveredSegmentsData = UserDefaults.standard.data(forKey: "berlinCoveredSegments")
+            let routes = processedRoutesData.flatMap {
+                try? JSONDecoder().decode([String: RouteCoverageData].self, from: $0)
             }
+            let segments = coveredSegmentsData.flatMap {
+                try? JSONDecoder().decode(Set<StreetSegment>.self, from: $0)
+            }
+            let hasIncrementalState = self.hasIncrementalStreetCoverageState()
+            let coverageData = hasIncrementalState
+                ? UserDefaults.standard.data(forKey: self.streetCoverageCacheKey)
+                : nil
+            let coverageCache = coverageData.flatMap {
+                try? JSONDecoder().decode(StreetCoverageCache.self, from: $0)
+            }.flatMap { $0.formatVersion == expectedVersion ? $0 : nil }
+            let hasStaleCoverageCache = UserDefaults.standard.object(forKey: self.streetCoverageCacheKey) != nil
+            let fingerprint = UserDefaults.standard.string(forKey: "berlinVisitedFingerprint") ?? ""
 
-            if UserDefaults.standard.object(forKey: visitedBerlinStreetIDsKey) == nil {
-                let visitedStreetIDs = cache.coverageByStreetID.compactMap { streetID, coverage in
-                    (coverage.coveredPoints > 0 || coverage.percentage > 0) ? streetID : nil
+            DispatchQueue.main.async {
+                if self.processedRoutes.isEmpty, let routes { self.processedRoutes = routes }
+                if self.streetSegmentsCovered.isEmpty, let segments { self.streetSegmentsCovered = segments }
+                self.streetCoverageStateStoreHasProcessedRoutes = hasIncrementalState
+                if let coverageCache {
+                    self.applyCachedStreetCoverage(coverageCache)
+                } else if hasStaleCoverageCache && !hasIncrementalState {
+                    UserDefaults.standard.removeObject(forKey: self.streetCoverageCacheKey)
+                    print("🔄 Ignoring stale legacy street coverage summary; rebuilt coverage state will be generated on next processing pass")
                 }
-                UserDefaults.standard.set(visitedStreetIDs, forKey: visitedBerlinStreetIDsKey)
+                self.berlinVisitedFingerprint = fingerprint
+                completion()
             }
+        }
+    }
 
-            // Initialize fastProcessor if we have cached data but no processor yet
-            if fastProcessor == nil {
-                print("🔧 Initializing fastProcessor from cached data")
-                fastProcessor = FastStreetProcessor()
+    private func applyCachedStreetCoverage(_ cache: StreetCoverageCache) {
+        streetCoverageByID = cache.coverageByStreetID
+        districtCoverageStats = cache.districtStats
+        stadtteilCoverageStats = cache.stadtteilStats
+        overallStreetCoverage = cache.overallCoveragePercentage
+        totalBerlinStreets = cache.totalStreetCount
+        processedBerlinStreets = cache.totalStreetCount
+        coveredBerlinStreets = cache.coveredStreetCount
+        fullyCoveredBerlinStreets = cache.fullyCoveredStreetCount
+        coveredBerlinPoints = cache.coveredPoints
+        totalBerlinPoints = cache.totalPoints
+        streetCoverageLastUpdated = cache.generatedAt
 
-                // Load streets in background to populate consolidated streets
-                Task {
-                    // Load all Berlin districts
-                    let allDistricts = BerlinDistricts.districts.map { $0.name }
-                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                        BerlinStreets.loadDistrictsInBackground(allDistricts) { loadedStreets in
-                            let allStreets = loadedStreets.values.flatMap { $0 }
-                            let consolidated = StreetConsolidator.consolidate(streets: allStreets)
-                            Task { @MainActor in
-                                self.fastProcessor?.consolidatedStreets = consolidated
-                                print("✅ Populated \(consolidated.count) consolidated streets")
-                            }
-                            continuation.resume()
+        if berlinStadtteileVisitedCached.isEmpty {
+            let visited = cache.stadtteilStats.filter { $0.coveredStreets > 0 }.map(\.stadtteil)
+            berlinStadtteileVisitedCached = Set(visited)
+        }
+
+        if UserDefaults.standard.object(forKey: visitedBerlinStreetIDsKey) == nil {
+            let visitedStreetIDs = cache.coverageByStreetID.compactMap { streetID, coverage in
+                (coverage.coveredPoints > 0 || coverage.percentage > 0) ? streetID : nil
+            }
+            UserDefaults.standard.set(visitedStreetIDs, forKey: visitedBerlinStreetIDsKey)
+        }
+
+    }
+
+    private func ensureStreetGeometryLoaded() {
+        guard consolidatedStreets.isEmpty, !isLoadingStreetGeometry else { return }
+        isLoadingStreetGeometry = true
+        let processor = fastProcessor ?? FastStreetProcessor()
+        fastProcessor = processor
+
+        Task {
+            let allDistricts = BerlinDistricts.districts.map(\.name)
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                BerlinStreets.loadDistrictsInBackground(allDistricts) { loadedStreets in
+                    let allStreets = loadedStreets.values.flatMap { $0 }
+                    let consolidated = StreetConsolidator.consolidate(streets: allStreets)
+                    Task { @MainActor in
+                        processor.consolidatedStreets = consolidated
+                        self.consolidatedStreets = consolidated
+                        self.streetsByDistrict = Dictionary(grouping: consolidated, by: \.district)
+                        self.streetsByStadtteil = Dictionary(grouping: consolidated) {
+                            $0.segments.first?.stadtteil ?? "Unknown"
                         }
+                        self.isLoadingStreetGeometry = false
+                        print("✅ Populated \(consolidated.count) consolidated streets")
                     }
+                    continuation.resume()
                 }
             }
-        } else if UserDefaults.standard.object(forKey: streetCoverageCacheKey) != nil && !streetCoverageStateStoreHasProcessedRoutes {
-            UserDefaults.standard.removeObject(forKey: streetCoverageCacheKey)
-            print("🔄 Ignoring stale legacy street coverage summary; rebuilt coverage state will be generated on next processing pass")
         }
-        
-        // Load fingerprints
-        berlinVisitedFingerprint = UserDefaults.standard.string(forKey: "berlinVisitedFingerprint") ?? ""
     }
     
     func saveCachedData() {
@@ -1037,8 +1077,10 @@ class AchievementsManager: ObservableObject {
     private func hasIncrementalStreetCoverageState() -> Bool {
         do {
             let store = try StreetCoverageStateStore.appCache()
-            let state = try store.load()
-            return !state.processedRouteIDs.isEmpty
+            let values = try store.fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            // The processing path validates and decodes the state. Launch only needs a
+            // cheap presence check so a large coverage JSON file never blocks first paint.
+            return values.isRegularFile == true && (values.fileSize ?? 0) > 2
         } catch {
             return false
         }
@@ -1554,6 +1596,15 @@ class AchievementsManager: ObservableObject {
     }
 
     func checkAndUnlockAchievementsInBackground(routes: [Route]) {
+        let requestFingerprint = RunMapRouteAnalysisEngine.fingerprint(
+            routeIDs: routes.map(\.persistenceKey)
+        )
+        guard requestFingerprint != lastRequestedAnalysisFingerprint else {
+            print("ℹ️ Achievement analysis already scheduled for this route library")
+            return
+        }
+        lastRequestedAnalysisFingerprint = requestFingerprint
+
         let previousFingerprint = berlinVisitedFingerprint
         let previousDistricts = berlinDistrictsVisitedCached
         let previousStadtteile = berlinStadtteileVisitedCached
@@ -1654,6 +1705,7 @@ class AchievementsManager: ObservableObject {
                         }
                     }
                     self.saveCachedData()
+                    self.ensureStreetGeometryLoaded()
                 }
             }
 
@@ -3773,8 +3825,7 @@ struct AchievementsView: View {
         }
         .navigationViewStyle(.stack)
         .onAppear {
-            print("🎯 AchievementsView appeared, triggering background achievement check")
-            achievementsManager.checkAndUnlockAchievementsInBackground(routes: routes)
+            achievementsManager.prepareForFeatureUse(routes: routes)
         }
         .alert(isPresented: $achievementsManager.showAchievementAlert) {
             Alert(

@@ -104,8 +104,11 @@ extension AchievementsManager {
             self.streetsByDistrict = byDistrict
             self.streetsByStadtteil = byStadtteil
 
+            let previousStadtteile = self.berlinStadtteileVisitedCached
             let visitedStadtteile = Set(processingResult.stadtteilStats.filter { $0.coveredStreets > 0 }.map { $0.stadtteil })
             self.berlinStadtteileVisitedCached = visitedStadtteile
+            self.newlyVisitedStadtteilNames = visitedStadtteile.subtracting(previousStadtteile).sorted()
+            self.newlyCoveredStreetNames = newlyCoveredStreetNames(from: processingResult)
 
             // Mark all routes as processed
             for route in routes {

@@ -529,23 +529,22 @@ struct StatsView: View {
         geocoded = 0
         heuristicallyClassified = 0
 
-        loading = true
-        computeRouteCharts(from: routesArray)
-        
-        // Safely calculate total km with error handling
-        totalKm = routesArray.compactMap { route in
-            guard route.coordinates.count > 1 else {
-                print("⚠️ Found route with insufficient coordinates: \(route.id) (count: \(route.coordinates.count))")
-                return nil
-            }
-            // Safely access distanceKm with additional protection
-            let distance = route.distanceKm
-            guard distance.isFinite && distance >= 0 else {
-                print("⚠️ Invalid distance calculated for route: \(route.id) (distance: \(distance))")
-                return nil
-            }
-            return distance
-        }.reduce(0, +)
+        let routeFingerprint = RunMapRouteAnalysisEngine.fingerprint(
+            routeIDs: routesArray.map(\.persistenceKey)
+        )
+        let cachedSnapshot: RunMapRouteAnalysisSnapshot?
+        do {
+            cachedSnapshot = try RunMapRouteAnalysisStore.appCache().load()
+        } catch {
+            cachedSnapshot = nil
+        }
+        let usableSnapshot = cachedSnapshot?.routeFingerprint == routeFingerprint ? cachedSnapshot : nil
+        if let usableSnapshot {
+            applyAnalysisSnapshot(usableSnapshot)
+            loading = false
+        } else {
+            loading = true
+        }
 
         // Use fast local geocoding with fallback to network geocoding
         let serialQueue = DispatchQueue(label: "stats.processing", qos: .userInitiated)
@@ -579,6 +578,14 @@ struct StatsView: View {
         
         // Process all routes using fast local geocoding
         serialQueue.async {
+            let analysisSnapshot: RunMapRouteAnalysisSnapshot
+            if let usableSnapshot {
+                analysisSnapshot = usableSnapshot
+            } else {
+                let snapshots = routesArray.map(RunMapRouteSnapshot.init(route:))
+                analysisSnapshot = RunMapRouteAnalysisEngine().makeSnapshot(routes: snapshots)
+                try? RunMapRouteAnalysisStore.appCache().save(analysisSnapshot)
+            }
             let result = self.processAllRoutesWithLocalGeocoding(
                 routes: routesArray, 
                 coordCache: coordCache, 
@@ -586,13 +593,14 @@ struct StatsView: View {
             )
             
             DispatchQueue.main.async {
+                self.applyAnalysisSnapshot(analysisSnapshot)
                 // Save updated caches
                 UserDefaults.standard.set(result.coordCache, forKey: "coordCountryCache")
                 UserDefaults.standard.set(result.cityCache, forKey: "coordCityCache")
                 
                 var countryDict = result.countryDict
                 let knownKm = countryDict.values.reduce(0, +)
-                let unknownKm = self.totalKm - knownKm
+                let unknownKm = analysisSnapshot.totalDistanceKilometers - knownKm
                 if unknownKm > 0 {
                     countryDict["(Unknown)"] = unknownKm
                 }
@@ -610,17 +618,22 @@ struct StatsView: View {
         }
     }
 
-    private func computeRouteCharts(from routes: [Route]) {
-        let validRoutes = routes.filter { route in
-            route.coordinates.count > 1 &&
-            route.distanceKm.isFinite &&
-            route.distanceKm > 0
+    private func applyAnalysisSnapshot(_ snapshot: RunMapRouteAnalysisSnapshot) {
+        totalKm = snapshot.totalDistanceKilometers
+        routeTotal = snapshot.routeCount
+        processedRoutes = snapshot.routeCount
+        computeRouteCharts(from: snapshot)
+    }
+
+    private func computeRouteCharts(from snapshot: RunMapRouteAnalysisSnapshot) {
+        let validRoutes = snapshot.routes.filter { route in
+            route.distanceKilometers.isFinite && route.distanceKilometers > 0
         }
 
         paceBins = makeFrequencyBins(
             values: validRoutes.compactMap { route in
-                guard route.durationSec > 0 else { return nil }
-                return route.durationSec / 60.0 / route.distanceKm
+                guard route.durationSeconds > 0 else { return nil }
+                return route.durationSeconds / 60.0 / route.distanceKilometers
             },
             ranges: [
                 (0, 4, "<4"),
@@ -638,7 +651,7 @@ struct StatsView: View {
         )
 
         distanceBins = makeFrequencyBins(
-            values: validRoutes.map(\.distanceKm),
+            values: validRoutes.map(\.distanceKilometers),
             ranges: [
                 (0, 0.5, "<0.5"),
                 (0.5, 1.0, "0.5-.99"),
@@ -656,12 +669,9 @@ struct StatsView: View {
             ]
         )
 
-        let dailyTotals = Dictionary(grouping: validRoutes) { route in
-            Calendar.current.startOfDay(for: route.date)
-        }
-        .mapValues { routes in
-            routes.map(\.distanceKm).reduce(0, +)
-        }
+        let dailyTotals = Dictionary(uniqueKeysWithValues: snapshot.dailyDistances.map {
+            ($0.day, $0.distanceKilometers)
+        })
 
         dailyDistanceWeeks = makeDailyDistanceWeeks(dailyTotals: dailyTotals)
         maxDailyDistance = dailyDistanceWeeks
