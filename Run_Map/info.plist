@@ -1,7 +1,0 @@
-{
-	"NSLocationAlwaysAndWhenInUseUsageDescription" = "Your location is used to map and save your workout route. Its also shown live on the map. Example: while you record a run, the app stores GPS points so you can review the route on the post-workout map.";
-	CFBundleIdentifier = "com.chris.Run_Map";
-	"CFBundleName\nCFBundleName\nCFBundleName\nCFBundleName" = "Run_Map";
-	"NSHealthUpdateUsageDescription\nNSHealthUpdateUsageDescription\nNSHealthUpdateUsageDescription\nNSHealthUpdateUsageDescription\nNSHealthUpdateUsageDescription\nNSHealthUpdateUsageDescription\nNSHealthUpdateUsageDescription" = "This app reads workout data from HealthKit to show your running, walking, and cycling routes on a map.";
-	"NSHealthShareUsageDescription" = "This app reads workout data from HealthKit to show your running, walking and cycling routes on a map.";
-}
