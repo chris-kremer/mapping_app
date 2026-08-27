@@ -77,7 +77,7 @@ enum MonthlyRecapNotificationScheduler {
     private static func scheduleMonthlyRecapNotification() {
         let content = UNMutableNotificationContent()
         content.title = "Monthly Recap Ready"
-        content.body = "Your Run Map monthly report is ready."
+        content.body = "Your Explore! monthly report is ready."
         content.sound = .default
 
         var components = DateComponents()

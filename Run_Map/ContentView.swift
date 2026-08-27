@@ -1527,6 +1527,55 @@ private struct LaunchSummaryRouteMap: UIViewRepresentable {
     }
 }
 
+private struct RotatingLaunchStatusView: View {
+    private static let updateInterval: TimeInterval = 0.03
+    private static let routeHistoryMessages = [
+        "Loading route history…",
+        "Adding cities…",
+        "Analysing latest…",
+        "Adding runs…",
+        "Calculating pace…",
+        "Loading data…",
+        "Mapping globe…",
+        "Updating achievements…",
+        "Creating goals…",
+        "Fixing bugs…"
+    ]
+    private static let mapMessages = [
+        "Preparing map…",
+        "Mapping globe…",
+        "Adding cities…",
+        "Adding runs…",
+        "Calculating pace…",
+        "Updating achievements…",
+        "Creating goals…",
+        "Loading data…",
+        "Fixing bugs…"
+    ]
+
+    let isLoadingRouteHistory: Bool
+    @State private var phaseStartedAt = Date()
+
+    private var messages: [String] {
+        isLoadingRouteHistory ? Self.routeHistoryMessages : Self.mapMessages
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: phaseStartedAt, by: Self.updateInterval)) { context in
+            let elapsed = max(0, context.date.timeIntervalSince(phaseStartedAt))
+            let index = Int(elapsed / Self.updateInterval) % messages.count
+            Text(messages[index])
+                .fontWeight(.semibold)
+                .frame(width: 205, alignment: .leading)
+        }
+        .onChange(of: isLoadingRouteHistory) { _ in
+            phaseStartedAt = Date()
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(isLoadingRouteHistory ? "Loading route history" : "Preparing map")
+    }
+}
+
 // MARK: - ContentView
 
 struct ContentView: View {
@@ -1651,7 +1700,7 @@ struct ContentView: View {
         case .unavailable:
             return "This Mac build cannot access HealthKit, so macOS will not show a Health permission prompt. Use the iPhone or iPad app to sync workouts, or load demo workouts to explore the app."
         case .denied:
-            return "Health access was not granted. Open Settings, allow Run Map to read workouts and workout routes, then try syncing again."
+            return "Health access was not granted. Open Settings, allow Explore! to read workouts and workout routes, then try syncing again."
         case .authorized, nil:
             return "Connect to Health and record a run or tap below to load a couple of demo workouts to see the app in action."
         }
@@ -1740,8 +1789,7 @@ struct ContentView: View {
                 HStack(spacing: 10) {
                     ProgressView()
                         .tint(.white)
-                    Text(isLoading ? "Loading route history…" : "Preparing map…")
-                        .fontWeight(.semibold)
+                    RotatingLaunchStatusView(isLoadingRouteHistory: isLoading)
                 }
                 .padding()
                 .background(Color.black.opacity(0.68))
@@ -1797,53 +1845,123 @@ struct ContentView: View {
                 Spacer()
                 VStack(spacing: usesRegularWidthLayout ? 16 : 12) {
                     if showControls {
-                        // Highlight button
-                        circleButton(icon: hasMapMarks ? "eraser.fill" : "highlighter")
-                            .onTapGesture {
+                        Menu {
+                            Button {
+                                viewModel.refreshFromHealthKit()
+                            } label: {
+                                Label("Update from Health", systemImage: "arrow.clockwise")
+                            }
+
+                            Menu {
+                                Button {
+                                    prepareRouteExport()
+                                } label: {
+                                    Label("Export Routes", systemImage: "square.and.arrow.up")
+                                }
+
+                                Button {
+                                    showRouteImporter = true
+                                } label: {
+                                    Label("Import Routes", systemImage: "square.and.arrow.down")
+                                }
+                            } label: {
+                                Label("Route Transfer", systemImage: "arrow.left.arrow.right")
+                            }
+                        } label: {
+                            circleButton(icon: "externaldrive.fill")
+                        }
+                        .accessibilityLabel("Data")
+
+                        Menu {
+                            Button {
+                                showStats = true
+                            } label: {
+                                Label("Statistics", systemImage: "chart.bar")
+                            }
+
+                            Button {
+                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+                                MonthlyRecapNotificationScheduler.configure()
+                                showMonthlyRecap = true
+                            } label: {
+                                Label("Monthly Recap", systemImage: "calendar.badge.clock")
+                            }
+
+                            Button {
+                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+                                showAchievementsPage = true
+                            } label: {
+                                Label("Achievements", systemImage: "trophy.fill")
+                            }
+                        } label: {
+                            circleButton(icon: "chart.bar.fill")
+                        }
+                        .accessibilityLabel("Progress")
+
+                        Menu {
+                            Button {
                                 if hasMapMarks {
                                     clearMapMarks()
                                 } else {
                                     markLatestDayRoutes()
                                 }
-                            }
-                            .onLongPressGesture {
-                                clearMapMarks()
-                            }
-
-                        // Update‑from‑HealthKit button
-                        circleButton(icon: "arrow.clockwise")
-                            .onTapGesture {
-                                viewModel.refreshFromHealthKit()
+                            } label: {
+                                Label(
+                                    hasMapMarks ? "Clear Map Marks" : "Highlight Latest Day",
+                                    systemImage: hasMapMarks ? "eraser.fill" : "highlighter"
+                                )
                             }
 
-                        // Export routes for transfer to another device
-                        circleButton(icon: "square.and.arrow.up")
-                            .onTapGesture {
-                                prepareRouteExport()
+                            Button {
+                                mapTypeRawValue = Int(
+                                    (mapType == .standard ? MKMapType.satellite : MKMapType.standard).rawValue
+                                )
+                            } label: {
+                                Label(
+                                    mapType == .standard ? "Use Satellite Map" : "Use Standard Map",
+                                    systemImage: mapType == .standard ? "globe" : "map"
+                                )
                             }
 
-                        // Import routes exported from another device
-                        circleButton(icon: "square.and.arrow.down")
-                            .onTapGesture {
-                                showRouteImporter = true
+                            Button {
+                                showUserLocation.toggle()
+                            } label: {
+                                Label(
+                                    showUserLocation ? "Hide My Location" : "Show My Location",
+                                    systemImage: showUserLocation ? "location.slash" : "location"
+                                )
                             }
 
-                        // Re‑center to current location
+                            Divider()
+
+                            Button {
+                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+                                showRoutePlanner = true
+                            } label: {
+                                Label(
+                                    "Route Planner",
+                                    systemImage: "point.topleft.down.curvedto.point.bottomright.up.fill"
+                                )
+                            }
+                        } label: {
+                            circleButton(icon: "map.fill")
+                        }
+                        .accessibilityLabel("Map tools")
+
+                        // Keep the most common map action available with one tap.
                         circleButton(icon: "location.fill")
                             .onTapGesture {
-                                // Short press: always go to current location
                                 print("🎯 Location button tapped")
                                 if let loc = locationManager.currentLocation {
                                     print("📍 Current location found: \(loc.coordinate)")
-                                    
-                                    // Add a tiny random offset to ensure the region always changes
-                                    // This forces the map to update even if clicking the same location repeatedly
+
+                                    // Force a region update even when the same location is selected repeatedly.
                                     let randomOffset = Double.random(in: -0.0001...0.0001)
                                     let adjustedCenter = CLLocationCoordinate2D(
                                         latitude: loc.coordinate.latitude + randomOffset,
                                         longitude: loc.coordinate.longitude + randomOffset
                                     )
-                                    
+
                                     let newRegion = MKCoordinateRegion(
                                         center: adjustedCenter,
                                         span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01))
@@ -1855,55 +1973,16 @@ struct ContentView: View {
                                     print("⚠️ No current location available - check location permissions in Settings")
                                 }
                             }
-                            .onLongPressGesture {
-                                // Long press: toggle user location dot
-                                showUserLocation.toggle()
-                            }
-
-                        // Map style toggle button
-                        circleButton(icon: mapType == .standard ? "globe" : "map")
-                            .onTapGesture {
-                                mapTypeRawValue = Int(
-                                    (mapType == .standard ? MKMapType.satellite : MKMapType.standard).rawValue
-                                )
-                            }
-
-                        // Route planner button
-                        circleButton(icon: "point.topleft.down.curvedto.point.bottomright.up.fill")
-                            .onTapGesture {
-                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
-                                showRoutePlanner = true
-                            }
-
-                        // Stats button
-                        circleButton(icon: "chart.bar")
-                            .onTapGesture {
-                                showStats = true
-                            }
-
-                        // Monthly recap button
-                        circleButton(icon: "calendar.badge.clock")
-                            .onTapGesture {
-                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
-                                MonthlyRecapNotificationScheduler.configure()
-                                showMonthlyRecap = true
-                            }
-
-                        // Achievements button
-                        circleButton(icon: "trophy.fill")
-                            .onTapGesture {
-                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
-                                showAchievementsPage = true
-                            }
+                            .accessibilityLabel("Center on my location")
 
                     }
 
                     // Main FAB that toggles the stack
                     circleButton(icon: showControls ? "xmark" : "plus")
-                        .rotationEffect(.degrees(showControls ? 45 : 0))
                         .onTapGesture {
                             withAnimation { showControls.toggle() }
                         }
+                        .accessibilityLabel(showControls ? "Close controls" : "Open controls")
                 }
                 .padding(usesRegularWidthLayout ? 24 : 16)
                 .frame(maxWidth: .infinity, alignment: .trailing)
@@ -1998,7 +2077,7 @@ struct ContentView: View {
             isPresented: $showRouteExporter,
             document: routeExportDocument,
             contentType: .json,
-            defaultFilename: "Run_Map_routes"
+            defaultFilename: "Explore_routes"
         ) { result in
             switch result {
             case .success:
