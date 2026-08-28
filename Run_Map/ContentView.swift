@@ -1528,7 +1528,7 @@ private struct LaunchSummaryRouteMap: UIViewRepresentable {
 }
 
 private struct RotatingLaunchStatusView: View {
-    private static let updateInterval: TimeInterval = 0.03
+    private static let updateInterval: TimeInterval = 0.3
     private static let routeHistoryMessages = [
         "Loading route history…",
         "Adding cities…",
