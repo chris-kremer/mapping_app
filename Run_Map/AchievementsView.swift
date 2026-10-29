@@ -1301,7 +1301,7 @@ class AchievementsManager: ObservableObject {
         ]
     }
     
-    private struct AchievementSaveData: Codable {
+    struct AchievementSaveData: Codable {
         let tier: String
         let date: Date
     }
@@ -1322,6 +1322,11 @@ class AchievementsManager: ObservableObject {
         }
         
         achievements = allAchievements
+    }
+
+    func reloadTransferredProgress(routes: [Route]) {
+        loadAchievements()
+        prepareForFeatureUse(routes: routes)
     }
     
     func updateAchievementTier(id: String, tier: AchievementTier, currentProgress: Double, nextGoal: Double, extraContext: String? = nil) {

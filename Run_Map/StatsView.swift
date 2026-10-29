@@ -26,6 +26,10 @@ struct StatsView: View {
         horizontalSizeClass == .regular ? 760 : .infinity
     }
 
+    private var routeRevision: String {
+        routes.map { "\($0.id):\($0.coordinates.count):\($0.durationSec)" }.joined(separator: "|")
+    }
+
     var body: some View {
         NavigationView {
             ScrollView {
@@ -40,7 +44,7 @@ struct StatsView: View {
         }
         .navigationViewStyle(.stack)
         .onAppear(perform: computeStats)
-        .onChange(of: routes.count) { _ in
+        .onChange(of: routeRevision) { _ in
             computeStats()
         }
     }

@@ -198,7 +198,7 @@ struct PersistedRoute: Codable {
         }
         return Route(
             id: id,
-            coordinates: RouteCoordinateSimplifier.simplified(coords),
+            coordinates: coords,
             date: date,
             workoutType: HKWorkoutActivityType(rawValue: workoutType) ?? .other,
             durationSec: durationSec,
@@ -224,10 +224,22 @@ final class RouteStorage {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let directoryURL: URL
+    private let legacyFileURL: URL?
     private var primaryNeedsRecovery = false
 
     init(directoryURL: URL? = nil) {
-        self.directoryURL = directoryURL ?? fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        if let directoryURL {
+            self.directoryURL = directoryURL
+            legacyFileURL = nil
+        } else if RunMapRuntime.isMac {
+            self.directoryURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("com.chris.RunMap", isDirectory: true)
+            legacyFileURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("cached_routes.json")
+        } else {
+            self.directoryURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            legacyFileURL = nil
+        }
     }
     
     private var fileURL: URL {
@@ -259,6 +271,19 @@ final class RouteStorage {
     }
 
     private func saveRoutesUnlocked(_ routes: [Route]) {
+        do { try writeRoutesUnlocked(routes) }
+        catch { print("Route archive write failed: \(error.localizedDescription)") }
+    }
+
+    func mergeSyncedRoutes(_ routes: [Route]) throws -> [Route] {
+        try Self.ioQueue.sync {
+            let merged = deduplicatedRoutes(loadRoutesUnlocked(logResult: false) + routes).sorted { $0.date > $1.date }
+            try writeRoutesUnlocked(merged)
+            return merged
+        }
+    }
+
+    private func writeRoutesUnlocked(_ routes: [Route]) throws {
         let tempURL = fileURL.appendingPathExtension("tmp")
         do {
             try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
@@ -283,11 +308,22 @@ final class RouteStorage {
             } else {
                 try fileManager.moveItem(at: tempURL, to: fileURL)
             }
+            var resourceValues = URLResourceValues()
+            resourceValues.isExcludedFromBackup = true
+            var archiveURL = fileURL
+            try archiveURL.setResourceValues(resourceValues)
+            if fileManager.fileExists(atPath: backupURL.path) {
+                var archiveBackupURL = backupURL
+                try archiveBackupURL.setResourceValues(resourceValues)
+            }
             primaryNeedsRecovery = false
             print("✅ Saved \(routes.count) routes to cache")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .runMapRouteArchiveDidChange, object: nil)
+            }
         } catch {
             try? fileManager.removeItem(at: tempURL)
-            print("❌ Failed to save routes: \(error.localizedDescription)")
+            throw error
         }
     }
 
@@ -304,7 +340,27 @@ final class RouteStorage {
         Self.ioQueue.sync { loadRoutesUnlocked(logResult: true) }
     }
 
+    func archiveRevision() -> String {
+        Self.ioQueue.sync {
+            guard let attributes = try? fileManager.attributesOfItem(atPath: fileURL.path) else { return "empty" }
+            let date = (attributes[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate ?? 0
+            let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+            return "\(date):\(size)"
+        }
+    }
+
     private func loadRoutesUnlocked(logResult: Bool) -> [Route] {
+        if !fileManager.fileExists(atPath: fileURL.path),
+           !fileManager.fileExists(atPath: backupURL.path),
+           let legacyFileURL, fileManager.fileExists(atPath: legacyFileURL.path) {
+            do {
+                let routes = validRoutes(from: try decodePersistedRoutes(from: Data(contentsOf: legacyFileURL)))
+                try writeRoutesUnlocked(routes)
+                return routes
+            } catch {
+                print("Earlier Mac route archive could not be migrated: \(error.localizedDescription)")
+            }
+        }
         for candidateURL in [fileURL, backupURL] where fileManager.fileExists(atPath: candidateURL.path) {
             do {
                 let routes = try RunMapPerformanceMetrics.measure("route_cache_decode") {
@@ -334,6 +390,10 @@ final class RouteStorage {
     }
 
     func importRoutes(from url: URL) throws -> [Route] {
+        try importExperience(from: url).routes
+    }
+
+    func importExperience(from url: URL) throws -> RunMapImportedExperience {
         let shouldStopAccessing = url.startAccessingSecurityScopedResource()
         defer {
             if shouldStopAccessing {
@@ -342,8 +402,15 @@ final class RouteStorage {
         }
 
         let data = try Data(contentsOf: url)
+        if let object = try? JSONSerialization.jsonObject(with: data),
+           let dictionary = object as? [String: Any],
+           dictionary["format"] != nil {
+            let backup = try JSONDecoder().decode(RunMapExperienceBackup.self, from: data)
+            try backup.validate()
+            return RunMapImportedExperience(routes: backup.routes.map { $0.toRoute() }, backup: backup)
+        }
         let persistedRoutes = try decodePersistedRoutes(from: data)
-        return validRoutes(from: persistedRoutes)
+        return RunMapImportedExperience(routes: validRoutes(from: persistedRoutes), backup: nil)
     }
 
     private func decodePersistedRoutes(from data: Data) throws -> [PersistedRoute] {
@@ -1583,6 +1650,9 @@ struct ContentView: View {
     @StateObject private var locationManager = LocationManager()
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
+    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var deviceSync = RunMapDeviceSync.shared
+
     @AppStorage("hasSeenTutorial") private var hasSeenTutorial = false
     @AppStorage("mapType") private var mapTypeRawValue: Int = Int(MKMapType.standard.rawValue)
 
@@ -1611,7 +1681,9 @@ struct ContentView: View {
     @State private var showMonthlyRecap = false
     @State private var showRouteExporter = false
     @State private var showRouteImporter = false
+    @State private var showDeviceSync = false
     @State private var routeExportDocument = RunMapRoutesDocument()
+    @State private var routeExportFilename = "Explore_routes"
     @State private var routeTransferMessage: String?
     @StateObject private var achievementsManager = AchievementsManager()
     @State private var showUpdatedMessage = false
@@ -1634,8 +1706,12 @@ struct ContentView: View {
     @State private var pendingLaunchSummary: PendingLaunchSummary?
     @State private var hasShownSummary = false
 
+    private var isMacExperience: Bool {
+        RunMapRuntime.isMac
+    }
+
     private var usesRegularWidthLayout: Bool {
-        horizontalSizeClass == .regular
+        isMacExperience || horizontalSizeClass == .regular
     }
 
     private var mapControlSize: CGFloat {
@@ -1698,12 +1774,116 @@ struct ContentView: View {
     private var noWorkoutsMessage: String {
         switch viewModel.healthKitAccess {
         case .unavailable:
-            return "This Mac build cannot access HealthKit, so macOS will not show a Health permission prompt. Use the iPhone or iPad app to sync workouts, or load demo workouts to explore the app."
+            return "Health data is unavailable on this device. Workouts can be received from a paired device or imported from a backup."
         case .denied:
             return "Health access was not granted. Open Settings, allow Explore! to read workouts and workout routes, then try syncing again."
         case .authorized, nil:
             return "Connect to Health and record a run or tap below to load a couple of demo workouts to see the app in action."
         }
+    }
+
+    private var macToolbar: some View {
+        HStack(spacing: 16) {
+            Picker("Workouts", selection: $viewModel.selectedFilter) {
+                ForEach(RunViewModel.WorkoutFilter.allCases) { filter in
+                    Text(filter.rawValue).tag(filter)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 240)
+
+            Spacer(minLength: 8)
+
+            Button {
+                showStats = true
+            } label: {
+                Image(systemName: "chart.bar")
+            }
+            .help("Statistics")
+            .accessibilityLabel("Statistics")
+
+            Button {
+                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+                showAchievementsPage = true
+            } label: {
+                Image(systemName: "trophy")
+            }
+            .help("Achievements and street coverage")
+            .accessibilityLabel("Achievements and street coverage")
+
+            Button {
+                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+                MonthlyRecapNotificationScheduler.configure()
+                showMonthlyRecap = true
+            } label: {
+                Image(systemName: "calendar.badge.clock")
+            }
+            .help("Monthly recap and goals")
+            .accessibilityLabel("Monthly recap and goals")
+
+            Button {
+                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+                showRoutePlanner = true
+            } label: {
+                Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+            }
+            .help("Route planner and saved plans")
+            .accessibilityLabel("Route planner and saved plans")
+
+            Menu {
+                Button {
+                    if hasMapMarks { clearMapMarks() } else { markLatestDayRoutes() }
+                } label: {
+                    Label(hasMapMarks ? "Clear Map Marks" : "Highlight Latest Day",
+                          systemImage: hasMapMarks ? "eraser" : "highlighter")
+                }
+                Button {
+                    mapTypeRawValue = Int((mapType == .standard ? MKMapType.satellite : .standard).rawValue)
+                } label: {
+                    Label(mapType == .standard ? "Satellite Map" : "Standard Map",
+                          systemImage: mapType == .standard ? "globe" : "map")
+                }
+                Toggle("Show My Location", isOn: $showUserLocation)
+            } label: {
+                Label("Map", systemImage: "map")
+            }
+
+            Menu {
+                Button {
+                    showRouteImporter = true
+                } label: {
+                    Label("Import iPhone Routes", systemImage: "square.and.arrow.down")
+                }
+                Button {
+                    prepareRouteExport()
+                } label: {
+                    Label("Export Routes", systemImage: "square.and.arrow.up")
+                }
+                .disabled(viewModel.routes.isEmpty)
+                Divider()
+                Button {
+                    prepareExperienceExport()
+                } label: {
+                    Label("Export Full Backup", systemImage: "externaldrive.badge.plus")
+                }
+            } label: {
+                Label("Data", systemImage: "externaldrive")
+            }
+
+            Button {
+                showDeviceSync = true
+            } label: {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .foregroundStyle(deviceSync.isConnected ? Color.green : Color.primary)
+            }
+            .help("Device Sync: \(deviceSync.status)")
+            .accessibilityLabel("Device Sync")
+        }
+        .buttonStyle(.borderless)
+        .font(.body)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.regularMaterial)
     }
 
     var body: some View {
@@ -1841,161 +2021,211 @@ struct ContentView: View {
                     .transition(.opacity)
             }
             
-            VStack {
-                Spacer()
-                VStack(spacing: usesRegularWidthLayout ? 16 : 12) {
-                    if showControls {
-                        Menu {
-                            Button {
-                                viewModel.refreshFromHealthKit()
+            if !isMacExperience {
+                VStack {
+                    Spacer()
+                    VStack(spacing: usesRegularWidthLayout ? 16 : 12) {
+                        if showControls {
+                            Menu {
+                                Button {
+                                    showDeviceSync = true
+                                } label: {
+                                    Label("Device Sync", systemImage: "arrow.triangle.2.circlepath")
+                                }
+
+                                Button {
+                                    viewModel.refreshFromHealthKit()
+                                } label: {
+                                    Label("Update from Health", systemImage: "arrow.clockwise")
+                                }
+
+                                Menu {
+                                    Button {
+                                        prepareExperienceExport()
+                                    } label: {
+                                        Label("Export Full Backup", systemImage: "externaldrive.badge.plus")
+                                    }
+
+                                    Button {
+                                        prepareRouteExport()
+                                    } label: {
+                                        Label("Export Routes", systemImage: "square.and.arrow.up")
+                                    }
+
+                                    Button {
+                                        showRouteImporter = true
+                                    } label: {
+                                        Label("Import Routes or Backup", systemImage: "square.and.arrow.down")
+                                    }
+                                } label: {
+                                    Label("Route Transfer", systemImage: "arrow.left.arrow.right")
+                                }
                             } label: {
-                                Label("Update from Health", systemImage: "arrow.clockwise")
+                                circleButton(icon: "externaldrive.fill")
                             }
+                            .accessibilityLabel("Data")
 
                             Menu {
                                 Button {
-                                    prepareRouteExport()
+                                    showStats = true
                                 } label: {
-                                    Label("Export Routes", systemImage: "square.and.arrow.up")
+                                    Label("Statistics", systemImage: "chart.bar")
                                 }
 
                                 Button {
-                                    showRouteImporter = true
+                                    achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+                                    MonthlyRecapNotificationScheduler.configure()
+                                    showMonthlyRecap = true
                                 } label: {
-                                    Label("Import Routes", systemImage: "square.and.arrow.down")
+                                    Label("Monthly Recap", systemImage: "calendar.badge.clock")
+                                }
+
+                                Button {
+                                    achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+                                    showAchievementsPage = true
+                                } label: {
+                                    Label("Achievements", systemImage: "trophy.fill")
                                 }
                             } label: {
-                                Label("Route Transfer", systemImage: "arrow.left.arrow.right")
+                                circleButton(icon: "chart.bar.fill")
                             }
-                        } label: {
-                            circleButton(icon: "externaldrive.fill")
-                        }
-                        .accessibilityLabel("Data")
+                            .accessibilityLabel("Progress")
 
-                        Menu {
-                            Button {
-                                showStats = true
-                            } label: {
-                                Label("Statistics", systemImage: "chart.bar")
-                            }
-
-                            Button {
-                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
-                                MonthlyRecapNotificationScheduler.configure()
-                                showMonthlyRecap = true
-                            } label: {
-                                Label("Monthly Recap", systemImage: "calendar.badge.clock")
-                            }
-
-                            Button {
-                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
-                                showAchievementsPage = true
-                            } label: {
-                                Label("Achievements", systemImage: "trophy.fill")
-                            }
-                        } label: {
-                            circleButton(icon: "chart.bar.fill")
-                        }
-                        .accessibilityLabel("Progress")
-
-                        Menu {
-                            Button {
-                                if hasMapMarks {
-                                    clearMapMarks()
-                                } else {
-                                    markLatestDayRoutes()
-                                }
-                            } label: {
-                                Label(
-                                    hasMapMarks ? "Clear Map Marks" : "Highlight Latest Day",
-                                    systemImage: hasMapMarks ? "eraser.fill" : "highlighter"
-                                )
-                            }
-
-                            Button {
-                                mapTypeRawValue = Int(
-                                    (mapType == .standard ? MKMapType.satellite : MKMapType.standard).rawValue
-                                )
-                            } label: {
-                                Label(
-                                    mapType == .standard ? "Use Satellite Map" : "Use Standard Map",
-                                    systemImage: mapType == .standard ? "globe" : "map"
-                                )
-                            }
-
-                            Button {
-                                showUserLocation.toggle()
-                            } label: {
-                                Label(
-                                    showUserLocation ? "Hide My Location" : "Show My Location",
-                                    systemImage: showUserLocation ? "location.slash" : "location"
-                                )
-                            }
-
-                            Divider()
-
-                            Button {
-                                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
-                                showRoutePlanner = true
-                            } label: {
-                                Label(
-                                    "Route Planner",
-                                    systemImage: "point.topleft.down.curvedto.point.bottomright.up.fill"
-                                )
-                            }
-                        } label: {
-                            circleButton(icon: "map.fill")
-                        }
-                        .accessibilityLabel("Map tools")
-
-                        // Keep the most common map action available with one tap.
-                        circleButton(icon: "location.fill")
-                            .onTapGesture {
-                                print("🎯 Location button tapped")
-                                if let loc = locationManager.currentLocation {
-                                    print("📍 Current location found: \(loc.coordinate)")
-
-                                    // Force a region update even when the same location is selected repeatedly.
-                                    let randomOffset = Double.random(in: -0.0001...0.0001)
-                                    let adjustedCenter = CLLocationCoordinate2D(
-                                        latitude: loc.coordinate.latitude + randomOffset,
-                                        longitude: loc.coordinate.longitude + randomOffset
-                                    )
-
-                                    let newRegion = MKCoordinateRegion(
-                                        center: adjustedCenter,
-                                        span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01))
-                                    print("🎯 Setting region to: \(newRegion)")
-                                    withAnimation(.easeInOut(duration: 1.0)) {
-                                        region = newRegion
+                            Menu {
+                                Button {
+                                    if hasMapMarks {
+                                        clearMapMarks()
+                                    } else {
+                                        markLatestDayRoutes()
                                     }
-                                } else {
-                                    print("⚠️ No current location available - check location permissions in Settings")
+                                } label: {
+                                    Label(
+                                        hasMapMarks ? "Clear Map Marks" : "Highlight Latest Day",
+                                        systemImage: hasMapMarks ? "eraser.fill" : "highlighter"
+                                    )
                                 }
+
+                                Button {
+                                    mapTypeRawValue = Int(
+                                        (mapType == .standard ? MKMapType.satellite : MKMapType.standard).rawValue
+                                    )
+                                } label: {
+                                    Label(
+                                        mapType == .standard ? "Use Satellite Map" : "Use Standard Map",
+                                        systemImage: mapType == .standard ? "globe" : "map"
+                                    )
+                                }
+
+                                Button {
+                                    showUserLocation.toggle()
+                                } label: {
+                                    Label(
+                                        showUserLocation ? "Hide My Location" : "Show My Location",
+                                        systemImage: showUserLocation ? "location.slash" : "location"
+                                    )
+                                }
+
+                                Divider()
+
+                                Button {
+                                    achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+                                    showRoutePlanner = true
+                                } label: {
+                                    Label(
+                                        "Route Planner",
+                                        systemImage: "point.topleft.down.curvedto.point.bottomright.up.fill"
+                                    )
+                                }
+                            } label: {
+                                circleButton(icon: "map.fill")
                             }
-                            .accessibilityLabel("Center on my location")
+                            .accessibilityLabel("Map tools")
 
-                    }
+                            // Keep the most common map action available with one tap.
+                            circleButton(icon: "location.fill")
+                                .onTapGesture {
+                                    print("🎯 Location button tapped")
+                                    if let loc = locationManager.currentLocation {
+                                        print("📍 Current location found: \(loc.coordinate)")
 
-                    // Main FAB that toggles the stack
-                    circleButton(icon: showControls ? "xmark" : "plus")
-                        .onTapGesture {
-                            withAnimation { showControls.toggle() }
+                                        // Force a region update even when the same location is selected repeatedly.
+                                        let randomOffset = Double.random(in: -0.0001...0.0001)
+                                        let adjustedCenter = CLLocationCoordinate2D(
+                                            latitude: loc.coordinate.latitude + randomOffset,
+                                            longitude: loc.coordinate.longitude + randomOffset
+                                        )
+
+                                        let newRegion = MKCoordinateRegion(
+                                            center: adjustedCenter,
+                                            span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01))
+                                        print("🎯 Setting region to: \(newRegion)")
+                                        withAnimation(.easeInOut(duration: 1.0)) {
+                                            region = newRegion
+                                        }
+                                    } else {
+                                        print("⚠️ No current location available - check location permissions in Settings")
+                                    }
+                                }
+                                .accessibilityLabel("Center on my location")
+
                         }
-                        .accessibilityLabel(showControls ? "Close controls" : "Open controls")
+
+                        // Main FAB that toggles the stack
+                        circleButton(icon: showControls ? "xmark" : "plus")
+                            .onTapGesture {
+                                withAnimation { showControls.toggle() }
+                            }
+                            .accessibilityLabel(showControls ? "Close controls" : "Open controls")
+                    }
+                    .padding(usesRegularWidthLayout ? 24 : 16)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                 }
-                .padding(usesRegularWidthLayout ? 24 : 16)
-                .frame(maxWidth: .infinity, alignment: .trailing)
             }
         }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if isMacExperience {
+                macToolbar
+            }
+        }
+        .overlay(alignment: .bottomLeading) {
+            if isMacExperience && viewModel.hasLoadedRouteCache && viewModel.routes.isEmpty && !isLoading {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("No workouts on this Mac")
+                        .font(.headline)
+                    Button {
+                        showDeviceSync = true
+                    } label: {
+                        Label("Pair iPhone", systemImage: "iphone")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button {
+                        showRouteImporter = true
+                    } label: {
+                        Label("Import iPhone Routes", systemImage: "square.and.arrow.down")
+                    }
+                }
+                .padding(16)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                .padding(20)
+            }
+        }
+        .frame(minWidth: isMacExperience ? 760 : nil, minHeight: isMacExperience ? 520 : nil)
         .onAppear {
             guard !didStartLaunch else { return }
             didStartLaunch = true
+            if isMacExperience { hasSeenTutorial = true }
             isLoading = true
             viewModel.loadRuns(fetchHealthKit: false)
         }
         .onReceive(NotificationCenter.default.publisher(for: .runMapHealthKitBackgroundImportDidFinish)) { _ in
             viewModel.reloadRoutesFromCache {
+                showUpdatedToast()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .runMapDeviceSyncDidImport)) { _ in
+            viewModel.reloadRoutesFromCache {
+                showNoWorkouts = false
+                achievementsManager.reloadTransferredProgress(routes: viewModel.routes)
                 showUpdatedToast()
             }
         }
@@ -2013,12 +2243,13 @@ struct ContentView: View {
                 shouldMountMap = true
             }
             showNoWorkouts = false
+            deviceSync.startIfEnabled()
             beginDeferredServicesIfReady()
         }
         .onReceive(viewModel.$loadProgress) { progress in
             if progress >= 1 {
                 // After all HealthKit queries finish decide whether to show the empty state
-                showNoWorkouts = viewModel.routes.isEmpty
+                showNoWorkouts = viewModel.routes.isEmpty && !isMacExperience
                 if !hasShownSummary {
                     let newRuns = max(0, viewModel.routes.count - lastRunCount)
                     let newlyAddedRoutes = Array(viewModel.routes.sorted { $0.date > $1.date }.prefix(newRuns))
@@ -2048,6 +2279,11 @@ struct ContentView: View {
                 beginDeferredServicesIfReady()
             }
         }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active && viewModel.hasLoadedRouteCache { deviceSync.sceneBecameActive() }
+            else if phase == .background { deviceSync.sceneEnteredBackground() }
+        }
+        .onChange(of: mapTypeRawValue) { _ in deviceSync.preferencesDidChange() }
         .onReceive(achievementsManager.$newlyCoveredStreetNames) { _ in
             presentPendingLaunchSummary()
         }
@@ -2058,7 +2294,7 @@ struct ContentView: View {
         }
     // end ZStack
         .fullScreenCover(isPresented: Binding(
-            get: { !hasSeenTutorial },
+            get: { !hasSeenTutorial && !isMacExperience },
             set: { _ in })) {
             OnboardingView {
                 hasSeenTutorial = true
@@ -2067,7 +2303,15 @@ struct ContentView: View {
         .fullScreenCover(isPresented: $showNoWorkouts) {
             NoWorkoutsView(
                 title: noWorkoutsTitle,
-                message: noWorkoutsMessage
+                message: noWorkoutsMessage,
+                importWorkouts: {
+                    showNoWorkouts = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { showRouteImporter = true }
+                },
+                connectDevice: {
+                    showNoWorkouts = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { showDeviceSync = true }
+                }
             ) {
                 loadDemoWorkouts()
                 showNoWorkouts = false
@@ -2077,11 +2321,11 @@ struct ContentView: View {
             isPresented: $showRouteExporter,
             document: routeExportDocument,
             contentType: .json,
-            defaultFilename: "Explore_routes"
+            defaultFilename: routeExportFilename
         ) { result in
             switch result {
             case .success:
-                showRouteTransferMessage("Routes exported")
+                showRouteTransferMessage("Export complete")
             case .failure(let error):
                 showRouteTransferMessage("Export failed: \(error.localizedDescription)")
             }
@@ -2097,6 +2341,9 @@ struct ContentView: View {
                 navigateToLocation(country: country, city: city)
             }
             .presentationDetents([.large])
+        }
+        .sheet(isPresented: $showDeviceSync) {
+            RunMapDeviceSyncView()
         }
         .sheet(isPresented: $showRoutePlanner) {
             RoutePlannerView(
@@ -2216,6 +2463,18 @@ struct ContentView: View {
             routeExportDocument = RunMapRoutesDocument(
                 data: try viewModel.routeStorage.exportData(for: viewModel.routes)
             )
+            routeExportFilename = "Explore_routes"
+            showRouteExporter = true
+        } catch {
+            showRouteTransferMessage("Export failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func prepareExperienceExport() {
+        do {
+            let backup = try RunMapExperienceBackup(routes: viewModel.routes)
+            routeExportDocument = RunMapRoutesDocument(data: try JSONEncoder().encode(backup))
+            routeExportFilename = "Explore_backup"
             showRouteExporter = true
         } catch {
             showRouteTransferMessage("Export failed: \(error.localizedDescription)")
@@ -2226,16 +2485,20 @@ struct ContentView: View {
         switch result {
         case .success(let url):
             do {
-                let importedRoutes = try viewModel.routeStorage.importRoutes(from: url)
-                guard !importedRoutes.isEmpty else {
+                let imported = try viewModel.routeStorage.importExperience(from: url)
+                let importedRoutes = imported.routes
+                guard !importedRoutes.isEmpty || imported.backup != nil else {
                     showRouteTransferMessage("No routes found in file")
                     return
                 }
 
+                try imported.backup?.restorePreferences()
                 viewModel.importRoutes(importedRoutes)
                 showNoWorkouts = false
-                showRouteTransferMessage("Imported \(importedRoutes.count) routes")
-                achievementsManager.prepareForFeatureUse(routes: viewModel.routes)
+                showRouteTransferMessage(imported.backup == nil
+                    ? "Imported \(importedRoutes.count) routes"
+                    : "Backup restored: \(importedRoutes.count) routes")
+                achievementsManager.reloadTransferredProgress(routes: viewModel.routes)
             } catch {
                 showRouteTransferMessage("Import failed: \(error.localizedDescription)")
             }
@@ -3007,6 +3270,8 @@ struct OnboardingView: View {
 struct NoWorkoutsView: View {
     var title: String = "No workouts found"
     var message: String = "Connect to Health and record a run or tap below to load a couple of demo workouts to see the app in action."
+    var importWorkouts: (() -> Void)? = nil
+    var connectDevice: (() -> Void)? = nil
     var loadDemoAndDismiss: () -> Void
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -3026,6 +3291,18 @@ struct NoWorkoutsView: View {
             Text(message)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
+
+            if let connectDevice {
+                Button(action: connectDevice) {
+                    Label("Device Sync", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            if let importWorkouts {
+                Button(action: importWorkouts) {
+                    Label("Import Routes or Backup", systemImage: "square.and.arrow.down")
+                }
+            }
 
             Button("Load Demo Workouts") {
                 loadDemoAndDismiss()

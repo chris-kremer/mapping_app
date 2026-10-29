@@ -162,6 +162,24 @@ struct RoutePlannerView: View {
         .onChange(of: waypointSignature) { _ in
             recalculateStats()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .runMapDeviceSyncDidImport)) { _ in
+            savedPlans = SavedRoutePlanStore.load()
+            simulatedPlanIDs.formIntersection(Set(savedPlans.map(\.id)))
+            switch plannerMode {
+            case .viewing(let id):
+                if let plan = savedPlans.first(where: { $0.id == id }) {
+                    waypoints = plan.coordinates
+                    planTitle = plan.title
+                    focusRequestID = UUID()
+                } else { startNewPlan() }
+            case .editing(let id):
+                if !savedPlans.contains(where: { $0.id == id }) { plannerMode = .new }
+            case .new: break
+            }
+            recalculateStats()
+            recalculateSavedPlanPreviews()
+            recalculateSimulationStats()
+        }
         .onChange(of: plannerDataSignature) { _ in
             recalculateStats()
             recalculateSavedPlanPreviews()
@@ -1752,7 +1770,7 @@ private enum RoutePlannerStreetData {
     }
 }
 
-private struct SavedRoutePlan: Identifiable, Codable {
+struct SavedRoutePlan: Identifiable, Codable {
     let id: UUID
     let title: String
     let createdAt: Date
@@ -1770,7 +1788,7 @@ private struct SavedRoutePlan: Identifiable, Codable {
     }
 }
 
-private struct SavedRoutePlanPoint: Codable {
+struct SavedRoutePlanPoint: Codable {
     let latitude: Double
     let longitude: Double
 }
@@ -1790,6 +1808,7 @@ private enum SavedRoutePlanStore {
         let sortedPlans = plans.sorted { $0.createdAt > $1.createdAt }
         guard let data = try? JSONEncoder().encode(sortedPlans) else { return }
         UserDefaults.standard.set(data, forKey: key)
+        _ = try? RunMapSyncedPreferences.capture(defaults: .standard)
     }
 }
 

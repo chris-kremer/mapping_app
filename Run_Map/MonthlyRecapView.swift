@@ -27,6 +27,7 @@ enum MonthlyGoalStore {
     static func save(_ goals: MonthlyGoals) {
         guard let data = try? JSONEncoder().encode(goals) else { return }
         UserDefaults.standard.set(data, forKey: key)
+        _ = try? RunMapSyncedPreferences.capture(defaults: .standard)
     }
 }
 
@@ -337,6 +338,11 @@ struct MonthlyRecapView: View {
     @State private var isGeneratingReport = false
     @State private var didSaveGoals = false
     @State private var skeletonPulse = false
+    @State private var reportGeneration = 0
+
+    private var syncedRouteRevision: String {
+        routes.map { "\($0.id):\($0.coordinates.count):\($0.durationSec)" }.joined(separator: "|")
+    }
 
     var body: some View {
         NavigationView {
@@ -363,6 +369,8 @@ struct MonthlyRecapView: View {
             .onChange(of: draftDistance) { _ in didSaveGoals = false }
             .onChange(of: draftStreets) { _ in didSaveGoals = false }
             .onChange(of: draftDistricts) { _ in didSaveGoals = false }
+            .onChange(of: syncedRouteRevision) { _ in refreshAfterSync() }
+            .onReceive(NotificationCenter.default.publisher(for: .runMapDeviceSyncDidImport)) { _ in refreshAfterSync() }
         }
         .navigationViewStyle(.stack)
     }
@@ -439,6 +447,8 @@ struct MonthlyRecapView: View {
     private func generateReportIfNeeded() {
         guard !isGeneratingReport, report == nil else { return }
         isGeneratingReport = true
+        reportGeneration += 1
+        let generation = reportGeneration
 
         let routes = routes
         let achievements = achievements
@@ -454,10 +464,26 @@ struct MonthlyRecapView: View {
             )
 
             DispatchQueue.main.async {
+                guard self.reportGeneration == generation else { return }
                 self.report = generatedReport
                 self.isGeneratingReport = false
             }
         }
+    }
+
+    private func refreshAfterSync() {
+        let hasDraft = draftDistance != (goals.distanceKm.map { String(format: "%.0f", $0) } ?? "") ||
+            draftStreets != (goals.newStreetCount.map(String.init) ?? "") ||
+            draftDistricts != (goals.newDistrictCount.map(String.init) ?? "")
+        goals = MonthlyGoalStore.load()
+        if !hasDraft {
+            draftDistance = goals.distanceKm.map { String(format: "%.0f", $0) } ?? ""
+            draftStreets = goals.newStreetCount.map(String.init) ?? ""
+            draftDistricts = goals.newDistrictCount.map(String.init) ?? ""
+        }
+        report = nil
+        isGeneratingReport = false
+        generateReportIfNeeded()
     }
 
     private func header(_ report: MonthlyRecapReport) -> some View {
@@ -653,43 +679,56 @@ struct MonthlyGoalProgressSection: View {
     @State private var goals = MonthlyGoalStore.load()
     @State private var progress: MonthlyGoalProgressSnapshot?
     @State private var isLoadingReport = false
+    @State private var progressGeneration = 0
 
     var body: some View {
-        if goals.hasAnyGoal {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Monthly Goals")
-                    .font(.title2)
-                    .fontWeight(.bold)
+        Group {
+            if goals.hasAnyGoal {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Monthly Goals")
+                        .font(.title2)
+                        .fontWeight(.bold)
 
-                if let progress {
-                    if let target = goals.distanceKm {
-                        progressRow(title: "Distance", current: progress.distanceKm, target: target, suffix: "km")
-                    }
-                    if let target = goals.newStreetCount, let newStreetCount = progress.newStreetCount {
-                        progressRow(title: "New streets", current: Double(newStreetCount), target: Double(target), suffix: "")
-                    }
-                    if let target = goals.newDistrictCount, let newDistrictCount = progress.newDistrictCount {
-                        progressRow(title: "New districts", current: Double(newDistrictCount), target: Double(target), suffix: "")
-                    }
-                } else {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .scaleEffect(0.8)
-                        Text("Calculating goal progress")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                    if let progress {
+                        if let target = goals.distanceKm {
+                            progressRow(title: "Distance", current: progress.distanceKm, target: target, suffix: "km")
+                        }
+                        if let target = goals.newStreetCount, let newStreetCount = progress.newStreetCount {
+                            progressRow(title: "New streets", current: Double(newStreetCount), target: Double(target), suffix: "")
+                        }
+                        if let target = goals.newDistrictCount, let newDistrictCount = progress.newDistrictCount {
+                            progressRow(title: "New districts", current: Double(newDistrictCount), target: Double(target), suffix: "")
+                        }
+                    } else {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                            Text("Calculating goal progress")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
                 }
-            }
-            .padding()
-            .background(Color(.secondarySystemGroupedBackground))
-            .cornerRadius(12)
-            .padding(.horizontal)
-            .onAppear {
-                goals = MonthlyGoalStore.load()
-                generateReportIfNeeded()
+                .padding()
+                .background(Color(.secondarySystemGroupedBackground))
+                .cornerRadius(12)
+                .padding(.horizontal)
+                .onAppear {
+                    goals = MonthlyGoalStore.load()
+                    generateReportIfNeeded()
+                }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .runMapDeviceSyncDidImport)) { _ in refreshSyncedGoals() }
+        .onChange(of: Self.routeSignature(for: routes)) { _ in refreshSyncedGoals() }
+    }
+
+    private func refreshSyncedGoals() {
+        progressGeneration += 1
+        goals = MonthlyGoalStore.load()
+        progress = nil
+        isLoadingReport = false
+        generateReportIfNeeded()
     }
 
     private func generateReportIfNeeded() {
@@ -703,6 +742,8 @@ struct MonthlyGoalProgressSection: View {
         }
 
         isLoadingReport = true
+        progressGeneration += 1
+        let generation = progressGeneration
 
         let routes = routes
         let achievements = achievements
@@ -722,6 +763,7 @@ struct MonthlyGoalProgressSection: View {
                 )
                 MonthlyGoalProgressCache.save(snapshot)
                 DispatchQueue.main.async {
+                    guard self.progressGeneration == generation else { return }
                     self.progress = snapshot
                     self.isLoadingReport = false
                 }
@@ -744,6 +786,7 @@ struct MonthlyGoalProgressSection: View {
             MonthlyGoalProgressCache.save(snapshot)
 
             DispatchQueue.main.async {
+                guard self.progressGeneration == generation else { return }
                 self.progress = snapshot
                 self.isLoadingReport = false
             }
